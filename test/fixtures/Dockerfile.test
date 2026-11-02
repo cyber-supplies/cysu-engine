@@ -1,0 +1,6 @@
+# Test-only layer: `codex exec` becomes a stand-in (no LLM). Everything else,
+# including `codex login` and `codex mcp list`, is the real Codex.
+FROM cysu-engine-workspace:dev
+USER root
+RUN mv /usr/local/bin/codex /usr/local/bin/codex-real
+COPY --chmod=755 fake-codex.sh /usr/local/bin/codex

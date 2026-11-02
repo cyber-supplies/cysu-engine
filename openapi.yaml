@@ -1,0 +1,867 @@
+openapi: 3.1.0
+info:
+  title: Cyber Supplies Engine API
+  version: 0.7.0
+  description: |
+    Local API of cysu-engine: the self-hosted server that runs Cyber Supplies
+    profiles as agents in hardened Docker containers. The web UI and the
+    `cysu` CLI both use it.
+
+    **Same machine only.** The engine listens on `http://127.0.0.1:8787`
+    (change with `PORT`) and has no login. To keep web pages in your browser
+    from using it, every request must:
+    - use a loopback `Host` (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`);
+    - send no `Origin`, or the engine's own origin (the CLI sends none);
+    - send `Content-Type: application/json` whenever it has a body.
+    Anything else gets `403`.
+
+    **Runs.** A run is a list of stages executed one after another, each in a
+    fresh container: the global profile is installed as the user, the stage
+    profile in `/workspace`, then Codex works on the prompt. One run is
+    active at a time.
+
+    Stages are either listed explicitly (`stages`) or built from the user's
+    profile tags (`fromTags`), like the old Windmill flow: every profile
+    except the global one must carry exactly one tag `"1"`–`"4"` (its stage
+    number); tags in `skip` are left out; stages run by tag, then profile ID.
+    `POST /api/runs/plan` shows the resulting stages without starting.
+
+    Inside a stage, Codex runs one or more **attempts**: `initial`; if it
+    fails and `fallbackModel` is set, one `fallback` with that model (same
+    prompt, same workspace); after success, one `reprompt` per follow-up
+    prompt, each resuming the same Codex thread, in order. A stage fails if
+    its initial (and fallback) attempt or any follow-up fails.
+
+    By default a failed stage is recorded and the next stages still run
+    (`continueOnFailure`); the run then ends `failed`.
+
+    Every run needs the user's own LLM login: a ChatGPT sign-in (Codex) or
+    an OpenAI API key. Check `GET /api/status` (`llm.ready`) and ask the user
+    to log in first.
+
+    Secrets (token, passkey, LLM keys/logins) are only ever written, never
+    returned: reads show them masked.
+
+    **Main agent.** The main agent does not use this API. It gets a separate
+    Unix socket (`<data>/agent.sock`) with only its tools (see
+    `server/agent-tools.js`), bridged to MCP by `cysu-engine-mcp`. It can
+    plan and *propose* runs and profile changes (create/edit profiles in the
+    user's Cyber Supplies account); a proposal does nothing until the user
+    approves it here (`/api/proposals/{id}/approve`). Whole profiles are never
+    deleted by the agent.
+
+    Errors are JSON `{"error": "<message>"}` with a 4xx/5xx status.
+servers:
+  - url: http://127.0.0.1:8787
+
+tags:
+  - name: Engine
+  - name: Settings
+  - name: LLM login
+  - name: Profiles
+  - name: Runs
+  - name: Saved setups
+  - name: Proposals
+  - name: Assistant
+
+paths:
+  /api/status:
+    get:
+      tags: [Engine]
+      summary: Engine health and setup state
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [docker, image, apiUrl, cysu, llm, configured]
+                properties:
+                  docker: { type: [string, 'null'], description: Docker server version, null when Docker is not reachable, example: 29.9.2 }
+                  image: { type: string, description: Worker image used for stages, example: 'cysu-engine-workspace:dev' }
+                  apiUrl: { type: string, description: Cyber Supplies API the engine uses }
+                  cysu: { type: boolean, description: Cyber Supplies token and passkey are saved }
+                  llm:
+                    type: object
+                    required: [mode, ready]
+                    properties:
+                      mode: { $ref: '#/components/schemas/LlmMode' }
+                      ready: { type: boolean, description: 'The LLM login is complete (API key saved, or ChatGPT signed in)' }
+                  configured: { type: boolean, description: Everything a run needs is set up (cysu and llm.ready) }
+
+  /api/settings:
+    get:
+      tags: [Settings]
+      summary: Read settings (secrets masked)
+      responses:
+        '200': { $ref: '#/components/responses/Settings' }
+    put:
+      tags: [Settings]
+      summary: Update settings
+      description: |
+        Only the fields you send change. Empty strings mean "keep what is
+        stored", so sending back masked values never overwrites a secret.
+        `llm.mode: codex` is only accepted after a ChatGPT sign-in
+        (see `/api/llm/codex-login`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token: { type: string, description: Cyber Supplies user token }
+                passkey: { type: string, description: Encryption passkey (CYSU passphrase); stays on this machine }
+                llm:
+                  type: object
+                  properties:
+                    mode: { $ref: '#/components/schemas/LlmMode' }
+                    apiKey: { type: string, description: OpenAI API key (for mode openai-api-key) }
+                globalProfile: { type: string, description: Default global profile ID for new runs ("" for none) }
+      responses:
+        '200': { $ref: '#/components/responses/Settings' }
+        '400': { $ref: '#/components/responses/Error' }
+
+  /api/llm/codex-login:
+    get:
+      tags: [LLM login]
+      summary: State of the ChatGPT (Codex device code) sign-in
+      responses:
+        '200': { $ref: '#/components/responses/CodexLogin' }
+    post:
+      tags: [LLM login]
+      summary: Start a ChatGPT sign-in
+      description: |
+        Starts `codex login --device-auth` in a worker container. Poll `GET`
+        until `status` is `waiting`, then show the user `url` and `code`.
+        On success the login is saved and `llm.mode` becomes `codex`.
+        Codes expire after 15 minutes. If a sign-in is already in progress
+        its state is returned.
+      responses:
+        '202': { $ref: '#/components/responses/CodexLogin' }
+        '503': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [LLM login]
+      summary: Cancel the sign-in in progress
+      responses:
+        '200': { $ref: '#/components/responses/CodexLogin' }
+
+  /api/llm/codex-auth:
+    delete:
+      tags: [LLM login]
+      summary: Forget the saved ChatGPT login
+      description: Removes it; if `llm.mode` was `codex` it becomes `none`.
+      responses:
+        '200': { $ref: '#/components/responses/Settings' }
+
+  /api/profiles:
+    get:
+      tags: [Profiles]
+      summary: The user's profiles, from Cyber Supplies
+      description: Passed through from the Cyber Supplies API using the saved token.
+      responses:
+        '200':
+          description: Profiles as returned by Cyber Supplies
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    tag: { type: array, items: { type: string } }
+                  additionalProperties: true
+        '400': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+
+  /api/runs:
+    get:
+      tags: [Runs]
+      summary: List runs, newest first
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RunSummary' }
+    post:
+      tags: [Runs]
+      summary: Start a run
+      description: |
+        Validates, saves and starts the run; returns it as saved (`queued`).
+        Run-level `globalProfile`, `model` and `reasoningEffort` apply to
+        every stage unless the stage sets its own (`modelOverrides` sets the
+        model per stage tag). `globalProfile` defaults to the saved setting;
+        send `""` for none.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RunRequest' }
+            examples:
+              fromTags:
+                summary: All stage profiles in tag order (the Windmill flow)
+                value:
+                  name: Example campaign
+                  prompt: Your target is example.com (in scope). Complete the instructions in your prompt.
+                  globalProfile: global
+                  fromTags: { skip: ['1'] }
+                  modelOverrides: [{ stage: 2, model: gpt-5.6-sol }]
+                  fallbackModel: gpt-5.6-sol
+                  reprompts:
+                    - { stage: '2', prompt: Start the second wave, with fresh hypotheses. }
+                    - { stage: '2', prompt: Start the final wave. }
+              explicit:
+                summary: One chosen profile
+                value:
+                  prompt: Your target is example.com (in scope). Map the attack surface and write notes.
+                  stages: [{ profile: attack }]
+      responses:
+        '201':
+          description: Run created and started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '400': { description: 'Invalid request, or setup missing (token/passkey, or no LLM login)', $ref: '#/components/responses/Error' }
+        '401': { description: Cyber Supplies rejected the token (fromTags), $ref: '#/components/responses/Error' }
+        '409': { description: Another run is active, $ref: '#/components/responses/Error' }
+        '502': { description: Cyber Supplies could not be reached (fromTags), $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/runs/plan:
+    post:
+      tags: [Runs]
+      summary: Preview a run's stages without starting it
+      description: Same request and validation as `POST /api/runs`; returns the planned run (stages `pending`). Nothing is saved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RunRequest' }
+            example: { prompt: Your target is example.com (in scope)., globalProfile: global, fromTags: { skip: ['1'] } }
+      responses:
+        '200':
+          description: The planned run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunPlan' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { description: Cyber Supplies rejected the token, $ref: '#/components/responses/Error' }
+        '502': { description: Cyber Supplies could not be reached or answered badly, $ref: '#/components/responses/Error' }
+
+  /api/runs/{runId}:
+    parameters: [{ $ref: '#/components/parameters/RunId' }]
+    get:
+      tags: [Runs]
+      summary: One run with its stages
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Runs]
+      summary: Delete a finished run and all its files
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: The run is still active, $ref: '#/components/responses/Error' }
+
+  /api/runs/{runId}/cancel:
+    parameters: [{ $ref: '#/components/parameters/RunId' }]
+    post:
+      tags: [Runs]
+      summary: Cancel an active run
+      description: Stops the running stage (SIGTERM, SIGKILL after 10 s); later stages are marked `cancelled` and never start. The run ends as `cancelled`.
+      responses:
+        '202':
+          description: Cancellation requested
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: The run is not active, $ref: '#/components/responses/Error' }
+
+  /api/runs/{runId}/rerun:
+    parameters: [{ $ref: '#/components/parameters/RunId' }]
+    post:
+      tags: [Runs]
+      summary: Run again
+      description: Starts a new run with the same request (`run.request`). Runs built from tags re-read the profile tags, so they pick up profile changes. The new run has `rerunOf` set.
+      responses:
+        '201':
+          description: The new run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: 'Another run is active, or the run predates run.request', $ref: '#/components/responses/Error' }
+
+  /api/runs/{runId}/download:
+    parameters: [{ $ref: '#/components/parameters/RunId' }]
+    get:
+      tags: [Runs]
+      summary: Download a finished run (.tar.gz)
+      description: "`run-<id>/run.json` and per stage `stages/<n>/events.jsonl`, `log.txt` and `result.md` (the agent's final answer). Contains no secrets."
+      responses:
+        '200':
+          description: The archive
+          content:
+            application/gzip:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: The run is still active, $ref: '#/components/responses/Error' }
+
+  /api/proposals:
+    get:
+      tags: [Proposals]
+      summary: Runs the main agent proposed, newest first
+      description: Pending proposals expire after 1 hour. Kept in memory (an engine restart clears them).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Proposal' } }
+
+  /api/proposals/{proposalId}/approve:
+    post:
+      tags: [Proposals]
+      summary: Approve a proposal (starts the run, or saves the profile change)
+      parameters: [{ name: proposalId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200':
+          description: Approved; `runId` is the started run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Proposal' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: 'Not pending (approved, rejected, expired or stale), another run is active, or things changed since the proposal (profile: the profile changed; run: the planned stages would differ) — the proposal becomes stale', $ref: '#/components/responses/Error' }
+        '502': { description: Cyber Supplies could not be reached (profile changes), $ref: '#/components/responses/Error' }
+
+  /api/proposals/{proposalId}/reject:
+    post:
+      tags: [Proposals]
+      summary: Reject a proposal
+      parameters: [{ name: proposalId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200':
+          description: Rejected
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Proposal' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/chats:
+    get:
+      tags: [Assistant]
+      summary: Assistant chats, most recently active first
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string, format: uuid }
+                    title: { type: string }
+                    status: { type: string, enum: [idle, thinking] }
+                    createdAt: { type: string, format: date-time }
+                    updatedAt: { type: string, format: date-time }
+                    messageCount: { type: integer }
+    post:
+      tags: [Assistant]
+      summary: Start a chat
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { title: { type: string } } }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Chat' }
+
+  /api/chats/{chatId}:
+    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Assistant]
+      summary: A chat with all its messages (poll while status is thinking)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Chat' }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Assistant]
+      summary: Delete a chat
+      responses:
+        '204': { description: Deleted }
+        '409': { description: The assistant is still answering, $ref: '#/components/responses/Error' }
+
+  /api/chats/{chatId}/messages:
+    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      tags: [Assistant]
+      summary: Send a message (the assistant answers in the background)
+      description: |
+        Starts one assistant turn: Codex in a hardened container with only the
+        user's LLM login and the engine's agent tools (no shell, files or web;
+        no Cyber Supplies token or passkey). Poll `GET /api/chats/{chatId}`
+        until `status` is `idle`. Runs and profile changes it suggests appear
+        as proposals (`/api/proposals`), linked from tool messages.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [text], properties: { text: { type: string, minLength: 1, maxLength: 20000 } } }
+      responses:
+        '202':
+          description: Accepted; the chat is now thinking
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Chat' }
+        '400': { description: 'Empty/too long message, or no LLM login', $ref: '#/components/responses/Error' }
+        '409': { description: The assistant is still answering, $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/chats/{chatId}/stop:
+    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      tags: [Assistant]
+      summary: Stop the assistant's current answer
+      responses:
+        '202':
+          description: Stopping
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Chat' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/chats/{chatId}/log:
+    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Assistant]
+      summary: The chat's container log (debugging)
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /api/workflows:
+    get:
+      tags: [Saved setups]
+      summary: Saved run setups
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SavedSetup' } }
+    post:
+      tags: [Saved setups]
+      summary: Save a run setup (create, or update by id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, request]
+              properties:
+                id: { type: string, description: Existing setup to update }
+                name: { type: string, minLength: 1, maxLength: 120 }
+                request: { $ref: '#/components/schemas/RunRequest' }
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedSetup' }
+        '400': { $ref: '#/components/responses/Error' }
+
+  /api/workflows/{setupId}:
+    delete:
+      tags: [Saved setups]
+      summary: Delete a saved setup
+      parameters: [{ name: setupId, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: Deleted }
+
+  /api/runs/{runId}/stages/{index}/events:
+    parameters:
+      - { $ref: '#/components/parameters/RunId' }
+      - { $ref: '#/components/parameters/StageIndex' }
+    get:
+      tags: [Runs]
+      summary: A stage's Codex events (cursor paging, for live views)
+      description: |
+        Returns events with `seq > after`, oldest first. Poll with
+        `after=<next>` to follow a live stage; stop when `done` is true and
+        no events came back.
+      parameters:
+        - { name: after, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 5000, default: 500 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events, next, done]
+                properties:
+                  events: { type: array, items: { $ref: '#/components/schemas/Event' } }
+                  next: { type: integer, description: Cursor for the next call }
+                  done: { type: boolean, description: The stage will produce no more events }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/runs/{runId}/stages/{index}/log:
+    parameters:
+      - { $ref: '#/components/parameters/RunId' }
+      - { $ref: '#/components/parameters/StageIndex' }
+    get:
+      tags: [Runs]
+      summary: A stage's container log
+      description: "`[engine]` lines, cysu install output and Codex stderr. Never contains secrets."
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/Error' }
+
+components:
+  parameters:
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    StageIndex:
+      name: index
+      in: path
+      required: true
+      description: 0-based stage index
+      schema: { type: integer, minimum: 0 }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: { type: string }
+    Settings:
+      description: Settings with secrets masked
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [token, passkey, llm, globalProfile, configured]
+            properties:
+              token: { type: string, description: 'Masked, e.g. "••••a1b2"; "" when unset' }
+              passkey: { type: string, enum: ['', set] }
+              llm:
+                type: object
+                required: [mode, apiKey, codex]
+                properties:
+                  mode: { $ref: '#/components/schemas/LlmMode' }
+                  apiKey: { type: string, description: Masked OpenAI API key }
+                  codex:
+                    type: object
+                    required: [saved]
+                    properties:
+                      saved: { type: boolean, description: A ChatGPT login is saved }
+                      savedAt: { type: string, format: date-time }
+              globalProfile: { type: string }
+              configured: { type: boolean }
+    CodexLogin:
+      description: ChatGPT sign-in state
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status]
+            properties:
+              status: { type: string, enum: [idle, starting, waiting, succeeded, failed, cancelled] }
+              url: { type: string, description: 'Page to open, e.g. https://auth.openai.com/codex/device' }
+              code: { type: string, description: One-time code to enter there }
+              error: { type: string }
+              startedAt: { type: string, format: date-time }
+              finishedAt: { type: string, format: date-time }
+
+  schemas:
+    LlmMode:
+      type: string
+      enum: [none, openai-api-key, codex]
+      description: How Codex logs in. Claude, Kimi and GLM come later.
+
+    ReasoningEffort:
+      type: string
+      enum: ['', none, minimal, low, medium, high, xhigh, max, ultra]
+      description: '"" keeps the model default'
+
+    RunStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled, interrupted]
+      description: '`interrupted`: the engine stopped while the run was active'
+
+    StageStatus:
+      type: string
+      enum: [pending, running, succeeded, failed, cancelled, interrupted, skipped]
+
+    RunRequest:
+      type: object
+      required: [prompt]
+      description: Give either `stages` or `fromTags`.
+      properties:
+        name: { type: string, maxLength: 120 }
+        prompt: { type: string, minLength: 1, maxLength: 100000, description: Objective given to every stage }
+        globalProfile: { type: string, description: 'Profile installed as the user in every stage; "" for none. Defaults to the saved setting.' }
+        model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: Default model for every stage }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        continueOnFailure: { type: boolean, default: true, description: 'false: stop after the first failed stage (the rest become skipped)' }
+        fallbackModel: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: 'If a stage''s first attempt fails, retry it once with this model (same prompt, same workspace)' }
+        reprompts:
+          type: array
+          description: Follow-up prompts per stage tag. After a stage's first attempt succeeds, each matching prompt is sent to the same Codex thread, in this order.
+          items:
+            type: object
+            required: [stage, prompt]
+            properties:
+              stage: { type: string, enum: ['1', '2', '3', '4'] }
+              prompt: { type: string, minLength: 1, maxLength: 100000 }
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 20
+          description: Explicit stages, executed in this order.
+          items:
+            type: object
+            required: [profile]
+            properties:
+              profile: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' }
+              tag: { type: string, enum: ['1', '2', '3', '4'], description: Optional stage number (lets modelOverrides apply) }
+              prompt: { type: string, description: Overrides the run prompt for this stage }
+              model: { type: string }
+              reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+              fallbackModel: { type: string }
+              reprompts: { type: array, maxItems: 20, items: { type: string, minLength: 1 }, description: This stage's follow-up prompts (instead of the run-level ones) }
+        fromTags:
+          type: object
+          description: Build the stages from the user's profile tags (see the description at the top).
+          properties:
+            skip:
+              type: array
+              uniqueItems: true
+              items: { type: string, enum: ['1', '2', '3', '4'] }
+              description: Stage tags to leave out
+        modelOverrides:
+          type: array
+          description: Model per stage tag; stages without one use `model`. Tags do not shift when stages are skipped.
+          items:
+            type: object
+            required: [stage, model]
+            properties:
+              stage: { type: integer, enum: [1, 2, 3, 4] }
+              model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$' }
+
+    RunPlan:
+      type: object
+      description: A planned run (from `POST /api/runs/plan`); a created run has these fields plus id, status and times.
+      properties:
+        name: { type: string }
+        prompt: { type: string }
+        globalProfile: { type: string }
+        model: { type: string }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        source: { type: string, enum: [explicit, tags] }
+        skip: { type: array, items: { type: string } }
+        modelOverrides: { type: array, items: { type: object, properties: { stage: { type: integer }, model: { type: string } } } }
+        continueOnFailure: { type: boolean }
+        fallbackModel: { type: string }
+        reprompts: { type: array, items: { type: object, properties: { stage: { type: string }, prompt: { type: string } } } }
+        stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
+
+    Stage:
+      type: object
+      required: [index, profile, status]
+      properties:
+        index: { type: integer }
+        profile: { type: string }
+        tag: { type: string, description: 'Stage number "1"-"4", or "" for explicit stages without one' }
+        globalProfile: { type: string }
+        prompt: { type: string }
+        model: { type: string }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        fallbackModel: { type: string }
+        reprompts: { type: array, items: { type: string } }
+        status: { $ref: '#/components/schemas/StageStatus' }
+        startedAt: { type: [string, 'null'], format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        exitCode: { type: [integer, 'null'], description: 'Container exit code; 5 = a profile could not be installed' }
+        threadId: { type: [string, 'null'], description: Codex thread (session) ID }
+        turns: { type: integer }
+        usage:
+          type: [object, 'null']
+          description: Token usage of the last Codex turn
+          properties:
+            input_tokens: { type: integer }
+            cached_input_tokens: { type: integer }
+            output_tokens: { type: integer }
+        result: { type: string, description: The agent's last message }
+        errors: { type: array, items: { type: string }, description: Errors from all attempts (a failure rescued by the fallback model is kept here) }
+        attempts:
+          type: array
+          description: The Codex runs inside this stage, in order
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [initial, fallback, reprompt] }
+              model: { type: string, description: '"" = default model' }
+              status: { type: string, enum: [running, succeeded, failed, cancelled] }
+              exitCode: { type: [integer, 'null'] }
+              turns: { type: integer }
+              startedAt: { type: string, format: date-time }
+              finishedAt: { type: [string, 'null'], format: date-time }
+        eventCount: { type: integer }
+        container: { type: string, description: Docker container name while it exists }
+
+    Run:
+      type: object
+      required: [id, status, createdAt, prompt, stages]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        createdAt: { type: string, format: date-time }
+        startedAt: { type: [string, 'null'], format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        prompt: { type: string }
+        globalProfile: { type: string }
+        model: { type: string }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        source: { type: string, enum: [explicit, tags] }
+        skip: { type: array, items: { type: string } }
+        modelOverrides: { type: array, items: { type: object, properties: { stage: { type: integer }, model: { type: string } } } }
+        continueOnFailure: { type: boolean }
+        cancelRequested: { type: boolean }
+        request: { $ref: '#/components/schemas/RunRequest', description: What was asked for (used by rerun) }
+        rerunOf: { type: [string, 'null'], description: The run this one repeats }
+        stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
+
+    Proposal:
+      type: object
+      required: [id, status, request, plan]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [run, rerun, profile] }
+        status: { type: string, enum: [pending, approved, rejected, expired, stale] }
+        createdAt: { type: string, format: date-time }
+        decidedAt: { type: [string, 'null'], format: date-time }
+        summary: { type: string, description: The agent's explanation for the user }
+        request: { $ref: '#/components/schemas/RunRequest' }
+        plan:
+          description: 'run/rerun: the planned run (RunPlan). profile: the diff — {profile, exists, tagsBefore, tagsAfter, created[], updated[], removed[] (each {kind, name, preview}), unchanged, changes}'
+          oneOf: [{ $ref: '#/components/schemas/RunPlan' }, { type: object }]
+        change: { type: object, description: 'profile: the change {profile, tags?, upsert?, remove?}' }
+        result: { type: object, description: 'profile: what Cyber Supplies reported after saving' }
+        error: { type: string, description: 'Why it became stale' }
+        rerunOf: { type: [string, 'null'] }
+        runId: { type: [string, 'null'], description: Set once a run proposal is approved }
+
+    Chat:
+      type: object
+      required: [id, title, status, messages]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        status: { type: string, enum: [idle, thinking] }
+        threadId: { type: [string, 'null'], description: The Codex conversation }
+        turns: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        messages:
+          type: array
+          items:
+            type: object
+            required: [id, role, time]
+            properties:
+              id: { type: string }
+              role: { type: string, enum: [user, agent, tool, error, notice] }
+              text: { type: string, description: 'user/agent/error/notice: the text; tool: the call arguments' }
+              time: { type: string, format: date-time }
+              tool: { type: string, description: 'tool: which engine tool' }
+              status: { type: string, enum: [running, done, failed], description: 'tool only' }
+              result: { type: string, description: 'tool: shortened result' }
+              proposalId: { type: string, description: 'tool: the proposal it created (see /api/proposals)' }
+
+    SavedSetup:
+      type: object
+      required: [id, name, request]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        request: { $ref: '#/components/schemas/RunRequest' }
+        updatedAt: { type: string, format: date-time }
+
+    RunSummary:
+      type: object
+      required: [id, status, createdAt, stageCount, stages]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        createdAt: { type: string, format: date-time }
+        startedAt: { type: [string, 'null'], format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        globalProfile: { type: string }
+        model: { type: string }
+        stageCount: { type: integer }
+        stages:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              profile: { type: string }
+              tag: { type: string }
+              status: { $ref: '#/components/schemas/StageStatus' }
+
+    Event:
+      type: object
+      required: [seq, time, type]
+      description: |
+        One line of Codex's `exec --json` stream, plus `seq` and `time`.
+        The engine adds `engine.attempt` (kind, model) before and
+        `engine.attempt.finished` (kind, exitCode) after each attempt.
+        Common Codex types: `thread.started` (thread_id), `turn.started`,
+        `item.started` / `item.completed` (item.type: agent_message,
+        reasoning, command_execution, file_change, mcp_tool_call, …),
+        `turn.completed` (usage), `turn.failed` (error), `error`.
+      properties:
+        seq: { type: integer, minimum: 1 }
+        time: { type: string, format: date-time }
+        type: { type: string }
+      additionalProperties: true

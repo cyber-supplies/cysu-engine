@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cyber Supplies Engine</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#/runs">Cyber Supplies <span>Engine</span></a>
+    <nav aria-label="Main">
+      <a href="#/chat" data-route="/chat">Assistant</a>
+      <a href="#/runs" data-route="/runs">Runs</a>
+      <a href="#/new" data-route="/new">New run</a>
+      <a href="#/setup" data-route="/setup">Setup</a>
+    </nav>
+    <div id="status" class="status" aria-live="polite"></div>
+  </header>
+  <main id="view" class="view"><p class="hint">Loading…</p></main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

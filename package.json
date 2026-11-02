@@ -1,0 +1,19 @@
+{
+  "name": "cysu-engine",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Self-hosted Cyber Supplies engine: build workflows from profiles and run them in Docker",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "image:build": "docker build -t cysu-engine-workspace:dev image",
+    "test:image": "node --test --test-concurrency=1 test/hardening.test.js test/secrets.test.js test/llm.test.js test/stage.test.js test/runs.test.js test/agent.test.js test/chat.test.js test/chat-codemode.test.js",
+    "image:build:test": "docker build -t cysu-engine-workspace:test -f test/fixtures/Dockerfile.test test/fixtures",
+    "stage": "node scripts/run-stage.js",
+    "test": "node --test test/profiles.test.js test/web-lib.test.js"
+  }
+}
