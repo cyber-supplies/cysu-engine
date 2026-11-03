@@ -1,8 +1,8 @@
 # cysu-engine
 
 Self-hosted, open-source engine for Cyber Supplies. It runs in the background
-on your machine; you use it from the `cysu` CLI: an AI assistant builds
-workspaces from your profiles, you start runs, and it shows you the results.
+on your machine; you use it from the `cysu` CLI: you build workspaces from
+your profiles, start runs, and see the results.
 Every stage runs in a hardened Docker container that comes with everything
 set up. There is no web UI.
 
@@ -39,7 +39,7 @@ npm run test:image           # everything with Docker (~5 min)
 | `docs/RELEASING.md` | Publishing the images (GitHub Actions, ghcr.io) |
 | `.github/workflows/release.yml` | The release workflow (tag `v*` or Run workflow) |
 | `docs/INSTALL.md` | Install and run (for testers) |
-| `docs/CLI.md` | How the `cysu` CLI talks to the engine (setup, chat, slash commands) |
+| `docs/CLI.md` | How the `cysu` CLI talks to the engine (setup, slash commands) |
 | `server/`   | Node server (no dependencies): JSON API, settings, Docker runs    |
 | `image/`    | Workspace image: Node, Go, Python, ProjectDiscovery, cysu, Codex  |
 

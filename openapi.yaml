@@ -1,19 +1,48 @@
 openapi: 3.1.0
 info:
   title: Cyber Supplies Engine API
-  version: 0.8.1
+  version: 0.10.0
   description: |
     Local API of cysu-engine: the self-hosted server that runs Cyber Supplies
     profiles as agents in hardened Docker containers. There is no web UI: the
-    `cysu` CLI is the client (setup, assistant chat, slash commands).
+    `cysu` CLI is the client (setup and slash commands).
 
     **Same machine only.** The engine listens on `http://127.0.0.1:8787`
-    (change with `PORT`) and has no login. To keep web pages in your browser
-    from using it, every request must:
+    (change with `PORT`). To keep web pages in your browser from using it,
+    every request must:
     - use a loopback `Host` (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`);
-    - send no `Origin`, or the engine's own origin (the CLI sends none);
+    - send no `Origin` header at all (the CLI sends none);
     - send `Content-Type: application/json` whenever it has a body.
     Anything else gets `403`.
+
+    **Authentication.** The engine token is the user's Cyber Supplies
+    **user token** (`usr_…`). Every request must send it as
+    `Authorization: Bearer usr_…` (only this header counts: never a query
+    string, cookie or body field). The only exception is `GET /api/health`.
+    - **Before setup** (no token stored yet) every request gets `401` with
+      `setupRequired: true`, except the setup itself: `PUT /api/settings`
+      with a `token` (no header needed). The engine checks the token with
+      Cyber Supplies first (refused → `400`, not reachable → `503`); then it
+      becomes the engine token. If two setups race, one wins and the other
+      gets `401`.
+    - **After setup** a missing or wrong token gets `401` with
+      `setupRequired: false`. Changing the token (`PUT /api/settings` with a
+      new `token`) needs the current one in the header; the old one stops
+      working at once (`tokenChanged: true` in the answer).
+    - A `401` from the engine ALWAYS means "wrong engine token". If Cyber
+      Supplies refuses the stored token (e.g. revoked), routes that ask it
+      answer `502` with a message saying so: set a new token.
+    - **10 wrong tokens within a minute** (a wrong token in the header, a
+      setup Cyber Supplies refuses, a lost setup race; a missing header does
+      not count) lock the engine for a minute: every request but
+      `GET /api/health` gets `429` with `Retry-After`, the right token
+      included (otherwise a hit would still tell itself apart from a miss).
+    - Lost the token? `sh scripts/engine.sh reset-auth` (needs Docker on the
+      machine) forgets it and keeps everything else; then set up again.
+
+    Checks run in this order: same machine (`403`), lockout (`429`), token
+    (`401`), then the route. A refused request's body is not read; the
+    connection is closed.
 
     **Runs.** A run is a list of stages executed one after another, each in a
     fresh container: the global profile is installed as the user, the stage
@@ -42,15 +71,18 @@ info:
     Secrets (token, passkey, LLM keys/logins) are only ever written, never
     returned: reads show them masked.
 
-    **Main agent (the assistant).** It does not use this API. It gets a
-    separate Unix socket (`<data>/agent.sock`) with only its tools (see
-    `server/agent-tools.js`), bridged to MCP by `cysu-engine-mcp`. Today it
-    builds workspaces from the user's own profiles and reads run results; it
-    cannot start runs (the user does), propose, or change profiles.
+    **Workspaces** are saved run setups. A workspace is referred to only by
+    its exact `id` (returned when it is created and in every listing); its
+    `name` is a label for people and is never accepted in a path. There is
+    no "current" workspace: the client keeps the id it works with.
 
     Errors are JSON `{"error": "<message>"}` with a 4xx/5xx status.
 servers:
   - url: http://127.0.0.1:8787
+
+# Every route needs the engine token unless it says otherwise.
+security:
+  - bearerAuth: []
 
 tags:
   - name: Engine
@@ -59,12 +91,6 @@ tags:
   - name: Profiles
   - name: Runs
   - name: Workspaces
-  - name: Proposals
-    description: |
-      Not used today: the assistant only builds workspaces and the user starts
-      runs with /run. Kept for later, when the assistant may propose runs and
-      profile changes again (the user approves each one here).
-  - name: Assistant
 
 paths:
   /:
@@ -72,6 +98,8 @@ paths:
       tags: [Engine]
       summary: What this server is (there is no web UI)
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -84,11 +112,26 @@ paths:
                   docs: { type: string, example: openapi.yaml }
                   ui: { type: string, example: 'none: use the cysu CLI' }
 
+  /api/health:
+    get:
+      tags: [Engine]
+      summary: Is the engine up? (the ONLY route without the engine token)
+      description: For scripts that wait for the engine to start. Says nothing else; same-machine checks still apply.
+      security: []
+      responses:
+        '200':
+          description: Up
+          content:
+            application/json:
+              schema: { type: object, required: [ok], properties: { ok: { type: boolean, const: true } } }
+
   /api/status:
     get:
       tags: [Engine]
       summary: Engine health and setup state
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -97,7 +140,7 @@ paths:
                 type: object
                 required: [docker, image, apiUrl, cysu, llm, configured]
                 properties:
-                  docker: { type: [string, 'null'], description: Docker server version, null when Docker is not reachable, example: 29.9.2 }
+                  docker: { type: [string, 'null'], description: 'Docker server version, null when Docker is not reachable', example: 29.9.2 }
                   image: { type: string, description: Worker image used for stages, example: 'cysu-engine-workspace:dev' }
                   apiUrl: { type: string, description: Cyber Supplies API the engine uses }
                   cysu: { type: boolean, description: Cyber Supplies token and passkey are saved }
@@ -107,24 +150,35 @@ paths:
                     properties:
                       mode: { $ref: '#/components/schemas/LlmMode' }
                       ready: { type: boolean, description: 'The LLM login is complete (API key saved, or ChatGPT signed in)' }
-                      model: { type: string, description: 'The assistant''s model ("" = Codex default)' }
                   configured: { type: boolean, description: Everything a run needs is set up (cysu and llm.ready) }
-                  workspace: { type: [string, 'null'], description: The current workspace's name (for the CLI prompt) }
 
   /api/settings:
     get:
       tags: [Settings]
       summary: Read settings (secrets masked)
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/Settings' }
     put:
       tags: [Settings]
-      summary: Update settings
+      summary: Update settings (also the first setup)
       description: |
         Only the fields you send change. Empty strings mean "keep what is
         stored", so sending back masked values never overwrites a secret.
         `llm.mode: codex` is only accepted after a ChatGPT sign-in
         (see `/api/llm/codex-login`).
+
+        **First setup:** while no token is stored, this is the one request
+        accepted without the header, and it must contain `token`. A new or
+        changed `token` must be a user token (`usr_…`) that Cyber Supplies
+        accepts (checked now: refused → 400, not reachable → 503; nothing is
+        saved then). After setup, changing it needs the current token in
+        the header, and the answer has `tokenChanged: true`: send the new
+        one from then on.
+      security:
+        - {}
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -140,16 +194,20 @@ paths:
                     mode: { $ref: '#/components/schemas/LlmMode' }
                     apiKey: { type: string, description: OpenAI API key (for mode openai-api-key) }
                 globalProfile: { type: string, description: Default global profile ID for new runs ("" for none) }
-                agentModel: { type: string, description: 'The assistant''s model ("" = Codex default)' }
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/Settings' }
-        '400': { $ref: '#/components/responses/Error' }
+        '400': { description: 'Bad input: not a user token (usr_…), Cyber Supplies refused the token, unknown LLM mode, …', $ref: '#/components/responses/Error' }
+        '503': { description: Could not check the token with Cyber Supplies (nothing saved), $ref: '#/components/responses/Error' }
 
   /api/llm/codex-login:
     get:
       tags: [LLM login]
       summary: State of the ChatGPT (Codex device code) sign-in
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/CodexLogin' }
     post:
       tags: [LLM login]
@@ -161,12 +219,16 @@ paths:
         Codes expire after 15 minutes. If a sign-in is already in progress
         its state is returned.
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '202': { $ref: '#/components/responses/CodexLogin' }
         '503': { $ref: '#/components/responses/Error' }
     delete:
       tags: [LLM login]
       summary: Cancel the sign-in in progress
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/CodexLogin' }
 
   /api/llm/codex-auth:
@@ -175,6 +237,8 @@ paths:
       summary: Forget the saved ChatGPT login
       description: Removes it; if `llm.mode` was `codex` it becomes `none`.
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/Settings' }
 
   /api/profiles:
@@ -183,6 +247,8 @@ paths:
       summary: The user's profiles, from Cyber Supplies
       description: Passed through from the Cyber Supplies API using the saved token.
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: Profiles as returned by Cyber Supplies
           content:
@@ -196,13 +262,15 @@ paths:
                     tag: { type: array, items: { type: string } }
                   additionalProperties: true
         '400': { $ref: '#/components/responses/Error' }
-        '502': { $ref: '#/components/responses/Error' }
+        '502': { description: 'Cyber Supplies refused the stored token (set a new one), could not be reached, or answered badly', $ref: '#/components/responses/Error' }
 
   /api/runs:
     get:
       tags: [Runs]
       summary: List runs, newest first
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -235,7 +303,7 @@ paths:
                   modelOverrides: [{ stage: 2, model: gpt-5.6-sol }]
                   fallbackModel: gpt-5.6-sol
                   reprompts:
-                    - { stage: '2', prompt: Start the second wave, with fresh hypotheses. }
+                    - { stage: '2', prompt: 'Start the second wave, with fresh hypotheses.' }
                     - { stage: '2', prompt: Start the final wave. }
               explicit:
                 summary: One chosen profile
@@ -243,15 +311,16 @@ paths:
                   prompt: Your target is example.com (in scope). Map the attack surface and write notes.
                   stages: [{ profile: attack }]
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '201':
           description: Run created and started
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
         '400': { description: 'Invalid request, or setup missing (token/passkey, or no LLM login)', $ref: '#/components/responses/Error' }
-        '401': { description: Cyber Supplies rejected the token (fromTags), $ref: '#/components/responses/Error' }
         '409': { description: Another run is active, $ref: '#/components/responses/Error' }
-        '502': { description: Cyber Supplies could not be reached (fromTags), $ref: '#/components/responses/Error' }
+        '502': { description: 'Cyber Supplies refused the stored token (set a new one), could not be reached, or answered badly', $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
 
   /api/runs/plan:
@@ -266,14 +335,15 @@ paths:
             schema: { $ref: '#/components/schemas/RunRequest' }
             example: { prompt: Your target is example.com (in scope)., globalProfile: global, fromTags: { skip: ['1'] } }
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: The planned run
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RunPlan' }
         '400': { $ref: '#/components/responses/Error' }
-        '401': { description: Cyber Supplies rejected the token, $ref: '#/components/responses/Error' }
-        '502': { description: Cyber Supplies could not be reached or answered badly, $ref: '#/components/responses/Error' }
+        '502': { description: 'Cyber Supplies refused the stored token (set a new one), could not be reached, or answered badly', $ref: '#/components/responses/Error' }
 
   /api/runs/{runId}:
     parameters: [{ $ref: '#/components/parameters/RunId' }]
@@ -281,6 +351,8 @@ paths:
       tags: [Runs]
       summary: One run with its stages
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -291,6 +363,8 @@ paths:
       tags: [Runs]
       summary: Delete a finished run and all its files
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '204': { description: Deleted }
         '404': { $ref: '#/components/responses/Error' }
         '409': { description: The run is still active, $ref: '#/components/responses/Error' }
@@ -302,6 +376,8 @@ paths:
       summary: Cancel an active run
       description: Stops the running stage (SIGTERM, SIGKILL after 10 s); later stages are marked `cancelled` and never start. The run ends as `cancelled`.
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '202':
           description: Cancellation requested
           content:
@@ -317,6 +393,8 @@ paths:
       summary: Run again
       description: Starts a new run with the same request (`run.request`). Runs built from tags re-read the profile tags, so they pick up profile changes. The new run has `rerunOf` set.
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '201':
           description: The new run
           content:
@@ -332,6 +410,8 @@ paths:
       summary: Download a finished run (.tar.gz)
       description: "`run-<id>/run.json` and per stage `stages/<n>/events.jsonl`, `log.txt` and `result.md` (the agent's final answer). Contains no secrets."
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: The archive
           content:
@@ -340,53 +420,13 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
         '409': { description: The run is still active, $ref: '#/components/responses/Error' }
 
-  /api/proposals:
-    get:
-      tags: [Proposals]
-      summary: Runs and profile changes the assistant proposed, newest first (not used today, see the Proposals tag)
-      description: Pending proposals expire after 1 hour. Kept in memory (an engine restart clears them).
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { type: array, items: { $ref: '#/components/schemas/Proposal' } }
-
-  /api/proposals/{proposalId}/approve:
-    post:
-      tags: [Proposals]
-      summary: Approve a proposal (starts the run, or saves the profile change)
-      parameters: [{ name: proposalId, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses:
-        '200':
-          description: Approved; `runId` is the started run
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Proposal' }
-        '400': { $ref: '#/components/responses/Error' }
-        '404': { $ref: '#/components/responses/Error' }
-        '409': { description: 'Not pending (approved, rejected, expired or stale), another run is active, or things changed since the proposal (profile: the profile changed; run: the planned stages would differ) — the proposal becomes stale', $ref: '#/components/responses/Error' }
-        '502': { description: Cyber Supplies could not be reached (profile changes), $ref: '#/components/responses/Error' }
-
-  /api/proposals/{proposalId}/reject:
-    post:
-      tags: [Proposals]
-      summary: Reject a proposal
-      parameters: [{ name: proposalId, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses:
-        '200':
-          description: Rejected
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Proposal' }
-        '404': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
-
   /api/workspaces:
     get:
       tags: [Workspaces]
-      summary: Workspaces, most recently changed first (`current` marks the one the user is on)
+      summary: Workspaces, most recently changed first
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -394,7 +434,7 @@ paths:
               schema: { type: array, items: { $ref: '#/components/schemas/Workspace' } }
     post:
       tags: [Workspaces]
-      summary: Create a workspace (it becomes the current one)
+      summary: "Create a workspace (keep the returned `id`; it is the only way to refer to it)"
       description: Without a request it starts as an empty draft (`{prompt:"", stages:[]}`) to load profiles into.
       requestBody:
         required: true
@@ -404,9 +444,11 @@ paths:
               type: object
               required: [name]
               properties:
-                name: { type: string, minLength: 1, maxLength: 80, description: Unique (any case); "current" is reserved }
+                name: { type: string, minLength: 1, maxLength: 80, description: 'A label, unique (any case); not usable as a reference' }
                 request: { $ref: '#/components/schemas/RunRequest' }
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '201':
           description: Created
           content:
@@ -415,12 +457,14 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '409': { description: Name taken, $ref: '#/components/responses/Error' }
 
-  /api/workspaces/{ref}:
-    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
+  /api/workspaces/{workspaceId}:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
     get:
       tags: [Workspaces]
       summary: One workspace, with the stages it would run now (or why it cannot run yet)
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -436,6 +480,8 @@ paths:
           application/json:
             schema: { type: object, properties: { name: { type: string }, request: { $ref: '#/components/schemas/RunRequest' } } }
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: Updated
           content:
@@ -446,26 +492,15 @@ paths:
         '409': { description: Name taken, $ref: '#/components/responses/Error' }
     delete:
       tags: [Workspaces]
-      summary: Delete a workspace (if it was current, there is no current one any more)
+      summary: Delete a workspace
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '204': { description: Deleted }
         '404': { $ref: '#/components/responses/Error' }
 
-  /api/workspaces/{ref}/select:
-    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
-    post:
-      tags: [Workspaces]
-      summary: Make it the current workspace (`/workspace <name>`)
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/WorkspaceView' }
-        '404': { $ref: '#/components/responses/Error' }
-
-  /api/workspaces/{ref}/profiles:
-    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
+  /api/workspaces/{workspaceId}/profiles:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
     post:
       tags: [Workspaces]
       summary: Load profiles (`/load`)
@@ -486,6 +521,8 @@ paths:
                 remove: { type: array, items: { type: string } }
                 global: { type: string, description: 'Global profile ("" for none)' }
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: Changed
           content:
@@ -502,12 +539,14 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
         '409': { description: The workspace builds its stages from tags, $ref: '#/components/responses/Error' }
 
-  /api/workspaces/{ref}/run:
-    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
+  /api/workspaces/{workspaceId}/run:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
     post:
       tags: [Workspaces]
-      summary: Start a run from the workspace (`/run`; the user only — the assistant cannot)
+      summary: Start a run from the workspace (`/run`)
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '201':
           description: Started (as POST /api/runs; `workspace` set)
           content:
@@ -516,136 +555,6 @@ paths:
         '400': { description: 'Not runnable yet (e.g. no objective or no stages), or setup missing', $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { description: Another run is active, $ref: '#/components/responses/Error' }
-
-  /api/chats:
-    get:
-      tags: [Assistant]
-      summary: Assistant chats, most recently active first
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    id: { type: string, format: uuid }
-                    title: { type: string }
-                    status: { type: string, enum: [idle, thinking] }
-                    createdAt: { type: string, format: date-time }
-                    updatedAt: { type: string, format: date-time }
-                    messageCount: { type: integer }
-    post:
-      tags: [Assistant]
-      summary: Start a chat
-      requestBody:
-        content:
-          application/json:
-            schema: { type: object, properties: { title: { type: string } } }
-      responses:
-        '201':
-          description: Created
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Chat' }
-
-  /api/chats/{chatId}:
-    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
-    get:
-      tags: [Assistant]
-      summary: A chat with all its messages (poll while status is thinking)
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Chat' }
-        '404': { $ref: '#/components/responses/Error' }
-    delete:
-      tags: [Assistant]
-      summary: Delete a chat
-      responses:
-        '204': { description: Deleted }
-        '409': { description: The assistant is still answering, $ref: '#/components/responses/Error' }
-
-  /api/chats/{chatId}/messages:
-    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
-    get:
-      tags: [Assistant]
-      summary: New messages for the CLI to print (waits for news)
-      description: |
-        Messages from index `after` on. While the assistant is answering and
-        nothing is new, waits up to `wait` ms (max 25000). A tool step is only
-        returned once it has finished, so print each message once and continue
-        with `after=next`. Stop when `status` is `idle` and nothing came back.
-        Text is cleaned of terminal control characters.
-      parameters:
-        - { name: after, in: query, schema: { type: integer, minimum: 0, default: 0 } }
-        - { name: wait, in: query, schema: { type: integer, minimum: 0, maximum: 25000, default: 0 } }
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [messages, next, status]
-                properties:
-                  messages: { type: array, items: { allOf: [{ $ref: '#/components/schemas/ChatMessage' }, { type: object, properties: { index: { type: integer } } }] } }
-                  next: { type: integer }
-                  status: { type: string, enum: [idle, thinking] }
-                  title: { type: string }
-        '404': { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Assistant]
-      summary: Send a message (the assistant answers in the background)
-      description: |
-        Starts one assistant turn: Codex in a hardened container with only the
-        user's LLM login and the engine's agent tools (no shell, files or web;
-        no Cyber Supplies token or passkey). Poll `GET /api/chats/{chatId}`
-        until `status` is `idle`. Runs and profile changes it suggests appear
-        as proposals (`/api/proposals`), linked from tool messages.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { type: object, required: [text], properties: { text: { type: string, minLength: 1, maxLength: 20000 } } }
-      responses:
-        '202':
-          description: Accepted; the chat is now thinking
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Chat' }
-        '400': { description: 'Empty/too long message, or no LLM login', $ref: '#/components/responses/Error' }
-        '409': { description: The assistant is still answering, $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/Error' }
-
-  /api/chats/{chatId}/stop:
-    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
-    post:
-      tags: [Assistant]
-      summary: Stop the assistant's current answer
-      responses:
-        '202':
-          description: Stopping
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Chat' }
-        '409': { $ref: '#/components/responses/Error' }
-
-  /api/chats/{chatId}/log:
-    parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
-    get:
-      tags: [Assistant]
-      summary: The chat's container log (debugging)
-      responses:
-        '200':
-          description: OK
-          content:
-            text/plain:
-              schema: { type: string }
 
   /api/runs/{runId}/feed:
     parameters: [{ $ref: '#/components/parameters/RunId' }]
@@ -661,6 +570,8 @@ paths:
         - { name: cursor, in: query, schema: { type: string, default: '' } }
         - { name: wait, in: query, schema: { type: integer, minimum: 0, maximum: 25000, default: 0 } }
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -709,6 +620,8 @@ paths:
         - { name: after, in: query, schema: { type: integer, minimum: 0, default: 0 } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 5000, default: 500 } }
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -731,6 +644,8 @@ paths:
       summary: A stage's container log
       description: "`[engine]` lines, cysu install output and Codex stderr. Never contains secrets."
       responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '200':
           description: OK
           content:
@@ -739,6 +654,11 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'The user''s Cyber Supplies user token (usr_…), the one given at setup.'
   parameters:
     RunId:
       name: runId
@@ -746,12 +666,12 @@ components:
       required: true
       description: The run id, or a unique prefix of it (at least 4 characters; the CLI shows 8)
       schema: { type: string }
-    WorkspaceRef:
-      name: ref
+    WorkspaceId:
+      name: workspaceId
       in: path
       required: true
-      description: Workspace name (URL-encoded, any case), its id, or `current`
-      schema: { type: string }
+      description: The workspace's exact id (no names, prefixes or other spellings; anything else is 404)
+      schema: { type: string, format: uuid }
     StageIndex:
       name: index
       in: path
@@ -760,6 +680,30 @@ components:
       schema: { type: integer, minimum: 0 }
 
   responses:
+    Unauthorized:
+      description: 'No engine token, or the wrong one (`setupRequired: false`); or the engine is not set up yet (`setupRequired: true`: run setup)'
+      headers:
+        WWW-Authenticate: { schema: { type: string, example: 'Bearer realm="cysu-engine"' } }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, setupRequired]
+            properties:
+              error: { type: string }
+              setupRequired: { type: boolean }
+    TooManyRequests:
+      description: Too many wrong engine tokens; every request is refused until the lockout ends
+      headers:
+        Retry-After: { description: Seconds until the lockout ends, schema: { type: integer } }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, retryAfter]
+            properties:
+              error: { type: string }
+              retryAfter: { type: integer, description: Seconds }
     Error:
       description: Error
       content:
@@ -792,8 +736,8 @@ components:
                       saved: { type: boolean, description: A ChatGPT login is saved }
                       savedAt: { type: string, format: date-time }
               globalProfile: { type: string }
-              agentModel: { type: string }
               configured: { type: boolean }
+              tokenChanged: { type: boolean, description: 'Only after PUT changed the token: use the new one from now on' }
     CodexLogin:
       description: ChatGPT sign-in state
       content:
@@ -970,52 +914,6 @@ components:
         workspace: { type: [object, 'null'], description: 'The workspace it was started from (/run)', properties: { id: { type: string }, name: { type: string } } }
         stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
 
-    Proposal:
-      type: object
-      required: [id, status, request, plan]
-      properties:
-        id: { type: string, format: uuid }
-        kind: { type: string, enum: [run, rerun, profile] }
-        status: { type: string, enum: [pending, approved, rejected, expired, stale] }
-        createdAt: { type: string, format: date-time }
-        decidedAt: { type: [string, 'null'], format: date-time }
-        summary: { type: string, description: The agent's explanation for the user }
-        request: { $ref: '#/components/schemas/RunRequest' }
-        plan:
-          description: 'run/rerun: the planned run (RunPlan). profile: the diff — {profile, exists, tagsBefore, tagsAfter, created[], updated[], removed[] (each {kind, name, preview}), unchanged, changes}'
-          oneOf: [{ $ref: '#/components/schemas/RunPlan' }, { type: object }]
-        change: { type: object, description: 'profile: the change {profile, tags?, upsert?, remove?}' }
-        result: { type: object, description: 'profile: what Cyber Supplies reported after saving' }
-        error: { type: string, description: 'Why it became stale' }
-        rerunOf: { type: [string, 'null'] }
-        runId: { type: [string, 'null'], description: Set once a run proposal is approved }
-
-    Chat:
-      type: object
-      required: [id, title, status, messages]
-      properties:
-        id: { type: string, format: uuid }
-        title: { type: string }
-        status: { type: string, enum: [idle, thinking] }
-        threadId: { type: [string, 'null'], description: The Codex conversation }
-        turns: { type: integer }
-        createdAt: { type: string, format: date-time }
-        updatedAt: { type: string, format: date-time }
-        messages: { type: array, items: { $ref: '#/components/schemas/ChatMessage' } }
-
-    ChatMessage:
-      type: object
-      required: [id, role, time]
-      properties:
-        id: { type: string }
-        role: { type: string, enum: [user, agent, tool, error, notice] }
-        text: { type: string, description: 'user/agent/error/notice: the text; tool: the call arguments' }
-        time: { type: string, format: date-time }
-        tool: { type: string, description: 'tool: which engine tool' }
-        status: { type: string, enum: [running, done, failed], description: 'tool only' }
-        result: { type: string, description: 'tool: shortened result' }
-        proposalId: { type: string, description: 'tool: the proposal it created (see /api/proposals)' }
-
     Workspace:
       type: object
       required: [id, name, request]
@@ -1025,7 +923,6 @@ components:
         request: { $ref: '#/components/schemas/RunRequest' }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
-        current: { type: boolean }
 
     WorkspaceView:
       allOf:

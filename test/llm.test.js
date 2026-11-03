@@ -10,6 +10,7 @@ import { mkdtemp, rm, stat, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { startFakeApi } from './fixtures/fake-api.js';
 
 const DATA = await mkdtemp(join(tmpdir(), 'cysu-engine-test-'));
 process.env.CYSU_ENGINE_DATA = DATA; // before the server modules load
@@ -119,25 +120,32 @@ test('forget login: removes it and switches back to no LLM login', async () => {
 test('HTTP API: login endpoints and the "sign in first" guard', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cysu-engine-http-'));
   const port = 18000 + Math.floor(Math.random() * 1000);
-  const server = spawn(process.execPath, ['server/index.js'], { env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir }, stdio: 'ignore' });
+  const TOKEN = 'usr_llm-http-test-4a1b';
+  const api = await startFakeApi('127.0.0.1', TOKEN);
+  const server = spawn(process.execPath, ['server/index.js'], { env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_API_URL: api.url }, stdio: 'ignore' });
   try {
     const url = (p) => `http://127.0.0.1:${port}${p}`;
-    await waitFor(() => fetch(url('/api/status')).then((r) => r.ok, () => false), 10_000);
+    await waitFor(() => fetch(url('/api/health')).then((r) => r.ok, () => false), 10_000);
+    const JSON_AUTH = { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` };
+    assert.equal((await fetch(url('/api/llm/codex-login'))).status, 401, 'not set up yet');
+    let r = await fetch(url('/api/settings'), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN, passkey: 'pk' }) });
+    assert.equal(r.status, 200, 'setup');
 
-    let r = await fetch(url('/api/llm/codex-login'));
+    r = await fetch(url('/api/llm/codex-login'), { headers: JSON_AUTH });
     assert.deepEqual(await r.json(), { status: 'idle' });
 
-    r = await fetch(url('/api/settings'), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ llm: { mode: 'codex' } }) });
+    r = await fetch(url('/api/settings'), { method: 'PUT', headers: JSON_AUTH, body: JSON.stringify({ llm: { mode: 'codex' } }) });
     assert.equal(r.status, 400);
     assert.match((await r.json()).error, /Sign in with ChatGPT first/);
 
-    r = await fetch(url('/api/settings'), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ llm: { mode: 'openai-api-key', apiKey: API_KEY } }) });
+    r = await fetch(url('/api/settings'), { method: 'PUT', headers: JSON_AUTH, body: JSON.stringify({ llm: { mode: 'openai-api-key', apiKey: API_KEY } }) });
     const s = await r.json();
     assert.equal(s.llm.mode, 'openai-api-key');
     assert.ok(!JSON.stringify(s).includes(API_KEY), 'API key returned unmasked');
     assert.deepEqual(s.llm.codex, { saved: false });
   } finally {
     server.kill();
+    api.server.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

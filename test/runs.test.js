@@ -26,6 +26,7 @@ const API_KEY = 'sk-runs-test-0f1e2d3c';
 const FAKE_AUTH = { auth_mode: 'chatgpt', tokens: { access_token: 'at-1', refresh_token: 'rt-original' } };
 
 let api, gateway;
+const AUTH = { Authorization: `Bearer ${TOKEN}` }; // the engine token (= the user token, after setup)
 const API_KEY_SETTINGS = { token: TOKEN, passkey: PASSKEY, llm: { mode: 'openai-api-key', apiKey: API_KEY } };
 let secrets = { settings: structuredClone(API_KEY_SETTINGS), codexAuth: null };
 let runs;
@@ -345,7 +346,7 @@ async function startServer(dir, port) {
   child.stdout.on('data', (d) => { output += d; });
   child.stderr.on('data', (d) => { output += d; });
   for (let i = 0; i < 50; i++) {
-    if (await fetch(`http://127.0.0.1:${port}/api/status`).then((r) => r.ok, () => false)) return { child, output: () => output };
+    if (await fetch(`http://127.0.0.1:${port}/api/health`).then((r) => r.ok, () => false)) return { child, output: () => output };
     await sleep(200);
   }
   child.kill('SIGKILL');
@@ -365,14 +366,17 @@ test('HTTP: same-machine protection (loopback Host, no Origin, JSON bodies)', as
       if (body) args.push('--data', body);
       execFile('curl', [...args, `${base}${path}`], (e, out) => resolve(Number(out)));
     });
-    assert.equal(await raw('/api/status', {}), 200, 'CLI-style request (no Origin)');
-    assert.equal(await raw('/api/status', { Host: 'evil.example:' + port }), 403, 'DNS rebinding Host');
-    assert.equal(await raw('/api/status', { Host: `localhost:${port}` }), 200);
+    // /api/health is the one route without the engine token, so it shows the
+    // same-machine checks on their own (they come before the token check).
+    assert.equal(await raw('/api/health', {}), 200, 'CLI-style request (no Origin)');
+    assert.equal(await raw('/api/health', { Host: 'evil.example:' + port }), 403, 'DNS rebinding Host');
+    assert.equal(await raw('/api/health', { Host: `localhost:${port}` }), 200);
     assert.equal(await raw('/api/settings', { Origin: 'https://evil.example' }), 403, 'other website');
     assert.equal(await raw('/api/settings', { Origin: `http://127.0.0.1:${port}` }), 403, 'no web UI any more: any Origin is refused');
-    assert.equal(await raw('/api/status', { Host: 'localhost:9999' }), 200, 'loopback on another port (container port mapping)');
-    assert.equal(await raw('/api/status', { Host: '[::1]:8787' }), 200);
-    assert.equal(await raw('/api/status', { Host: '127.0.0.1.evil.example' }), 403, 'look-alike name');
+    assert.equal(await raw('/api/health', { Host: 'localhost:9999' }), 200, 'loopback on another port (container port mapping)');
+    assert.equal(await raw('/api/health', { Host: '[::1]:8787' }), 200);
+    assert.equal(await raw('/api/health', { Host: '127.0.0.1.evil.example' }), 403, 'look-alike name');
+    assert.equal(await raw('/api/health', { Origin: 'https://evil.example' }), 403, 'health is same-machine only too');
     assert.equal(await raw('/api/runs', { 'Content-Type': 'application/x-www-form-urlencoded' }, 'POST', 'a=b'), 403, 'HTML form post');
     assert.equal(await raw('/api/runs', { 'Content-Type': 'text/plain' }, 'POST', '{}'), 403, 'text/plain post');
   } finally {
@@ -386,7 +390,7 @@ test('HTTP: full run lifecycle, then crash + restart marks it interrupted', asyn
   const port = 19500 + Math.floor(Math.random() * 400);
   const base = `http://127.0.0.1:${port}`;
   const json = (path, method = 'GET', body) => fetch(`${base}${path}`, {
-    method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined,
+    method, headers: { ...AUTH, ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined,
   }).then(async (r) => ({ status: r.status, body: r.status === 204 ? null : await r.json() }));
   let server = await startServer(dir, port);
   try {
@@ -413,7 +417,7 @@ test('HTTP: full run lifecycle, then crash + restart marks it interrupted', asyn
     const events = (await json(`/api/runs/${id}/stages/0/events?after=0`)).body;
     assert.equal(events.events.length, 7);
     assert.equal(events.done, true);
-    const log = await fetch(`${base}/api/runs/${id}/stages/0/log`).then((x) => x.text());
+    const log = await fetch(`${base}/api/runs/${id}/stages/0/log`, { headers: AUTH }).then((x) => x.text());
     assert.match(log, /LLM login: OpenAI API key/);
     assert.ok(!log.includes(API_KEY), 'API key in log');
     assert.equal((await json('/api/runs')).body[0].id, id);
@@ -448,7 +452,7 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
   const port = 20000 + Math.floor(Math.random() * 500);
   const base = `http://127.0.0.1:${port}`;
   const json = (path, method = 'GET', body) => fetch(`${base}${path}`, {
-    method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined,
+    method, headers: { ...AUTH, ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined,
   }).then(async (r) => ({ status: r.status, headers: r.headers, body: r.status === 204 ? null : await r.json().catch(() => null) }));
   const server = await startServer(dir, port);
   const waitDone = async (id) => {
@@ -475,7 +479,7 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     assert.deepEqual(second.stages.map((s) => `${s.profile}:${s.status}:${s.reprompts.length}`), first.stages.map((s) => `${s.profile}:succeeded:${s.reprompts.length}`));
 
     // download → a real tar.gz with run.json, events, logs and results
-    const res = await fetch(`${base}/api/runs/${first.id}/download`);
+    const res = await fetch(`${base}/api/runs/${first.id}/download`, { headers: AUTH });
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('content-type'), 'application/gzip');
     assert.match(res.headers.get('content-disposition'), new RegExp(`run-${first.id}\\.tar\\.gz`));
@@ -493,11 +497,13 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     const all = (await sh('tar', ['-xzOf', archive])).out;
     assert.ok(!all.includes(TOKEN) && !all.includes(PASSKEY) && !all.includes(API_KEY), 'secret inside the download');
 
-    // workspaces (basic HTTP; the full /load, /run, current tests are in workspaces-api.test.js)
+    // workspaces (basic HTTP, by exact id; the full /load, /run tests are in workspaces-api.test.js)
     let r = await json('/api/workspaces', 'POST', { name: 'Weekly recon', request });
     assert.equal(r.status, 201);
     const setupId = r.body.id;
-    r = await json(`/api/workspaces/${encodeURIComponent('weekly recon')}`, 'PATCH', { request: { ...request, prompt: 'changed' } });
+    r = await json(`/api/workspaces/${encodeURIComponent('Weekly recon')}`, 'PATCH', { request: { ...request, prompt: 'changed' } });
+    assert.equal(r.status, 404, 'a name is not a reference');
+    r = await json(`/api/workspaces/${setupId}`, 'PATCH', { request: { ...request, prompt: 'changed' } });
     assert.equal(r.status, 200);
     let list = (await json('/api/workspaces')).body;
     assert.equal(list.length, 1);
@@ -509,14 +515,14 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
 
     // No web UI any more: "/" only describes the API, other paths are 404,
     // and nothing the engine sends can be rendered or framed by a browser.
-    const root = await fetch(`${base}/`);
+    const root = await fetch(`${base}/`, { headers: AUTH });
     assert.equal(root.headers.get('content-type'), 'application/json');
     assert.match((await root.json()).ui, /cysu CLI/);
     for (const path of ['/index.html', '/app.js', '/style.css', '/web/app.js']) {
-      assert.equal((await fetch(`${base}${path}`)).status, 404, `${path} should not be served`);
+      assert.equal((await fetch(`${base}${path}`, { headers: AUTH })).status, 404, `${path} should not be served`);
     }
     for (const path of ['/', '/api/status', `/api/runs/${first.id}/download`]) {
-      const h = (await fetch(`${base}${path}`)).headers;
+      const h = (await fetch(`${base}${path}`, { headers: AUTH })).headers;
       assert.equal(h.get('content-security-policy'), "default-src 'none'; frame-ancestors 'none'", path);
       assert.equal(h.get('x-content-type-options'), 'nosniff');
       assert.equal(h.get('x-frame-options'), 'DENY');

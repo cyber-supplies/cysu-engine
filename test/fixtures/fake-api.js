@@ -45,7 +45,10 @@ function bundle(id) {
   };
 }
 
+// token: the user token it accepts (or a list of them). `tokens` can be
+// changed by tests (e.g. revoke one: tokens.delete(t)).
 export function startFakeApi(host, token) {
+  const tokens = new Set([].concat(token));
   const requests = [];
   // `saved` holds profiles written with PUT (they override the built-in bundles).
   const state = { list: structuredClone(DEFAULT_LIST), listStatus: 200, saved: new Map(), puts: [] };
@@ -53,7 +56,7 @@ export function startFakeApi(host, token) {
   const server = createServer((req, res) => {
     requests.push({ method: req.method, url: req.url, auth: req.headers.authorization });
     const json = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
-    if (req.headers.authorization !== `Bearer ${token}`) return json(401, { error: 'unauthorized' });
+    if (![...tokens].some((t) => req.headers.authorization === `Bearer ${t}`)) return json(401, { error: 'unauthorized' });
     if (req.method === 'GET' && req.url === '/api/profiles') {
       return state.listStatus === 200 ? json(200, state.list) : json(state.listStatus, { error: 'upstream trouble' });
     }
@@ -77,7 +80,7 @@ export function startFakeApi(host, token) {
     json(404, { error: 'not found' });
   });
   return new Promise((resolve) => server.listen(0, host, () => resolve({
-    server, requests, url: `http://${host}:${server.address().port}`,
+    server, requests, tokens, url: `http://${host}:${server.address().port}`,
     setProfiles: (list) => { state.list = structuredClone(list); },
     setListStatus: (status) => { state.listStatus = status; },
     setSaved: (id, doc) => { state.saved.set(id, structuredClone(doc)); if (!state.list.some((p) => p.id === id)) state.list.push({ id, tag: doc.tag ?? [] }); },

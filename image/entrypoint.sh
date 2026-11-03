@@ -1,26 +1,20 @@
 #!/bin/sh
-# Entrypoint of every engine container. Two roles (CYSU_ROLE):
-#   stage       (default) one stage of a run: install the global profile as the
-#               user and the stage profile in /workspace, then run Codex
-#               (see the stage section below, CYSU_STAGE_JSON)
-#   main-agent  one turn of the assistant chat (image/main-agent.sh)
+# Entrypoint of every engine container: one stage of a run. It installs the
+# global profile as the user and the stage profile in /workspace, then runs
+# Codex (see the stage section below, CYSU_STAGE_JSON).
 #
 # Secrets never come in as env vars or files (both show up in `docker inspect`
 # or on disk). With CYSU_SECRETS=stdin the engine writes ONE JSON line to the
 # container's stdin and closes it:
-#   stage:      {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}}
-#   main-agent: {"openaiApiKey": "..." | "codexAuth": {...}, "message": "...", "codexSessions": "<base64 tar>"}
+#   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}}
 # The passphrase is used once, by `cysu key init` as runner, to create
 # ~/.config/cysu/master.key; no long-lived process ever holds it. The LLM
 # login (an OpenAI API key, or a saved Codex/ChatGPT auth.json) is written to
-# ~/.codex/auth.json and is NOT left in the agent's environment. A stage agent
-# gets CYSU_TOKEN (the CLI only reads it from env), the key file and auth.json;
-# the main agent gets no Cyber Supplies token or key at all.
+# ~/.codex/auth.json and is NOT left in the agent's environment. The agent
+# gets CYSU_TOKEN (the CLI only reads it from env), the key file and auth.json.
 #
 # Other inputs (env, set by the engine, not secret):
-#   CYSU_ROLE           stage | main-agent
-#   CYSU_STAGE_JSON     stage: {profile, globalProfile, prompt, model, reasoningEffort, fallbackModel, reprompts}
-#   CYSU_CHAT_THREAD    main-agent: Codex conversation to continue (CYSU_CHAT_MODEL: model)
+#   CYSU_STAGE_JSON     {profile, globalProfile, prompt, model, reasoningEffort, fallbackModel, reprompts}
 #   CYSU_EGRESS_GUARD   0 disables the outbound firewall (local debugging and tests only)
 #
 # Started as root with only NET_ADMIN/SETUID/SETGID/KILL: installs the egress
@@ -67,42 +61,16 @@ if [ "$(id -u)" = "0" ]; then
     passphrase=$(field passphrase)
     openai_key=$(field openaiApiKey)
     codex_auth=$(printf '%s' "$secrets" | jq -c '.codexAuth // empty | objects' 2>/dev/null || true)
-    if [ "${CYSU_ROLE:-stage}" = "main-agent" ]; then
-      # The main agent gets NO Cyber Supplies token or passkey: it works only
-      # through the engine's tools. It needs the LLM login, the user's message
-      # and (after the first turn) the saved Codex conversation.
-      chat_message=$(field message)
-      chat_sessions=$(field codexSessions)
-      unset secrets
-      if [ -z "$codex_auth" ] && [ -z "$openai_key" ]; then
-        log "refusing to run: the main agent needs an LLM login" >&2
-        exit 4
-      fi
-      if [ -z "$chat_message" ]; then
-        log "refusing to run: no chat message" >&2
-        exit 4
-      fi
-      if [ -n "$chat_sessions" ]; then
-        if ! printf '%s' "$chat_sessions" | base64 -d | as_runner sh -c 'mkdir -p ~/.codex && tar -x -C ~/.codex --no-same-owner --no-same-permissions sessions'; then
-          log "refusing to run: could not restore the conversation" >&2
-          exit 4
-        fi
-      fi
-      unset chat_sessions
-      export CYSU_CHAT_MESSAGE="$chat_message"
-      unset chat_message
-    else
-      unset secrets
-      if [ -z "$token" ] || [ -z "$passphrase" ]; then
-        log "refusing to run: secrets on stdin must be a JSON line with token and passphrase" >&2
-        exit 4
-      fi
-      if ! CYSU_PASSPHRASE="$passphrase" as_runner cysu key init >/dev/null 2>&1; then
-        log "refusing to run: could not create the encryption key from the passkey" >&2
-        exit 4
-      fi
-      unset passphrase
+    unset secrets
+    if [ -z "$token" ] || [ -z "$passphrase" ]; then
+      log "refusing to run: secrets on stdin must be a JSON line with token and passphrase" >&2
+      exit 4
     fi
+    if ! CYSU_PASSPHRASE="$passphrase" as_runner cysu key init >/dev/null 2>&1; then
+      log "refusing to run: could not create the encryption key from the passkey" >&2
+      exit 4
+    fi
+    unset passphrase
 
     # LLM login -> ~/.codex/auth.json (0600, owned by runner). Fed through
     # stdin so the key/tokens never appear in argv or env.
@@ -123,7 +91,7 @@ if [ "$(id -u)" = "0" ]; then
     fi
     unset openai_key codex_auth
 
-    [ -z "$token" ] || [ "${CYSU_ROLE:-stage}" = "main-agent" ] || export CYSU_TOKEN="$token"
+    export CYSU_TOKEN="$token"
     unset token
   fi
   unset CYSU_SECRETS
@@ -134,10 +102,6 @@ fi
 
 if [ "$#" -gt 0 ]; then
   exec "$@"
-fi
-
-if [ "${CYSU_ROLE:-stage}" = "main-agent" ]; then
-  exec cysu-main-agent
 fi
 
 if [ -z "${CYSU_TOKEN:-}" ] || [ ! -f "$HOME/.config/cysu/master.key" ]; then

@@ -45,7 +45,10 @@ test('clear errors for a missing global profile, nothing to run, bad skip, bad d
 test('fetchProfiles: token required, upstream errors mapped', async () => {
   await assert.rejects(fetchProfiles(''), (e) => e.status === 400);
   const fake = (status, body) => async () => ({ ok: status === 200, status, json: async () => body });
-  await assert.rejects(fetchProfiles('t', { fetchImpl: fake(401, {}) }), (e) => e.status === 401);
+  // A refused token is a 502 (to the engine's client 401 means "wrong ENGINE token").
+  for (const code of [401, 403]) {
+    await assert.rejects(fetchProfiles('t', { fetchImpl: fake(code, {}) }), (e) => e.status === 502 && e.upstreamStatus === code && /did not accept your user token/.test(e.message));
+  }
   await assert.rejects(fetchProfiles('t', { fetchImpl: fake(500, {}) }), (e) => e.status === 502 && /\(500\)/.test(e.message));
   await assert.rejects(fetchProfiles('t', { fetchImpl: fake(200, { not: 'a list' }) }), (e) => e.status === 502);
   await assert.rejects(fetchProfiles('t', { fetchImpl: async () => { throw new Error('ECONNREFUSED'); } }), (e) => e.status === 502 && /ECONNREFUSED/.test(e.message));

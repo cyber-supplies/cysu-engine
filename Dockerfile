@@ -5,7 +5,7 @@
 #   docker run -d --name cysu-engine --restart unless-stopped --init \
 #     -p 127.0.0.1:8787:8787 \
 #     -v /var/run/docker.sock:/var/run/docker.sock \
-#     -v cysu-engine-data:/data -v cysu-engine-agent:/run/cysu-engine \
+#     -v cysu-engine-data:/data \
 #     cysu-engine:dev
 #
 #   docker build -t cysu-engine:dev .
@@ -18,7 +18,7 @@ LABEL org.opencontainers.image.source="https://github.com/cyber-supplies/cysu-en
       org.opencontainers.image.description="Cyber Supplies Engine: runs workspaces in Docker; used from the cysu CLI"
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
-# The worker image this engine starts for stages and the assistant. Local
+# The worker image this engine starts for stages. Local
 # builds use the locally built one; the release workflow passes the
 # published image of the same version.
 ARG WORKER_IMAGE=cysu-engine-workspace:dev
@@ -29,14 +29,11 @@ COPY server/ ./server/
 COPY docs/ ./docs/
 
 # Inside the container it listens on all interfaces, but the run command only
-# publishes it on the host's 127.0.0.1. The agent socket lives in the
-# cysu-engine-agent volume, which the assistant's containers mount too.
+# publishes it on the host's 127.0.0.1.
 ENV CYSU_ENGINE_IMAGE=${WORKER_IMAGE} \
     HOST=0.0.0.0 \
     PORT=8787 \
-    CYSU_ENGINE_DATA=/data \
-    CYSU_ENGINE_AGENT_SOCKET=/run/cysu-engine/agent.sock \
-    CYSU_ENGINE_AGENT_VOLUME=cysu-engine-agent
-VOLUME ["/data", "/run/cysu-engine"]
+    CYSU_ENGINE_DATA=/data
+VOLUME ["/data"]
 EXPOSE 8787
 CMD ["node", "server/index.js"]

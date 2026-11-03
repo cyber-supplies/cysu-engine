@@ -53,11 +53,6 @@ RUN npm install -g @cyber-supplies/cysu@${CYSU_VERSION} @openai/codex@${CODEX_VE
 RUN useradd -m -u 10001 -s /bin/bash runner && mkdir -p /workspace && chown runner:runner /workspace
 COPY --chmod=755 entrypoint.sh /usr/local/bin/cysu-entrypoint
 COPY --chmod=755 egress-guard.sh /usr/local/bin/cysu-egress-guard
-# MCP bridge for the main agent (engine tools over the mounted agent socket).
-COPY --chmod=755 engine-mcp.mjs /usr/local/bin/cysu-engine-mcp
-# The main agent (assistant chat): runner script + its instructions.
-COPY --chmod=755 main-agent.sh /usr/local/bin/cysu-main-agent
-COPY --chmod=644 main-agent.md /opt/cysu/main-agent.md
 
 # The cysu skill, from the public cysu-cli repo. It is kept OUTSIDE the home
 # directory and copied into ~/.codex/skills and ~/.agents/skills at container

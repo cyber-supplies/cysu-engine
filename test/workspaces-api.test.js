@@ -1,6 +1,5 @@
 // The API behind the CLI's slash commands: /workspace, /load, /run, /runs,
-// /watch (feed), /cancel, /download — with the "current" workspace and short
-// run ids. Real engine + stand-in Cyber Supplies API + stand-in Codex stages.
+// /watch (feed), /cancel, /download — workspaces by exact id, short run ids. Real engine + stand-in Cyber Supplies API + stand-in Codex stages.
 // Needs Docker + both images (npm run image:build && npm run image:build:test).
 
 import { test, before, after } from 'node:test';
@@ -26,7 +25,7 @@ before(async () => {
     stdio: 'ignore',
   });
   for (let i = 0; i < 50; i++) {
-    if (await fetch(`${base}/api/status`).then((r) => r.ok, () => false)) break;
+    if (await fetch(`${base}/api/health`).then((r) => r.ok, () => false)) break;
     await sleep(200);
   }
   await http('/api/settings', 'PUT', { token: TOKEN, passkey: 'pk', llm: { mode: 'openai-api-key', apiKey: 'sk-wsapi' } });
@@ -39,73 +38,94 @@ after(async () => {
 });
 
 function http(path, method = 'GET', body) {
-  return fetch(`${base}${path}`, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined })
+  const headers = { Authorization: `Bearer ${TOKEN}`, ...(body ? { 'Content-Type': 'application/json' } : {}) };
+  return fetch(`${base}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined })
     .then(async (r) => ({ status: r.status, body: r.status === 204 ? null : await r.json().catch(() => null) }));
 }
 const ws = (ref, rest = '') => `/api/workspaces/${encodeURIComponent(ref)}${rest}`;
 
-test('/workspace: a new workspace becomes current; status shows it; drafts are allowed', async () => {
-  assert.equal((await http('/api/status')).body.workspace, null);
+let wsId;
+test('/workspace: create returns the id; names do not work as references; drafts are allowed', async () => {
   const r = await http('/api/workspaces', 'POST', { name: 'My recon' });
   assert.equal(r.status, 201, JSON.stringify(r.body));
-  assert.equal(r.body.current, true);
+  wsId = r.body.id;
+  assert.match(wsId, /^[0-9a-f-]{36}$/);
+  assert.equal(r.body.current, undefined, 'no current workspace');
   assert.deepEqual(r.body.request, { prompt: '', stages: [] }, 'an empty draft to load profiles into');
-  assert.equal((await http('/api/status')).body.workspace, 'My recon');
-  const view = (await http(ws('current'))).body;
+  assert.equal((await http('/api/status')).body.workspace, undefined, 'status has no current workspace');
+  const view = (await http(ws(wsId))).body;
   assert.equal(view.name, 'My recon');
   assert.equal(view.plan, null);
   assert.match(view.planError, /stage|prompt/i, 'the draft says what it still needs');
-  assert.equal((await http('/api/workspaces', 'POST', { name: 'current' })).status, 400, '"current" is reserved');
+  for (const ref of ['My recon', 'my recon', 'current', wsId.slice(0, 8), wsId.toUpperCase()]) {
+    for (const [method, rest] of [['GET', ''], ['PATCH', ''], ['DELETE', ''], ['POST', '/profiles'], ['POST', '/run']]) {
+      const res = await http(ws(ref, rest), method, method === 'GET' || method === 'DELETE' ? undefined : { name: 'x', add: ['recon'] });
+      assert.equal(res.status, 404, `${method} ${ref}${rest}`);
+      assert.match(res.body.error, /No workspace with id/);
+    }
+  }
+  assert.equal((await http(ws(wsId))).body.name, 'My recon', 'nothing was changed or deleted by those');
+  assert.deepEqual((await http('/api/workspaces')).body.map((w) => [w.id, w.current]), [[wsId, undefined]]);
 });
 
 test('/load: add stage profiles in order, skip duplicates, refuse unknown ones, set the global profile, remove', async () => {
-  let r = await http(ws('my RECON', '/profiles'), 'POST', { add: ['recon', 'attack'] });
+  let r = await http(ws(wsId, '/profiles'), 'POST', { add: ['recon', 'attack'] });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.deepEqual([r.body.added, r.body.skipped], [['recon', 'attack'], []]);
-  r = await http(ws('current', '/profiles'), 'POST', { add: ['attack', 'escalate'], global: 'global' });
+  r = await http(ws(wsId, '/profiles'), 'POST', { add: ['attack', 'escalate'], global: 'global' });
   assert.deepEqual([r.body.added, r.body.skipped], [['escalate'], ['attack']]);
-  assert.deepEqual(r.body.request.stages.map((s) => s.profile), ['recon', 'attack', 'escalate']);
+  assert.deepEqual(r.body.request.stages, [{ profile: 'recon', tag: '1' }, { profile: 'attack', tag: '2' }, { profile: 'escalate', tag: '3' }], 'tags saved');
   assert.equal(r.body.request.globalProfile, 'global');
 
-  r = await http(ws('current', '/profiles'), 'POST', { add: ['not-mine'] });
+  r = await http(ws(wsId, '/profiles'), 'POST', { add: ['not-mine'] });
   assert.equal(r.status, 400);
   assert.match(r.body.error, /Not one of your profiles: not-mine/);
-  r = await http(ws('current', '/profiles'), 'POST', { global: 'nope' });
+  r = await http(ws(wsId, '/profiles'), 'POST', { global: 'nope' });
   assert.match(r.body.error, /Not one of your profiles: nope/);
-  r = await http(ws('current', '/profiles'), 'POST', { remove: ['escalate'] });
+  // Per-tag model + follow-up reach /load-ed stages now (they carry their tag).
+  const reqNow = (await http(ws(wsId))).body.request;
+  assert.equal(reqNow.stages.length, 3);
+  r = await http(ws(wsId), 'PATCH', { request: { ...reqNow, prompt: 'p', modelOverrides: [{ stage: 2, model: 'gpt-attack' }], reprompts: [{ stage: '3', prompt: 'again' }] } });
+  assert.equal(r.body.planError, null, r.body.planError);
+  assert.deepEqual(r.body.plan.stages.map((s) => `${s.profile}:${s.tag}:${s.model}`), ['recon:1:default', 'attack:2:gpt-attack', 'escalate:3:default']);
+  const planned = (await http('/api/runs/plan', 'POST', r.body.request)).body;
+  assert.deepEqual(planned.stages.map((s) => s.reprompts), [[], [], ['again']]);
+  await http(ws(wsId), 'PATCH', { request: reqNow }); // back to the draft (no objective) for the next tests
+  r = await http(ws(wsId, '/profiles'), 'POST', { remove: ['escalate'] });
   assert.deepEqual(r.body.request.stages.map((s) => s.profile), ['recon', 'attack']);
-  r = await http(ws('current', '/profiles'), 'POST', { remove: ['triage'] });
+  r = await http(ws(wsId, '/profiles'), 'POST', { remove: ['triage'] });
   assert.equal(r.status, 400);
   assert.match(r.body.error, /triage is not a stage of "My recon"/);
-  assert.equal((await http(ws('current', '/profiles'), 'POST', {})).status, 400);
-  assert.equal((await http(ws('current', '/profiles'), 'POST', { add: 'recon' })).status, 400);
+  assert.equal((await http(ws(wsId, '/profiles'), 'POST', {})).status, 400);
+  assert.equal((await http(ws(wsId, '/profiles'), 'POST', { add: 'recon' })).status, 400);
 
-  await http('/api/workspaces', 'POST', { name: 'Tagged', request: { prompt: 'p', fromTags: {} } });
-  r = await http(ws('Tagged', '/profiles'), 'POST', { add: ['recon'] });
+  const tagged = (await http('/api/workspaces', 'POST', { name: 'Tagged', request: { prompt: 'p', fromTags: {} } })).body;
+  r = await http(ws(tagged.id, '/profiles'), 'POST', { add: ['recon'] });
   assert.equal(r.status, 409);
   assert.match(r.body.error, /builds its stages from profile tags/);
 });
 
-test('/workspace <name>: switch the current workspace; listing marks it', async () => {
-  assert.equal((await http('/api/status')).body.workspace, 'Tagged', 'the newest one is current');
-  const r = await http(ws('my recon', '/select'), 'POST');
-  assert.equal(r.body.current, true);
-  const list = (await http('/api/workspaces')).body;
-  assert.deepEqual(list.filter((w) => w.current).map((w) => w.name), ['My recon']);
-  assert.equal((await http(ws('nope', '/select'), 'POST')).status, 404);
+test('the assistant, proposals and workspace selection are gone', async () => {
+  for (const [method, path] of [['GET', '/api/chats'], ['POST', '/api/chats'], ['GET', '/api/proposals'], ['POST', '/api/proposals/x/approve'],
+    ['POST', ws(wsId, '/select')]]) {
+    assert.equal((await http(path, method, method === 'POST' ? {} : undefined)).status, 404, `${method} ${path}`);
+  }
+  const s = (await http('/api/settings', 'PUT', { agentModel: 'gpt-6.1-sol' })).body;
+  assert.equal(s.agentModel, undefined, 'no assistant model setting');
+  assert.equal((await http('/api/status')).body.llm.model, undefined);
 });
 
 let runId;
-test('/run: refused while the workspace is incomplete; then the USER starts it', async () => {
-  let r = await http(ws('current', '/run'), 'POST');
+test('/run: refused while the workspace is incomplete; then it starts', async () => {
+  let r = await http(ws(wsId, '/run'), 'POST');
   assert.equal(r.status, 400);
   assert.match(r.body.error, /prompt/i);
-  await http(ws('current'), 'PATCH', { request: { ...(await http(ws('current'))).body.request, prompt: 'Map example.com (authorized).' } });
-  r = await http(ws('current', '/run'), 'POST');
+  await http(ws(wsId), 'PATCH', { request: { ...(await http(ws(wsId))).body.request, prompt: 'Map example.com (authorized).' } });
+  r = await http(ws(wsId, '/run'), 'POST');
   assert.equal(r.status, 201, JSON.stringify(r.body));
   runId = r.body.id;
   assert.equal(r.body.name, 'My recon');
-  assert.equal(r.body.workspace.name, 'My recon');
+  assert.deepEqual(r.body.workspace, { id: wsId, name: 'My recon' });
   assert.deepEqual(r.body.stages.map((s) => s.profile), ['recon', 'attack']);
   assert.equal(r.body.globalProfile, 'global');
 });
@@ -138,7 +158,7 @@ test('/watch: the feed waits for news and walks through every stage until done',
 test('short run ids work for /runs, /download, /cancel; bad ones are clear', async () => {
   const short = runId.slice(0, 8);
   assert.equal((await http(`/api/runs/${short}`)).body.id, runId);
-  const dl = await fetch(`${base}/api/runs/${short}/download`);
+  const dl = await fetch(`${base}/api/runs/${short}/download`, { headers: { Authorization: `Bearer ${TOKEN}` } });
   assert.equal(dl.status, 200);
   assert.equal(dl.headers.get('content-type'), 'application/gzip');
   assert.equal((await http(`/api/runs/${short}/cancel`, 'POST')).status, 409, 'not active');
@@ -148,12 +168,11 @@ test('short run ids work for /runs, /download, /cancel; bad ones are clear', asy
   assert.equal((await http('/api/runs')).body[0].workspace.name, 'My recon', '/runs shows where each run came from');
 });
 
-test('deleting the current workspace clears "current"', async () => {
-  assert.equal((await http(ws('current'), 'DELETE')).status, 204);
-  assert.equal((await http('/api/status')).body.workspace, null);
-  const r = await http(ws('current'));
+test('deleting a workspace by id', async () => {
+  assert.equal((await http(ws(wsId), 'DELETE')).status, 204);
+  const r = await http(ws(wsId));
   assert.equal(r.status, 404);
-  assert.match(r.body.error, /No current workspace/);
+  assert.match(r.body.error, /No workspace with id/);
 });
 
 test('settings: only a USER token (usr_…) is accepted; an LLM token is refused', async () => {
@@ -163,21 +182,12 @@ test('settings: only a USER token (usr_…) is accepted; an LLM token is refused
   assert.equal((await http('/api/settings', 'PUT', { token: TOKEN })).status, 200);
 });
 
-test('settings: the assistant\'s model can be chosen ("" = default), and is checked', async () => {
-  let r = await http('/api/settings', 'PUT', { agentModel: 'gpt-6.1-sol' });
-  assert.equal(r.body.agentModel, 'gpt-6.1-sol');
-  assert.equal((await http('/api/status')).body.llm.model, 'gpt-6.1-sol');
-  assert.equal((await http('/api/settings', 'PUT', { agentModel: 'bad model!' })).status, 400);
-  r = await http('/api/settings', 'PUT', { agentModel: '' });
-  assert.equal(r.body.agentModel, '');
-});
-
 test('unknown ids on log/feed/events endpoints get a clean 404, and the engine stays up', async () => {
   const z = '00000000-0000-4000-8000-000000000000';
-  for (const path of [`/api/chats/${z}/log`, `/api/runs/${z}/stages/0/log`, `/api/runs/${z}/feed`, `/api/runs/${z}/stages/0/events`, `/api/runs/${z}/download`, `/api/chats/${z}/messages`]) {
+  for (const path of [`/api/workspaces/${z}`, `/api/runs/${z}/stages/0/log`, `/api/runs/${z}/feed`, `/api/runs/${z}/stages/0/events`, `/api/runs/${z}/download`]) {
     const r = await http(path);
     assert.equal(r.status, 404, path);
-    assert.match(r.body.error, /not found/i, path);
+    assert.match(r.body.error, /not found|no workspace/i, path);
   }
   assert.equal((await http('/api/status')).status, 200, 'the engine must still be running');
 });

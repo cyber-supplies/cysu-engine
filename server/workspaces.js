@@ -1,11 +1,10 @@
 // workspaces.js: named, saved run setups. A workspace holds a run request
 // (global profile, stage profiles from tags or picked in order, objective,
-// models, follow-ups…). The assistant builds them; the user starts one with
-// /run in the CLI. Stored in <data>/workspaces.json.
+// models, follow-ups…). The user starts one with /run in the CLI. Stored in
+// <data>/workspaces.json.
 //
-// One workspace is "current" (shared by the CLI and the assistant): `current`
-// can be used wherever a workspace name is expected, and /run without a name
-// starts it. Stored in <data>/workspace-current.json.
+// A workspace is referred to ONLY by its exact id. Its name is a label for
+// people (unique, so lists stay readable), never a way to look it up.
 //
 // Older engines called these "saved setups" (workflows.json); they are carried
 // over the first time workspaces are loaded.
@@ -18,7 +17,6 @@ export class WorkspaceError extends Error {
 }
 
 const cleanName = (name) => String(name ?? '').replace(/\s+/g, ' ').trim();
-const RESERVED = ['current'];
 
 export class Workspaces {
   constructor({ store = { load, save } } = {}) {
@@ -42,47 +40,25 @@ export class Workspaces {
     return (await this.all()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  // find by id, by name (case-insensitive) — the CLI and the assistant use
-  // names — or "current".
-  async find(ref) {
-    const key = cleanName(ref);
-    if (!key) return null;
-    if (key.toLowerCase() === 'current') return this.current();
-    const items = await this.all();
-    return items.find((w) => w.id === key) || items.find((w) => w.name.toLowerCase() === key.toLowerCase()) || null;
-  }
-
-  async get(ref) {
-    const ws = await this.find(ref);
-    if (!ws) {
-      if (cleanName(ref).toLowerCase() === 'current') throw new WorkspaceError(404, 'No current workspace: pick one with /workspace <name>, or create one');
-      throw new WorkspaceError(404, `No workspace called "${cleanName(ref)}"`);
-    }
-    return ws;
-  }
-
-  async current() {
-    const id = (await this.store.load('workspace-current', null))?.id;
-    if (!id) return null;
-    return (await this.all()).find((w) => w.id === id) || null;
-  }
-
-  async select(ref) {
-    const ws = await this.get(ref);
-    await this.store.save('workspace-current', { id: ws.id });
+  // get finds a workspace by its exact id: no names, no prefixes, no trimming.
+  async get(id) {
+    const ws = typeof id === 'string' && id ? (await this.all()).find((w) => w.id === id) : null;
+    if (!ws) throw new WorkspaceError(404, `No workspace with id "${String(id ?? '').slice(0, 100)}"`);
     return ws;
   }
 
   // changeStages adds/removes picked stage profiles (in order) or sets the
   // global profile. Workspaces that build stages from tags have no list to
-  // change. Returns { workspace, added, skipped, removed }.
-  async changeStages(ref, { add = [], remove = [], global } = {}) {
+  // change. tagOf(profileId) gives the profile's stage tag ("1"-"4", or "" if
+  // it has none): it is saved with each added stage, so per-tag models and
+  // follow-ups reach it. Returns { workspace, added, skipped, removed }.
+  async changeStages(id, { add = [], remove = [], global, tagOf = () => '' } = {}) {
     return this.write(async () => {
       const items = await this.all();
-      const ws = await this.get(ref);
+      const ws = await this.get(id);
       const request = structuredClone(ws.request);
       if ((add.length || remove.length) && request.fromTags !== undefined) {
-        throw new WorkspaceError(409, `Workspace "${ws.name}" builds its stages from profile tags; ask the assistant to switch it to picked stages first`);
+        throw new WorkspaceError(409, `Workspace "${ws.name}" builds its stages from profile tags; switch it to picked stages (PATCH its request) first`);
       }
       const stages = Array.isArray(request.stages) ? request.stages : [];
       const out = { added: [], skipped: [], removed: [] };
@@ -95,7 +71,7 @@ export class Workspaces {
       }
       for (const id of add) {
         if (stages.some((st) => st.profile === id)) out.skipped.push(id);
-        else { stages.push({ profile: id }); out.added.push(id); }
+        else { const tag = tagOf(id); stages.push(tag ? { profile: id, tag } : { profile: id }); out.added.push(id); }
       }
       if (add.length || remove.length) request.stages = stages;
       if (global !== undefined) request.globalProfile = global;
@@ -113,7 +89,6 @@ export class Workspaces {
 
   static check(name, request) {
     if (!name) throw new WorkspaceError(400, 'A workspace needs a name');
-    if (RESERVED.includes(name.toLowerCase())) throw new WorkspaceError(400, `"${name}" is a reserved word; pick another name`);
     if (name.length > 80) throw new WorkspaceError(400, 'Workspace names are limited to 80 characters');
     if (!request || typeof request !== 'object' || Array.isArray(request)) throw new WorkspaceError(400, 'A workspace needs a run request');
   }
@@ -131,10 +106,10 @@ export class Workspaces {
     });
   }
 
-  async update(ref, { name, request } = {}) {
+  async update(id, { name, request } = {}) {
     return this.write(async () => {
       const items = await this.all();
-      const ws = await this.get(ref);
+      const ws = await this.get(id);
       const next = { ...ws, name: name === undefined ? ws.name : cleanName(name), request: request === undefined ? ws.request : structuredClone(request) };
       Workspaces.check(next.name, next.request);
       if (items.some((w) => w.id !== ws.id && w.name.toLowerCase() === next.name.toLowerCase())) throw new WorkspaceError(409, `A workspace called "${next.name}" already exists`);
@@ -144,11 +119,10 @@ export class Workspaces {
     });
   }
 
-  async delete(ref) {
+  async delete(id) {
     return this.write(async () => {
-      const ws = await this.get(ref);
+      const ws = await this.get(id);
       await this.store.save('workspaces', (await this.all()).filter((w) => w.id !== ws.id));
-      if ((await this.store.load('workspace-current', null))?.id === ws.id) await this.store.save('workspace-current', {});
       return ws;
     });
   }
