@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { hardeningArgs, IMAGE, LABEL, removeContainer, copyFileFromContainer } from './docker.js';
 import { keepRefreshedCodexAuth } from './llm.js';
+import { cleanText } from './runs.js';
 
 const CHAT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_MESSAGE = 20_000;
@@ -55,7 +56,12 @@ function toolResult(item) {
 
 export class Chats {
   // getSecrets: async () => ({ settings, codexAuth }); socketPath: the agent socket.
-  constructor({ dir, getSecrets, socketPath, image = IMAGE, extraEnv = {} }) {
+  // agentVolume: when the engine itself runs in a container, the socket lives
+  // in this named Docker volume (mounted at /run/cysu-engine in both the
+  // engine and the assistant's container); a host path would mean nothing to
+  // the host's Docker, and sockets do not cross Docker Desktop file shares.
+  constructor({ dir, getSecrets, socketPath, agentVolume = '', image = IMAGE, extraEnv = {} }) {
+    this.agentVolume = agentVolume;
     this.dir = dir;
     this.getSecrets = getSecrets;
     this.socketPath = socketPath;
@@ -170,12 +176,13 @@ export class Chats {
     else secrets.openaiApiKey = settings.llm.apiKey;
     if (sessions) secrets.codexSessions = sessions.toString('base64');
 
-    const env = { CYSU_ROLE: 'main-agent', CYSU_SECRETS: 'stdin', CYSU_ENGINE_SOCKET: '/run/cysu-engine.sock', ...this.extraEnv };
+    const socketInContainer = this.agentVolume ? `/run/cysu-engine/${this.socketPath.split('/').pop()}` : '/run/cysu-engine.sock';
+    const env = { CYSU_ROLE: 'main-agent', CYSU_SECRETS: 'stdin', CYSU_ENGINE_SOCKET: socketInContainer, ...this.extraEnv };
     if (chat.threadId) env.CYSU_CHAT_THREAD = chat.threadId;
     if (settings.agentModel) env.CYSU_CHAT_MODEL = settings.agentModel;
     if (process.env.CYSU_ENGINE_TEST_NO_FIREWALL === '1') env.CYSU_EGRESS_GUARD = '0';
     const args = ['run', '-i', '--name', active.container, '--label', `${LABEL}=chat`, ...hardeningArgs(),
-      '-v', `${this.socketPath}:/run/cysu-engine.sock`];
+      '-v', this.agentVolume ? `${this.agentVolume}:/run/cysu-engine` : `${this.socketPath}:/run/cysu-engine.sock`];
     for (const [k, v] of Object.entries(env)) args.push('-e', `${k}=${v}`);
     args.push(this.image);
 
@@ -231,6 +238,30 @@ export class Chats {
     else if (code !== 0 && !answered) push({ role: 'error', text: `The assistant stopped unexpectedly (exit ${code}). The log has details.` });
     chat.status = 'idle';
     await this.save(chat);
+  }
+
+  // messages: what the CLI prints. Messages from index `after` on, waiting up
+  // to `wait` ms for something new while the assistant is answering. A tool
+  // step is sent once it has finished (so it is printed once, complete); the
+  // returned `next` stops before it until then. Text is cleaned for terminals.
+  async messages(id, { after = 0, wait = 0 } = {}) {
+    const deadline = Date.now() + Math.min(25_000, Math.max(0, Number(wait) || 0));
+    const from = Math.max(0, Number(after) || 0);
+    for (;;) {
+      const chat = await this.read(id);
+      let end = chat.messages.length;
+      const running = chat.messages.findIndex((m, i) => i >= from && m.role === 'tool' && m.status === 'running');
+      if (running >= 0) end = running;
+      const messages = chat.messages.slice(from, end).map((m, i) => ({
+        index: from + i, ...m,
+        ...(m.text !== undefined ? { text: cleanText(m.text) } : {}),
+        ...(m.result !== undefined ? { result: cleanText(m.result) } : {}),
+      }));
+      if (messages.length || chat.status !== 'thinking' || Date.now() >= deadline) {
+        return { messages, next: end, status: chat.status, title: chat.title };
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
   }
 
   async log(id) {

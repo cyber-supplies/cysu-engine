@@ -36,6 +36,22 @@ export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+// Terminal-safe text: drop control characters (escape sequences could rewrite
+// the user's terminal), keep newlines and tabs.
+export const cleanText = (text) => String(text ?? '').replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
+
+// feedItem condenses one Codex/engine event for /watch (null = skip).
+function feedItem(e) {
+  const it = e.item || {};
+  if (e.type === 'engine.attempt') return { kind: 'attempt', text: cleanText(`${e.kind}${e.model ? ` (${e.model})` : ''}`) };
+  if (e.type === 'engine.attempt.finished' && e.exitCode !== 0) return { kind: 'error', text: `attempt ended with exit code ${e.exitCode}` };
+  if (e.type === 'item.completed' && it.type === 'agent_message') return { kind: 'message', text: cleanText(it.text) };
+  if (e.type === 'item.completed' && it.type === 'command_execution') return { kind: 'command', text: cleanText(it.command), exitCode: it.exit_code ?? null };
+  if (e.type === 'turn.failed' || e.type === 'error') return { kind: 'error', text: cleanText(e.error?.message || e.message) };
+  if (e.type === 'turn.completed') return { kind: 'turn', text: `turn finished · ${e.usage?.input_tokens ?? '?'} in / ${e.usage?.output_tokens ?? '?'} out` };
+  return null;
+}
+
 async function writeJson(file, value) {
   const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`; // unique: saves may overlap
   await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -94,6 +110,50 @@ export class Runs {
     } catch (error) {
       if (error.code === 'ENOENT') throw new HttpError(404, 'Run not found');
       throw error;
+    }
+  }
+
+  // resolve turns a full run id or a short prefix (≥ 4 characters, as the CLI
+  // shows: the first 8) into the full id.
+  async resolve(ref) {
+    const key = String(ref ?? '').trim().toLowerCase();
+    if (RUN_ID.test(key)) return key;
+    if (!/^[0-9a-f-]{4,35}$/.test(key)) throw new HttpError(404, 'Run not found');
+    let matches = [];
+    try { matches = (await readdir(this.dir)).filter((name) => RUN_ID.test(name) && name.startsWith(key)); } catch { /* no runs yet */ }
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) throw new HttpError(409, `Several runs start with ${key}; give more characters`);
+    throw new HttpError(404, 'Run not found');
+  }
+
+  // feed: one live view of a whole run for /watch — new condensed items from
+  // all stages after `cursor` ("seq,seq,…" per stage), waiting up to `wait` ms
+  // for something new while the run is active. Text is cleaned for terminals.
+  async feed(id, { cursor = '', wait = 0 } = {}) {
+    const deadline = Date.now() + Math.min(25_000, Math.max(0, Number(wait) || 0));
+    const after = String(cursor).split(',').map((n) => Math.max(0, Number(n) || 0));
+    for (;;) {
+      const run = await this.read(id);
+      const items = [];
+      const next = [];
+      for (const stage of run.stages) {
+        const from = after[stage.index] || 0;
+        const page = await this.events(id, stage.index, { after: from, limit: 5000 });
+        next[stage.index] = page.next;
+        for (const e of page.events) {
+          const item = feedItem(e);
+          if (item) items.push({ stage: stage.index, profile: stage.profile, seq: e.seq, time: e.time, ...item });
+        }
+      }
+      const active = ACTIVE.includes(run.status);
+      if (items.length || !active || Date.now() >= deadline) {
+        return {
+          run: { id: run.id, name: run.name, status: run.status, workspace: run.workspace ?? null,
+            stages: run.stages.map((st) => ({ index: st.index, profile: st.profile, tag: st.tag, status: st.status })) },
+          items, cursor: next.join(','), done: !active,
+        };
+      }
+      await new Promise((r) => setTimeout(r, 500));
     }
   }
 
@@ -196,6 +256,16 @@ export class Runs {
       throw error;
     }
 
+    if (input.fromTags === undefined) {
+      // Picked stages (checked for format above): every profile, and the global
+      // one, must be the user's, so a typo fails now with a clear message, not
+      // later inside a stage. fromTags already checked this against the list.
+      const mine = new Set((await this.listProfiles(settings)).map((r) => r?.id));
+      const missing = [...new Set(stages.map((st) => st.profile).filter((id) => !mine.has(id)))];
+      if (missing.length) throw new HttpError(400, `Not one of your profiles: ${missing.join(', ')}`);
+      if (defaults.globalProfile && !mine.has(defaults.globalProfile)) throw new HttpError(400, `Global profile ${defaults.globalProfile} is not one of your profiles`);
+    }
+
     return {
       name: String(input.name ?? '').trim().slice(0, 120),
       ...defaults,
@@ -219,6 +289,9 @@ export class Runs {
       // What was asked for: "run again" repeats it (fromTags runs re-read the
       // profile tags, so they pick up profile changes).
       request: requestOf(input), rerunOf: input.rerunOf ?? null,
+      // The workspace it was started from (/run <workspace> in the CLI).
+      workspace: input.workspace && typeof input.workspace === 'object'
+        ? { id: String(input.workspace.id || ''), name: String(input.workspace.name || '') } : null,
     };
     await mkdir(this.folder(run.id), { recursive: true, mode: 0o700 });
     await writeJson(join(this.folder(run.id), 'run.json'), run);

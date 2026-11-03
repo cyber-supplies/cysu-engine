@@ -1,5 +1,8 @@
 // Main-agent tools: MCP bridge ↔ agent socket ↔ engine. Real engine server,
 // stand-in Cyber Supplies API and stand-in Codex (no LLM).
+// Runs with ALL tools on (CYSU_ENGINE_AGENT_TOOLS=all), so the tools that are
+// switched off for now (proposals, profile editing) stay tested. The tools the
+// assistant actually gets are tested in agent-workspaces.test.js.
 // Needs Docker + both images (npm run image:build && npm run image:build:test).
 
 import { test, before, after } from 'node:test';
@@ -12,7 +15,7 @@ import { request } from 'node:http';
 import { startFakeApi } from './fixtures/fake-api.js';
 import { hardeningArgs } from '../server/docker.js';
 
-const TOKEN = 'agent-test-token-6d1f';
+const TOKEN = 'usr_agent-test-token-6d1f';
 const PASSKEY = 'agent-test-passkey-27aa';
 const API_KEY = 'sk-agent-test-9e8d7c';
 const TEST_IMAGE = 'cysu-engine-workspace:test';
@@ -28,7 +31,7 @@ before(async () => {
   const port = 21000 + Math.floor(Math.random() * 500);
   base = `http://127.0.0.1:${port}`;
   server = spawn(process.execPath, ['server/index.js'], {
-    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: TEST_IMAGE, CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
+    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: TEST_IMAGE, CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1', CYSU_ENGINE_AGENT_TOOLS: 'all' },
     stdio: 'ignore',
   });
   for (let i = 0; i < 50; i++) {
@@ -91,9 +94,9 @@ test('MCP handshake: initialize, ping, tools/list, unknown method', async () => 
   assert.deepEqual((await mcp.rpc('ping')).result, {});
   const { tools } = (await mcp.rpc('tools/list')).result;
   assert.deepEqual(tools.map((t) => t.name).sort(), [
-    'cancel_run', 'get_chatgpt_login_status', 'get_profile', 'get_proposal', 'get_run', 'get_setup_status', 'get_stage_activity',
-    'get_stage_log', 'list_profiles', 'list_runs', 'list_saved_setups', 'plan_profile_change', 'plan_run', 'propose_profile_change',
-    'propose_rerun', 'propose_run', 'start_chatgpt_login',
+    'cancel_run', 'create_workspace', 'get_chatgpt_login_status', 'get_profile', 'get_proposal', 'get_run', 'get_setup_status',
+    'get_stage_activity', 'get_stage_log', 'get_workspace', 'list_profiles', 'list_runs', 'list_saved_setups', 'list_workspaces',
+    'plan_profile_change', 'plan_run', 'propose_profile_change', 'propose_rerun', 'propose_run', 'start_chatgpt_login', 'update_workspace',
   ]);
   assert.ok(tools.every((t) => t.description && t.inputSchema?.type === 'object'));
   const unknown = await mcp.rpc('resources/list');
@@ -105,8 +108,8 @@ test('setup status tells the agent what the USER must do, then turns ready', asy
   assert.equal(r.data.ready, false);
   assert.equal(r.data.cyberSupplies, 'missing');
   assert.equal(r.data.llm, 'not logged in');
-  assert.ok(r.data.whatTheUserMustDo.some((t) => /token and passkey/.test(t) && /never ask for them in chat/.test(t)));
-  assert.ok(r.data.whatTheUserMustDo.some((t) => /Sign in with ChatGPT/.test(t)));
+  assert.ok(r.data.whatTheUserMustDo.some((t) => /\/setup/.test(t) && /token and passkey/.test(t) && /never ask for them in chat/.test(t)));
+  assert.ok(r.data.whatTheUserMustDo.some((t) => /\/setup/.test(t) && /Codex \(ChatGPT\) sign-in or an OpenAI API key/.test(t)));
   await http('/api/settings', 'PUT', { token: TOKEN, passkey: PASSKEY, globalProfile: 'global', llm: { mode: 'openai-api-key', apiKey: API_KEY } });
   r = await tool('get_setup_status');
   assert.equal(r.data.ready, true);
@@ -200,7 +203,7 @@ test('reject, rerun proposals, saved setups, cancel_run', async () => {
   assert.equal((await tool('get_proposal', { proposal_id: p.data.proposalId })).data.status, 'rejected');
   assert.equal((await http(`/api/proposals/${p.data.proposalId}/approve`, 'POST')).status, 409);
 
-  await http('/api/workflows', 'POST', { name: 'Weekly', request: { prompt: 'w', fromTags: {} } });
+  await http('/api/workspaces', 'POST', { name: 'Weekly', request: { prompt: 'w', fromTags: {} } });
   assert.deepEqual((await tool('list_saved_setups')).data.map((s) => s.name), ['Weekly']);
 
   api.setProfiles([{ id: 'global', tag: [] }, { id: 'slow', tag: ['1'] }]);

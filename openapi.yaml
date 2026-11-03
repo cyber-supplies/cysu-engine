@@ -1,11 +1,11 @@
 openapi: 3.1.0
 info:
   title: Cyber Supplies Engine API
-  version: 0.7.0
+  version: 0.8.1
   description: |
     Local API of cysu-engine: the self-hosted server that runs Cyber Supplies
-    profiles as agents in hardened Docker containers. The web UI and the
-    `cysu` CLI both use it.
+    profiles as agents in hardened Docker containers. There is no web UI: the
+    `cysu` CLI is the client (setup, assistant chat, slash commands).
 
     **Same machine only.** The engine listens on `http://127.0.0.1:8787`
     (change with `PORT`) and has no login. To keep web pages in your browser
@@ -42,13 +42,11 @@ info:
     Secrets (token, passkey, LLM keys/logins) are only ever written, never
     returned: reads show them masked.
 
-    **Main agent.** The main agent does not use this API. It gets a separate
-    Unix socket (`<data>/agent.sock`) with only its tools (see
-    `server/agent-tools.js`), bridged to MCP by `cysu-engine-mcp`. It can
-    plan and *propose* runs and profile changes (create/edit profiles in the
-    user's Cyber Supplies account); a proposal does nothing until the user
-    approves it here (`/api/proposals/{id}/approve`). Whole profiles are never
-    deleted by the agent.
+    **Main agent (the assistant).** It does not use this API. It gets a
+    separate Unix socket (`<data>/agent.sock`) with only its tools (see
+    `server/agent-tools.js`), bridged to MCP by `cysu-engine-mcp`. Today it
+    builds workspaces from the user's own profiles and reads run results; it
+    cannot start runs (the user does), propose, or change profiles.
 
     Errors are JSON `{"error": "<message>"}` with a 4xx/5xx status.
 servers:
@@ -60,11 +58,32 @@ tags:
   - name: LLM login
   - name: Profiles
   - name: Runs
-  - name: Saved setups
+  - name: Workspaces
   - name: Proposals
+    description: |
+      Not used today: the assistant only builds workspaces and the user starts
+      runs with /run. Kept for later, when the assistant may propose runs and
+      profile changes again (the user approves each one here).
   - name: Assistant
 
 paths:
+  /:
+    get:
+      tags: [Engine]
+      summary: What this server is (there is no web UI)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, example: cysu-engine }
+                  api: { type: string, example: /api }
+                  docs: { type: string, example: openapi.yaml }
+                  ui: { type: string, example: 'none: use the cysu CLI' }
+
   /api/status:
     get:
       tags: [Engine]
@@ -88,7 +107,9 @@ paths:
                     properties:
                       mode: { $ref: '#/components/schemas/LlmMode' }
                       ready: { type: boolean, description: 'The LLM login is complete (API key saved, or ChatGPT signed in)' }
+                      model: { type: string, description: 'The assistant''s model ("" = Codex default)' }
                   configured: { type: boolean, description: Everything a run needs is set up (cysu and llm.ready) }
+                  workspace: { type: [string, 'null'], description: The current workspace's name (for the CLI prompt) }
 
   /api/settings:
     get:
@@ -119,6 +140,7 @@ paths:
                     mode: { $ref: '#/components/schemas/LlmMode' }
                     apiKey: { type: string, description: OpenAI API key (for mode openai-api-key) }
                 globalProfile: { type: string, description: Default global profile ID for new runs ("" for none) }
+                agentModel: { type: string, description: 'The assistant''s model ("" = Codex default)' }
       responses:
         '200': { $ref: '#/components/responses/Settings' }
         '400': { $ref: '#/components/responses/Error' }
@@ -321,7 +343,7 @@ paths:
   /api/proposals:
     get:
       tags: [Proposals]
-      summary: Runs the main agent proposed, newest first
+      summary: Runs and profile changes the assistant proposed, newest first (not used today, see the Proposals tag)
       description: Pending proposals expire after 1 hour. Kept in memory (an engine restart clears them).
       responses:
         '200':
@@ -359,6 +381,141 @@ paths:
               schema: { $ref: '#/components/schemas/Proposal' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+
+  /api/workspaces:
+    get:
+      tags: [Workspaces]
+      summary: Workspaces, most recently changed first (`current` marks the one the user is on)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Workspace' } }
+    post:
+      tags: [Workspaces]
+      summary: Create a workspace (it becomes the current one)
+      description: Without a request it starts as an empty draft (`{prompt:"", stages:[]}`) to load profiles into.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80, description: Unique (any case); "current" is reserved }
+                request: { $ref: '#/components/schemas/RunRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workspace' }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { description: Name taken, $ref: '#/components/responses/Error' }
+
+  /api/workspaces/{ref}:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
+    get:
+      tags: [Workspaces]
+      summary: One workspace, with the stages it would run now (or why it cannot run yet)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceView' }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Workspaces]
+      summary: Rename and/or replace the request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string }, request: { $ref: '#/components/schemas/RunRequest' } } }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceView' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: Name taken, $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Workspaces]
+      summary: Delete a workspace (if it was current, there is no current one any more)
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/workspaces/{ref}/select:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
+    post:
+      tags: [Workspaces]
+      summary: Make it the current workspace (`/workspace <name>`)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceView' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/workspaces/{ref}/profiles:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
+    post:
+      tags: [Workspaces]
+      summary: Load profiles (`/load`)
+      description: |
+        Adds picked stage profiles (appended in order; ones already there are
+        skipped), removes some, and/or sets the global profile. Every profile
+        must be one of the user's (a dragged local folder: upload it first,
+        e.g. `cysu profiles save`). Workspaces that build their stages from
+        tags have no list to change (409).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                add: { type: array, items: { type: string } }
+                remove: { type: array, items: { type: string } }
+                global: { type: string, description: 'Global profile ("" for none)' }
+      responses:
+        '200':
+          description: Changed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/WorkspaceView' }
+                  - type: object
+                    properties:
+                      added: { type: array, items: { type: string } }
+                      skipped: { type: array, items: { type: string }, description: Already a stage }
+                      removed: { type: array, items: { type: string } }
+        '400': { description: 'Nothing to change, bad input, not one of your profiles, or not a stage', $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: The workspace builds its stages from tags, $ref: '#/components/responses/Error' }
+
+  /api/workspaces/{ref}/run:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceRef' }]
+    post:
+      tags: [Workspaces]
+      summary: Start a run from the workspace (`/run`; the user only — the assistant cannot)
+      responses:
+        '201':
+          description: Started (as POST /api/runs; `workspace` set)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '400': { description: 'Not runnable yet (e.g. no objective or no stages), or setup missing', $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: Another run is active, $ref: '#/components/responses/Error' }
 
   /api/chats:
     get:
@@ -415,6 +572,32 @@ paths:
 
   /api/chats/{chatId}/messages:
     parameters: [{ name: chatId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Assistant]
+      summary: New messages for the CLI to print (waits for news)
+      description: |
+        Messages from index `after` on. While the assistant is answering and
+        nothing is new, waits up to `wait` ms (max 25000). A tool step is only
+        returned once it has finished, so print each message once and continue
+        with `after=next`. Stop when `status` is `idle` and nothing came back.
+        Text is cleaned of terminal control characters.
+      parameters:
+        - { name: after, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: wait, in: query, schema: { type: integer, minimum: 0, maximum: 25000, default: 0 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages, next, status]
+                properties:
+                  messages: { type: array, items: { allOf: [{ $ref: '#/components/schemas/ChatMessage' }, { type: object, properties: { index: { type: integer } } }] } }
+                  next: { type: integer }
+                  status: { type: string, enum: [idle, thinking] }
+                  title: { type: string }
+        '404': { $ref: '#/components/responses/Error' }
     post:
       tags: [Assistant]
       summary: Send a message (the assistant answers in the background)
@@ -464,45 +647,52 @@ paths:
             text/plain:
               schema: { type: string }
 
-  /api/workflows:
+  /api/runs/{runId}/feed:
+    parameters: [{ $ref: '#/components/parameters/RunId' }]
     get:
-      tags: [Saved setups]
-      summary: Saved run setups
+      tags: [Runs]
+      summary: Live feed of a whole run (`/watch`)
+      description: |
+        New condensed items from every stage after `cursor` (pass back the
+        returned `cursor`; "" to start). While the run is active and nothing is
+        new, waits up to `wait` ms (max 25000). Stop when `done` is true and no
+        items came back. Text is cleaned of terminal control characters.
+      parameters:
+        - { name: cursor, in: query, schema: { type: string, default: '' } }
+        - { name: wait, in: query, schema: { type: integer, minimum: 0, maximum: 25000, default: 0 } }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema: { type: array, items: { $ref: '#/components/schemas/SavedSetup' } }
-    post:
-      tags: [Saved setups]
-      summary: Save a run setup (create, or update by id)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [name, request]
-              properties:
-                id: { type: string, description: Existing setup to update }
-                name: { type: string, minLength: 1, maxLength: 120 }
-                request: { $ref: '#/components/schemas/RunRequest' }
-      responses:
-        '200':
-          description: Saved
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/SavedSetup' }
-        '400': { $ref: '#/components/responses/Error' }
-
-  /api/workflows/{setupId}:
-    delete:
-      tags: [Saved setups]
-      summary: Delete a saved setup
-      parameters: [{ name: setupId, in: path, required: true, schema: { type: string } }]
-      responses:
-        '204': { description: Deleted }
+              schema:
+                type: object
+                required: [run, items, cursor, done]
+                properties:
+                  run:
+                    type: object
+                    properties:
+                      id: { type: string }
+                      name: { type: string }
+                      status: { $ref: '#/components/schemas/RunStatus' }
+                      workspace: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string } } }
+                      stages: { type: array, items: { type: object, properties: { index: { type: integer }, profile: { type: string }, tag: { type: string }, status: { $ref: '#/components/schemas/StageStatus' } } } }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [stage, profile, seq, kind, text]
+                      properties:
+                        stage: { type: integer }
+                        profile: { type: string }
+                        seq: { type: integer }
+                        time: { type: string, format: date-time }
+                        kind: { type: string, enum: [attempt, message, command, error, turn] }
+                        text: { type: string }
+                        exitCode: { type: [integer, 'null'], description: 'command only' }
+                  cursor: { type: string }
+                  done: { type: boolean }
+        '404': { $ref: '#/components/responses/Error' }
 
   /api/runs/{runId}/stages/{index}/events:
     parameters:
@@ -554,7 +744,14 @@ components:
       name: runId
       in: path
       required: true
-      schema: { type: string, format: uuid }
+      description: The run id, or a unique prefix of it (at least 4 characters; the CLI shows 8)
+      schema: { type: string }
+    WorkspaceRef:
+      name: ref
+      in: path
+      required: true
+      description: Workspace name (URL-encoded, any case), its id, or `current`
+      schema: { type: string }
     StageIndex:
       name: index
       in: path
@@ -595,6 +792,7 @@ components:
                       saved: { type: boolean, description: A ChatGPT login is saved }
                       savedAt: { type: string, format: date-time }
               globalProfile: { type: string }
+              agentModel: { type: string }
               configured: { type: boolean }
     CodexLogin:
       description: ChatGPT sign-in state
@@ -769,6 +967,7 @@ components:
         cancelRequested: { type: boolean }
         request: { $ref: '#/components/schemas/RunRequest', description: What was asked for (used by rerun) }
         rerunOf: { type: [string, 'null'], description: The run this one repeats }
+        workspace: { type: [object, 'null'], description: 'The workspace it was started from (/run)', properties: { id: { type: string }, name: { type: string } } }
         stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
 
     Proposal:
@@ -802,29 +1001,44 @@ components:
         turns: { type: integer }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
-        messages:
-          type: array
-          items:
-            type: object
-            required: [id, role, time]
-            properties:
-              id: { type: string }
-              role: { type: string, enum: [user, agent, tool, error, notice] }
-              text: { type: string, description: 'user/agent/error/notice: the text; tool: the call arguments' }
-              time: { type: string, format: date-time }
-              tool: { type: string, description: 'tool: which engine tool' }
-              status: { type: string, enum: [running, done, failed], description: 'tool only' }
-              result: { type: string, description: 'tool: shortened result' }
-              proposalId: { type: string, description: 'tool: the proposal it created (see /api/proposals)' }
+        messages: { type: array, items: { $ref: '#/components/schemas/ChatMessage' } }
 
-    SavedSetup:
+    ChatMessage:
+      type: object
+      required: [id, role, time]
+      properties:
+        id: { type: string }
+        role: { type: string, enum: [user, agent, tool, error, notice] }
+        text: { type: string, description: 'user/agent/error/notice: the text; tool: the call arguments' }
+        time: { type: string, format: date-time }
+        tool: { type: string, description: 'tool: which engine tool' }
+        status: { type: string, enum: [running, done, failed], description: 'tool only' }
+        result: { type: string, description: 'tool: shortened result' }
+        proposalId: { type: string, description: 'tool: the proposal it created (see /api/proposals)' }
+
+    Workspace:
       type: object
       required: [id, name, request]
       properties:
         id: { type: string }
         name: { type: string }
         request: { $ref: '#/components/schemas/RunRequest' }
+        createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
+        current: { type: boolean }
+
+    WorkspaceView:
+      allOf:
+        - { $ref: '#/components/schemas/Workspace' }
+        - type: object
+          properties:
+            plan:
+              type: [object, 'null']
+              description: The stages it would run now (null when it cannot run yet)
+              properties:
+                globalProfile: { type: string }
+                stages: { type: array, items: { type: object, properties: { order: { type: integer }, tag: { type: string }, profile: { type: string }, model: { type: string } } } }
+            planError: { type: [string, 'null'], description: 'Why it cannot run yet (e.g. no objective, no stages, unknown profile)' }
 
     RunSummary:
       type: object

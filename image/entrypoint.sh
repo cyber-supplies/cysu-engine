@@ -1,27 +1,32 @@
 #!/bin/sh
-# Prepares the workspace for one workflow run, then hands off to the agent.
+# Entrypoint of every engine container. Two roles (CYSU_ROLE):
+#   stage       (default) one stage of a run: install the global profile as the
+#               user and the stage profile in /workspace, then run Codex
+#               (see the stage section below, CYSU_STAGE_JSON)
+#   main-agent  one turn of the assistant chat (image/main-agent.sh)
 #
 # Secrets never come in as env vars or files (both show up in `docker inspect`
 # or on disk). With CYSU_SECRETS=stdin the engine writes ONE JSON line to the
 # container's stdin and closes it:
-#   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}}
+#   stage:      {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}}
+#   main-agent: {"openaiApiKey": "..." | "codexAuth": {...}, "message": "...", "codexSessions": "<base64 tar>"}
 # The passphrase is used once, by `cysu key init` as runner, to create
 # ~/.config/cysu/master.key; no long-lived process ever holds it. The LLM
 # login (an OpenAI API key, or a saved Codex/ChatGPT auth.json) is written to
-# ~/.codex/auth.json and is NOT left in the agent's environment. The agent
-# gets CYSU_TOKEN (the CLI only reads it from env), the key file and auth.json.
+# ~/.codex/auth.json and is NOT left in the agent's environment. A stage agent
+# gets CYSU_TOKEN (the CLI only reads it from env), the key file and auth.json;
+# the main agent gets no Cyber Supplies token or key at all.
 #
 # Other inputs (env, set by the engine, not secret):
-#   CYSU_PROVIDER            agent provider for profile installs (CODEX for now)
-#   CYSU_GLOBAL_PROFILE      profile installed as the user (global scope)
-#   CYSU_WORKSPACE_PROFILES  comma-separated profiles installed in /workspace
-#   CYSU_TASK                what the agent should do
-#   CYSU_EGRESS_GUARD        0 disables the outbound firewall (local debugging only)
+#   CYSU_ROLE           stage | main-agent
+#   CYSU_STAGE_JSON     stage: {profile, globalProfile, prompt, model, reasoningEffort, fallbackModel, reprompts}
+#   CYSU_CHAT_THREAD    main-agent: Codex conversation to continue (CYSU_CHAT_MODEL: model)
+#   CYSU_EGRESS_GUARD   0 disables the outbound firewall (local debugging and tests only)
 #
-# Started as root with only NET_ADMIN/SETUID/SETGID: installs the egress
+# Started as root with only NET_ADMIN/SETUID/SETGID/KILL: installs the egress
 # firewall, reads the secrets, then permanently drops to `runner` (uid 10001,
 # no capabilities) before any profile or agent code runs. With arguments, runs
-# that command as `runner` instead of the workflow setup (tests, engine tooling).
+# that command as `runner` instead (tests, engine tooling).
 set -eu
 
 log() { printf '[engine] %s\n' "$*" >&2; }

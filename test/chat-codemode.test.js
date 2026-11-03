@@ -13,11 +13,10 @@ import { join } from 'node:path';
 import { startFakeApi } from './fixtures/fake-api.js';
 import { startFakeLlm } from './fixtures/fake-llm.js';
 
-const TOKEN = 'codemode-test-token-71ab';
+const TOKEN = 'usr_codemode-test-token-71ab';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const ENGINE_TOOLS = ['cancel_run', 'get_chatgpt_login_status', 'get_profile', 'get_proposal', 'get_run', 'get_setup_status', 'get_stage_activity',
-  'get_stage_log', 'list_profiles', 'list_runs', 'list_saved_setups', 'plan_profile_change', 'plan_run', 'propose_profile_change', 'propose_rerun',
-  'propose_run', 'start_chatgpt_login'];
+const ENGINE_TOOLS = ['create_workspace', 'get_profile', 'get_run', 'get_setup_status', 'get_stage_activity', 'get_stage_log', 'get_workspace',
+  'list_profiles', 'list_runs', 'list_workspaces', 'plan_run', 'update_workspace'];
 
 let api, llm, dir, server, base, chatId;
 before(async () => {
@@ -80,7 +79,8 @@ test('Code Mode is really in use, and works (no "code-mode host is disabled")', 
 
 test('the instructions tell the model how to call the engine tools in Code Mode', () => {
   const req = llm.requests.at(-1).body;
-  assert.match(JSON.stringify(req.input), /tools\.mcp__cysu_engine__plan_run/);
+  assert.match(JSON.stringify(req.input), /tools\.mcp__cysu_engine__list_workspaces/);
+  assert.match(JSON.stringify(req.input), /\/run <workspace>/, 'the model is told the user starts runs');
 });
 
 test('inside exec: exactly the engine tools + read-only helpers', async () => {
@@ -92,17 +92,20 @@ test('inside exec: exactly the engine tools + read-only helpers', async () => {
   ].sort());
 });
 
-test('engine tool calls work through exec, show in the chat, and link proposals', async () => {
+test('engine tool calls work through exec, show in the chat; workspaces are built, nothing runs', async () => {
   let msgs = await say('CALL get_setup_status {}');
   assert.deepEqual(msgs.map((m) => `${m.role}${m.tool ? `:${m.tool}` : ''}`), ['user', 'tool:get_setup_status', 'agent'], JSON.stringify(msgs));
   assert.equal(msgs[1].status, 'done');
   assert.match(msgs[2].text, /"ready":true/);
 
-  msgs = await say('CALL propose_run {"request":{"prompt":"p","fromTags":{"skip":["3","4"]}},"summary":"via code mode"}');
-  const tool = msgs.find((m) => m.tool === 'propose_run');
-  assert.ok(tool?.proposalId, JSON.stringify(msgs));
-  assert.equal((await http('/api/proposals')).body.find((p) => p.id === tool.proposalId).status, 'pending');
-  assert.deepEqual((await http('/api/runs')).body, [], 'nothing runs before Approve');
+  msgs = await say('CALL create_workspace {"name":"Code mode ws","request":{"prompt":"p","fromTags":{"skip":["3","4"]}}}');
+  const tool = msgs.find((m) => m.tool === 'create_workspace');
+  assert.equal(tool?.status, 'done', JSON.stringify(msgs));
+  assert.match(msgs.at(-1).text, /\/run Code mode ws/);
+  assert.deepEqual((await http('/api/workspaces')).body.map((w) => w.name), ['Code mode ws']);
+  assert.deepEqual((await http('/api/runs')).body, [], 'the assistant must not start runs');
+  msgs = await say('CALL propose_run {"request":{"prompt":"p","fromTags":{}},"summary":"x"}');
+  assert.match(lastExecOutput(), /mcp__cysu_engine__propose_run|not a function|undefined/i, 'switched-off tools do not exist in Code Mode');
 });
 
 test('the JavaScript sandbox has no network, modules or process; file writes are blocked', async () => {

@@ -1,0 +1,7 @@
+# Never put local state (tokens, passkey, LLM logins, runs) into an image.
+data/
+node_modules/
+.git/
+test/
+image/
+*.log

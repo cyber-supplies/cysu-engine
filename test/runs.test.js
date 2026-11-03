@@ -20,7 +20,7 @@ const { LABEL } = await import('../server/docker.js');
 const { fetchProfiles } = await import('../server/profiles.js');
 
 const TEST_IMAGE = 'cysu-engine-workspace:test';
-const TOKEN = 'runs-test-token-91c2';
+const TOKEN = 'usr_runs-test-token-91c2';
 const PASSKEY = 'runs-test-passkey-55e0';
 const API_KEY = 'sk-runs-test-0f1e2d3c';
 const FAKE_AUTH = { auth_mode: 'chatgpt', tokens: { access_token: 'at-1', refresh_token: 'rt-original' } };
@@ -352,7 +352,7 @@ async function startServer(dir, port) {
   throw new Error(`server did not start: ${output}`);
 }
 
-test('HTTP: same-machine protection (Host, Origin, JSON bodies)', async () => {
+test('HTTP: same-machine protection (loopback Host, no Origin, JSON bodies)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cysu-engine-http-'));
   const port = 19000 + Math.floor(Math.random() * 500);
   const { child } = await startServer(dir, port);
@@ -369,7 +369,10 @@ test('HTTP: same-machine protection (Host, Origin, JSON bodies)', async () => {
     assert.equal(await raw('/api/status', { Host: 'evil.example:' + port }), 403, 'DNS rebinding Host');
     assert.equal(await raw('/api/status', { Host: `localhost:${port}` }), 200);
     assert.equal(await raw('/api/settings', { Origin: 'https://evil.example' }), 403, 'other website');
-    assert.equal(await raw('/api/settings', { Origin: `http://127.0.0.1:${port}` }), 200, 'the engine page itself');
+    assert.equal(await raw('/api/settings', { Origin: `http://127.0.0.1:${port}` }), 403, 'no web UI any more: any Origin is refused');
+    assert.equal(await raw('/api/status', { Host: 'localhost:9999' }), 200, 'loopback on another port (container port mapping)');
+    assert.equal(await raw('/api/status', { Host: '[::1]:8787' }), 200);
+    assert.equal(await raw('/api/status', { Host: '127.0.0.1.evil.example' }), 403, 'look-alike name');
     assert.equal(await raw('/api/runs', { 'Content-Type': 'application/x-www-form-urlencoded' }, 'POST', 'a=b'), 403, 'HTML form post');
     assert.equal(await raw('/api/runs', { 'Content-Type': 'text/plain' }, 'POST', '{}'), 403, 'text/plain post');
   } finally {
@@ -440,7 +443,7 @@ test('HTTP: full run lifecycle, then crash + restart marks it interrupted', asyn
   }
 });
 
-test('HTTP: run again, download (.tar.gz), saved setups, security headers', async () => {
+test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security headers', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cysu-engine-http-'));
   const port = 20000 + Math.floor(Math.random() * 500);
   const base = `http://127.0.0.1:${port}`;
@@ -490,29 +493,34 @@ test('HTTP: run again, download (.tar.gz), saved setups, security headers', asyn
     const all = (await sh('tar', ['-xzOf', archive])).out;
     assert.ok(!all.includes(TOKEN) && !all.includes(PASSKEY) && !all.includes(API_KEY), 'secret inside the download');
 
-    // saved setups
-    let r = await json('/api/workflows', 'POST', { name: 'Weekly recon', request });
-    assert.equal(r.status, 200);
+    // workspaces (basic HTTP; the full /load, /run, current tests are in workspaces-api.test.js)
+    let r = await json('/api/workspaces', 'POST', { name: 'Weekly recon', request });
+    assert.equal(r.status, 201);
     const setupId = r.body.id;
-    r = await json('/api/workflows', 'POST', { id: setupId, name: 'Weekly recon', request: { ...request, prompt: 'changed' } });
-    let list = (await json('/api/workflows')).body;
-    assert.equal(list.length, 1, 'saving with the same id updates');
+    r = await json(`/api/workspaces/${encodeURIComponent('weekly recon')}`, 'PATCH', { request: { ...request, prompt: 'changed' } });
+    assert.equal(r.status, 200);
+    let list = (await json('/api/workspaces')).body;
+    assert.equal(list.length, 1);
     assert.equal(list[0].request.prompt, 'changed');
-    assert.equal((await json('/api/workflows', 'POST', { name: '', request })).status, 400);
-    assert.equal((await json('/api/workflows', 'POST', { name: 'x', request: 'nope' })).status, 400);
-    assert.equal((await json(`/api/workflows/${setupId}`, 'DELETE')).status, 204);
-    assert.deepEqual((await json('/api/workflows')).body, []);
+    assert.equal((await json('/api/workspaces', 'POST', { name: '', request })).status, 400);
+    assert.equal((await json('/api/workspaces', 'POST', { name: 'x', request: 'nope' })).status, 400);
+    assert.equal((await json(`/api/workspaces/${setupId}`, 'DELETE')).status, 204);
+    assert.deepEqual((await json('/api/workspaces')).body, []);
 
-    // security headers on the page and on API responses
-    for (const path of ['/', '/app.js', '/api/status']) {
+    // No web UI any more: "/" only describes the API, other paths are 404,
+    // and nothing the engine sends can be rendered or framed by a browser.
+    const root = await fetch(`${base}/`);
+    assert.equal(root.headers.get('content-type'), 'application/json');
+    assert.match((await root.json()).ui, /cysu CLI/);
+    for (const path of ['/index.html', '/app.js', '/style.css', '/web/app.js']) {
+      assert.equal((await fetch(`${base}${path}`)).status, 404, `${path} should not be served`);
+    }
+    for (const path of ['/', '/api/status', `/api/runs/${first.id}/download`]) {
       const h = (await fetch(`${base}${path}`)).headers;
-      assert.match(h.get('content-security-policy'), /default-src 'none'; script-src 'self'/, path);
-      assert.doesNotMatch(h.get('content-security-policy'), /unsafe-inline|unsafe-eval/, path);
+      assert.equal(h.get('content-security-policy'), "default-src 'none'; frame-ancestors 'none'", path);
       assert.equal(h.get('x-content-type-options'), 'nosniff');
       assert.equal(h.get('x-frame-options'), 'DENY');
     }
-    const page = await fetch(`${base}/`).then((x) => x.text());
-    assert.doesNotMatch(page, /<script(?![^>]*\bsrc=)[^>]*>|\son[a-z]+\s*=/i, 'the page has no inline scripts or handlers (CSP would block them)');
   } finally {
     server.child.kill('SIGKILL');
     await rm(dir, { recursive: true, force: true });

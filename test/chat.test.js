@@ -13,7 +13,7 @@ import { startFakeApi } from './fixtures/fake-api.js';
 import { startFakeLlm } from './fixtures/fake-llm.js';
 import { hardeningArgs } from '../server/docker.js';
 
-const TOKEN = 'chat-test-token-4b2e';
+const TOKEN = 'usr_chat-test-token-4b2e';
 const PASSKEY = 'chat-test-passkey-8c1d';
 const API_KEY = 'sk-chat-test-3f9a0b';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -89,7 +89,8 @@ test('the model is offered ONLY the engine tools (no shell, files, web, sub-agen
   const top = req.tools.map((t) => t.name || t.type).sort();
   assert.deepEqual(top, ['list_mcp_resource_templates', 'list_mcp_resources', 'mcp__cysu_engine', 'read_mcp_resource', 'request_user_input']);
   const engineTools = req.tools.find((t) => t.name === 'mcp__cysu_engine').tools.map((t) => t.name);
-  assert.equal(engineTools.length, 17);
+  assert.equal(engineTools.length, 12, 'the shipped assistant tools (workspaces + results)');
+  for (const off of ['propose_run', 'propose_profile_change', 'cancel_run']) assert.ok(!engineTools.includes(off), `${off} must be off`);
   for (const forbidden of ['exec_command', 'shell', 'write_stdin', 'apply_patch', 'web_search', 'view_image', 'multi_agent_v1', 'image_generation']) {
     assert.ok(!JSON.stringify(req.tools.map((t) => t.name)).includes(`"${forbidden}"`), `${forbidden} offered`);
   }
@@ -113,16 +114,38 @@ test('the conversation continues: the second turn sees the first (session restor
   assert.match(JSON.stringify(req.input), /hello there/, 'earlier message missing: conversation not restored');
 });
 
-test('a proposed run waits for Approve; the chat links the proposal', async () => {
+test('the assistant builds a workspace from the chat; nothing runs until the user /runs it', async () => {
   const n = (await http(`/api/chats/${chat.id}`)).body.messages.length;
-  const done = await say(chat.id, 'CALL plan_run {"request":{"prompt":"from chat","fromTags":{"skip":["3","4"]}}}\nCALL propose_run {"request":{"prompt":"from chat","fromTags":{"skip":["3","4"]}},"summary":"Recon + attack."}');
+  const done = await say(chat.id, 'CALL plan_run {"request":{"prompt":"from chat","fromTags":{"skip":["3","4"]}}}\nCALL create_workspace {"name":"Chat recon","request":{"prompt":"from chat","fromTags":{"skip":["3","4"]}}}');
   const msgs = after_(done, n);
-  assert.deepEqual(msgs.map((m) => `${m.role}${m.tool ? `:${m.tool}` : ''}`), ['user', 'tool:plan_run', 'tool:propose_run', 'agent']);
-  const proposalId = msgs[2].proposalId;
-  assert.ok(proposalId, 'proposal id linked on the tool message');
-  const proposals = (await http('/api/proposals')).body;
-  assert.equal(proposals.find((p) => p.id === proposalId).status, 'pending');
-  assert.deepEqual((await http('/api/runs')).body, [], 'nothing runs before Approve');
+  assert.deepEqual(msgs.map((m) => `${m.role}${m.tool ? `:${m.tool}` : ''}`), ['user', 'tool:plan_run', 'tool:create_workspace', 'agent']);
+  assert.equal(msgs[2].status, 'done', msgs[2].result);
+  assert.match(msgs[3].text, /Start it with: \/run Chat recon/);
+  assert.deepEqual((await http('/api/workspaces')).body.map((w) => w.name), ['Chat recon']);
+  assert.deepEqual((await http('/api/runs')).body, [], 'the assistant must not start runs');
+});
+
+test('CLI chat feed: "messages after N" waits for news and only sends finished tool steps', async () => {
+  const start = (await http(`/api/chats/${chat.id}`)).body.messages.length;
+  const sent = await http(`/api/chats/${chat.id}/messages`, 'POST', { text: 'CALL list_workspaces {}' });
+  assert.equal(sent.status, 202);
+  let after = start;
+  const got = [];
+  for (let i = 0; i < 60; i++) {
+    const t = Date.now();
+    const page = (await http(`/api/chats/${chat.id}/messages?after=${after}&wait=10000`)).body;
+    for (const m of page.messages) {
+      assert.notEqual(m.status, 'running', 'a running tool step must not be sent');
+      assert.equal(m.index, after + page.messages.indexOf(m));
+      got.push(m);
+    }
+    after = page.next;
+    if (page.status === 'idle' && !page.messages.length) break;
+    if (page.status === 'thinking') assert.ok(page.messages.length || Date.now() - t >= 9_000, 'returned early with nothing new');
+  }
+  assert.deepEqual(got.map((m) => `${m.role}${m.tool ? `:${m.tool}:${m.status}` : ''}`), ['user', 'tool:list_workspaces:done', 'agent']);
+  const idle = (await http(`/api/chats/${chat.id}/messages?after=${after}&wait=5000`)).body;
+  assert.deepEqual([idle.messages, idle.status], [[], 'idle'], 'idle chats answer at once');
 });
 
 test('built-in tools cannot be used even if the model tries (shell → rejected, nothing runs)', async () => {
