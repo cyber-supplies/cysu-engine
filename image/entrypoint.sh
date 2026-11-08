@@ -139,6 +139,7 @@ prompt=$(stage prompt)
 model=$(stage model)
 effort=$(stage reasoningEffort)
 fallback_model=$(stage fallbackModel)
+daybreak=$(stage daybreak)
 reprompt_count=$(printf '%s' "$CYSU_STAGE_JSON" | jq '[.reprompts // [] | .[] | strings] | length')
 if [ -z "$profile" ] || [ -z "$prompt" ]; then
   log "refusing to run: CYSU_STAGE_JSON needs a profile and a prompt" >&2
@@ -147,6 +148,15 @@ fi
 case "$effort" in
   ''|none|minimal|low|medium|high|xhigh|max|ultra) ;;
   *) log "refusing to run: unknown reasoning effort" >&2; exit 5 ;;
+esac
+# OpenAI Daybreak: the Codex access program for every attempt of this stage
+# (initial, fallback, follow-ups). default = no flag (OpenAI decides).
+case "${daybreak:-default}" in
+  default) cyber_program='' ;;
+  standard) cyber_program=standard ;;
+  blue) cyber_program=daybreak_blue ;;
+  red) cyber_program=daybreak_red ;;
+  *) log "refusing to run: unknown daybreak setting" >&2; exit 5 ;;
 esac
 for m in "$model" "$fallback_model"; do
   if [ -n "$m" ] && ! printf '%s' "$m" | grep -Eq '^[A-Za-z0-9._:/-]{1,120}$'; then
@@ -203,7 +213,7 @@ rc=0
 # limit, not visible in ps). With THREAD it resumes that conversation.
 attempt() {
   a_kind=$1 a_model=$2 a_prompt=$3 a_thread=${4:-}
-  jq -cn --arg kind "$a_kind" --arg model "$a_model" '{type: "engine.attempt", kind: $kind, model: $model}'
+  jq -cn --arg kind "$a_kind" --arg model "$a_model" --arg daybreak "${daybreak:-default}" '{type: "engine.attempt", kind: $kind, model: $model, daybreak: $daybreak}'
   if [ -n "$a_thread" ]; then
     set -- codex exec resume --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check
   else
@@ -211,6 +221,7 @@ attempt() {
   fi
   [ -z "$a_model" ] || set -- "$@" --model "$a_model"
   [ -z "$effort" ] || set -- "$@" -c "model_reasoning_effort=\"$effort\""
+  [ -z "$cyber_program" ] || set -- "$@" --cyber-access-program "$cyber_program"
   [ -z "$a_thread" ] || set -- "$@" "$a_thread"
   : > "$ATTEMPT_EVENTS"
   { printf '%s' "$a_prompt" | "$@" -; echo $? > /tmp/cysu-rc; } | tee "$ATTEMPT_EVENTS"
@@ -223,7 +234,7 @@ attempt() {
 }
 
 cd /workspace
-log "running Codex${model:+ (model $model)}${effort:+ (effort $effort)}" >&2
+log "running Codex${model:+ (model $model)}${effort:+ (effort $effort)}${cyber_program:+ (Daybreak: $cyber_program)}" >&2
 if attempt initial "$model" "$prompt"; then
   :
 elif [ -n "$fallback_model" ] && [ "$rc" -lt 128 ]; then

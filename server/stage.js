@@ -5,7 +5,7 @@
 // Container protocol (see image/entrypoint.sh):
 //   stdin   one JSON line of secrets (token, passphrase, LLM login)
 //   env     CYSU_STAGE_JSON = {profile, globalProfile, prompt, model, reasoningEffort,
-//                              fallbackModel, reprompts}
+//                              fallbackModel, reprompts, daybreak}
 //   stdout  JSONL only: Codex events + engine.attempt / engine.attempt.finished
 //           markers around each Codex run (initial, fallback, reprompt)
 //   stderr  [engine] lines, cysu output, Codex stderr
@@ -16,6 +16,11 @@ import { createInterface } from 'node:readline';
 import { hardeningArgs, secretsLine, IMAGE, LABEL, removeContainer, copyFileFromContainer } from './docker.js';
 
 export const REASONING_EFFORTS = ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+// OpenAI Daybreak (Trusted Access for Cyber): which access program Codex asks
+// for. default = leave it to OpenAI (Daybreak where the account has it);
+// standard = off; blue / red = that tier (the account must be approved).
+export const DAYBREAK = ['default', 'standard', 'blue', 'red'];
+export const DAYBREAK_ERROR = 'daybreak must be one of default, standard, blue, red';
 const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MODEL = /^[A-Za-z0-9._:/-]{1,120}$/;
 const MAX_EVENTS = 20_000;
@@ -36,6 +41,7 @@ export function validateStage(input = {}) {
     reasoningEffort: String(input.reasoningEffort ?? '').trim(),
     fallbackModel: String(input.fallbackModel ?? '').trim(),
     reprompts: input.reprompts ?? [],
+    daybreak: String(input.daybreak || 'default').trim(),
   };
   if (!PROFILE_ID.test(stage.profile)) throw new StageError('A valid stage profile ID is required');
   if (stage.globalProfile && !PROFILE_ID.test(stage.globalProfile)) throw new StageError('Invalid global profile ID');
@@ -45,6 +51,7 @@ export function validateStage(input = {}) {
   if (stage.model && !MODEL.test(stage.model)) throw new StageError('Invalid model name');
   if (!REASONING_EFFORTS.includes(stage.reasoningEffort)) throw new StageError('Unknown reasoning effort');
   if (stage.fallbackModel && !MODEL.test(stage.fallbackModel)) throw new StageError('Invalid fallback model name');
+  if (!DAYBREAK.includes(stage.daybreak)) throw new StageError(DAYBREAK_ERROR);
   if (!Array.isArray(stage.reprompts) || !stage.reprompts.every((p) => typeof p === 'string' && p.trim())) {
     throw new StageError('Follow-up prompts must be a list of non-empty texts');
   }
@@ -62,7 +69,7 @@ function applyEvent(run, event) {
   const current = run.attempts.at(-1);
   switch (event.type) {
     case 'engine.attempt':
-      run.attempts.push({ kind: String(event.kind || ''), model: String(event.model || ''), startedAt: event.time, finishedAt: null, exitCode: null, turns: 0, status: 'running' });
+      run.attempts.push({ kind: String(event.kind || ''), model: String(event.model || ''), daybreak: String(event.daybreak || 'default'), startedAt: event.time, finishedAt: null, exitCode: null, turns: 0, status: 'running' });
       run.agentError = false;
       break;
     case 'engine.attempt.finished':

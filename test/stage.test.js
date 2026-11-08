@@ -42,9 +42,10 @@ test('stage definitions are validated before anything starts', () => {
     [{ profile: 'attack', prompt: 'x', reprompts: 'second wave' }, /Follow-up prompts must be a list/],
     [{ profile: 'attack', prompt: 'x', reprompts: ['ok', '  '] }, /Follow-up prompts must be a list of non-empty/],
     [{ profile: 'attack', prompt: 'x', reprompts: Array(21).fill('again') }, /At most 20 follow-up/],
+    [{ profile: 'attack', prompt: 'x', daybreak: 'daybreak_red' }, /daybreak must be one of default, standard, blue, red/],
   ]) assert.throws(() => validateStage(input), message);
   assert.deepEqual(validateStage({ profile: 'attack', prompt: 'go' }),
-    { profile: 'attack', globalProfile: '', prompt: 'go', model: '', reasoningEffort: '', fallbackModel: '', reprompts: [] });
+    { profile: 'attack', globalProfile: '', prompt: 'go', model: '', reasoningEffort: '', fallbackModel: '', reprompts: [], daybreak: 'default' });
 });
 
 test('full stage: installs global + stage profile, Codex sees both, run record filled in', async () => {
@@ -230,3 +231,21 @@ test('cysu skill: a profile that ships its own cysu skill is not overwritten', a
   } finally { api.reset(); }
 });
 
+
+test('Daybreak: every attempt (initial, fallback, follow-ups) asks Codex for the access program', async () => {
+  const r = await run({ profile: 'attack', prompt: 'go', model: 'bad-model', fallbackModel: 'gpt-5.6-cyber', daybreak: 'red', reprompts: ['more'] }).done;
+  assert.equal(r.status, 'succeeded', r.log);
+  assert.deepEqual(r.attempts.map((a) => `${a.kind}:${a.daybreak}`), ['initial:red', 'fallback:red', 'reprompt:red']);
+  const [fallback, followUp] = messages(r);
+  assert.match(fallback.args, /--model gpt-5\.6-cyber --cyber-access-program daybreak_red -$/);
+  assert.match(followUp.args, /--model gpt-5\.6-cyber --cyber-access-program daybreak_red fake-thread-\d+ -$/);
+  assert.match(r.log, /running Codex \(model bad-model\) \(Daybreak: daybreak_red\)/);
+  assert.equal(r.stage.daybreak, 'red');
+
+  for (const [daybreak, flag] of [['blue', / --cyber-access-program daybreak_blue -$/], ['standard', / --cyber-access-program standard -$/], ['default', /-C \/workspace -$/]]) {
+    const one = await run({ profile: 'attack', prompt: 'go', daybreak }).done;
+    assert.equal(one.status, 'succeeded', one.log);
+    assert.match(report(one).args, flag, daybreak);
+    assert.equal(one.attempts[0].daybreak, daybreak);
+  }
+});

@@ -227,6 +227,28 @@ test('plan: stages from tags, ordered; skip; per-tag models; nothing is started'
   assert.equal((await runs.list()).length, before, 'plan must not create a run');
 });
 
+test('plan: Daybreak for the whole run, per stage tag, or on one stage', async () => {
+  let plan = await runs.plan({ prompt: 'p', globalProfile: 'global', fromTags: {} });
+  assert.ok(plan.stages.every((s) => s.daybreak === 'default'), 'default: OpenAI decides');
+  assert.equal(plan.daybreak, 'default');
+
+  plan = await runs.plan({ prompt: 'p', globalProfile: 'global', fromTags: {}, daybreak: 'blue',
+    daybreakOverrides: [{ stage: 2, daybreak: 'red' }, { stage: '4', daybreak: 'standard' }] });
+  assert.deepEqual(plan.stages.map((s) => `${s.profile}=${s.daybreak}`),
+    ['recon=blue', 'attack=red', 'attack-b=red', 'escalate=blue', 'triage=standard']);
+  assert.deepEqual(plan.daybreakOverrides, [{ stage: 2, daybreak: 'red' }, { stage: 4, daybreak: 'standard' }]);
+
+  plan = await runs.plan({ prompt: 'p', daybreak: 'blue', stages: [{ profile: 'recon' }, { profile: 'attack', daybreak: 'red' }] });
+  assert.deepEqual(plan.stages.map((s) => s.daybreak), ['blue', 'red']);
+
+  await rejects(runs.plan({ prompt: 'p', fromTags: {}, daybreak: 'purple' }), 400, /daybreak must be one of default, standard, blue, red/);
+  await rejects(runs.plan({ prompt: 'p', fromTags: {}, daybreakOverrides: [{ stage: 2, daybreak: 'daybreak_red' }] }), 400, /Daybreak override needs a stage 1 to 4/);
+  await rejects(runs.plan({ prompt: 'p', fromTags: {}, daybreakOverrides: [{ stage: 2, daybreak: 'red' }, { stage: 2, daybreak: 'blue' }] }), 400, /Duplicate Daybreak override for stage 2/);
+  await rejects(runs.plan({ prompt: 'p', fromTags: {}, daybreakOverrides: 'red' }), 400, /must be a list/);
+  await rejects(runs.plan({ prompt: 'p', stages: [{ profile: 'attack' }], daybreakOverrides: [{ stage: 2, daybreak: 'red' }] }), 400, /apply to tagged stages/);
+  await rejects(runs.plan({ prompt: 'p', stages: [{ profile: 'attack', daybreak: 'pink' }] }), 400, /daybreak must be one of/);
+});
+
 test('plan: clear errors (untagged profile, unknown global, bad overrides, upstream down)', async () => {
   api.setProfiles([{ id: 'global', tag: [] }, { id: 'recon', tag: ['1'] }, { id: 'notes', tag: [] }]);
   await rejects(runs.plan({ prompt: 'p', globalProfile: 'global', fromTags: {} }), 400, /Profile notes must have exactly one stage tag/);
@@ -239,6 +261,19 @@ test('plan: clear errors (untagged profile, unknown global, bad overrides, upstr
   api.setListStatus(500);
   await rejects(runs.plan({ prompt: 'p', globalProfile: 'global', fromTags: {} }), 502, /profile lookup failed \(500\)/);
   api.reset();
+});
+
+test('Daybreak reaches each stage\'s Codex and shows in the run and the /watch feed', async () => {
+  const created = await runs.create({ prompt: 'p', globalProfile: 'global', fromTags: { skip: ['3', '4'] }, daybreak: 'blue', daybreakOverrides: [{ stage: 2, daybreak: 'red' }] });
+  const run = await finished(created.id, 180_000);
+  assert.equal(run.status, 'succeeded');
+  assert.deepEqual(run.stages.map((st) => `${st.profile}:${st.daybreak}:${st.attempts.map((a) => a.daybreak)}`), ['recon:blue:blue', 'attack:red:red', 'attack-b:red:red']);
+  const args = run.stages.map((st) => JSON.parse(st.result).args);
+  assert.match(args[0], /--cyber-access-program daybreak_blue -$/);
+  assert.match(args[1], /--cyber-access-program daybreak_red -$/);
+  assert.deepEqual(run.request.daybreakOverrides, [{ stage: 2, daybreak: 'red' }], '"run again" keeps it');
+  const feed = await runs.feed(run.id, { cursor: '' });
+  assert.deepEqual(feed.items.filter((it) => it.kind === 'attempt').map((it) => it.text), ['initial · Daybreak blue', 'initial · Daybreak red', 'initial · Daybreak red']);
 });
 
 test('ordered run: every stage in order, each in a FRESH container with global + its own profile', async () => {

@@ -71,7 +71,7 @@ async function workspaceView(ws) {
   try {
     // Workspaces have no objective: plan with a stand-in to check the rest.
     const p = await runs.plan({ ...ws.request, objective: 'objective given at run time' });
-    plan = { stages: p.stages.map((st) => ({ order: st.index + 1, tag: st.tag, profile: st.profile, model: st.model || 'default' })), globalProfile: p.globalProfile || '' };
+    plan = { stages: p.stages.map((st) => ({ order: st.index + 1, tag: st.tag, profile: st.profile, model: st.model || 'default', daybreak: st.daybreak })), globalProfile: p.globalProfile || '' };
   } catch (error) { planError = error.message; }
   return { ...ws, plan, planError };
 }

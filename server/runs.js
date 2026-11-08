@@ -17,7 +17,7 @@ import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { startStage, cancelStage, validateStage, StageError } from './stage.js';
+import { startStage, cancelStage, validateStage, StageError, DAYBREAK, DAYBREAK_ERROR } from './stage.js';
 import { removeOrphanContainers } from './docker.js';
 import { keepRefreshedCodexAuth } from './llm.js';
 import { orderProfiles, STAGE_TAGS, ProfileError } from './profiles.js';
@@ -25,7 +25,7 @@ import { tarGz } from './tar.js';
 
 // The request fields a run remembers, so it can be run again.
 const REQUEST_FIELDS = ['name', 'objective', 'prompt', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
-  'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts'];
+  'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts', 'daybreak', 'daybreakOverrides'];
 const requestOf = (input) => structuredClone(Object.fromEntries(REQUEST_FIELDS.filter((k) => input[k] !== undefined).map((k) => [k, input[k]])));
 
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -43,7 +43,10 @@ export const cleanText = (text) => String(text ?? '').replace(/[\u0000-\u0008\u0
 // feedItem condenses one Codex/engine event for /watch (null = skip).
 function feedItem(e) {
   const it = e.item || {};
-  if (e.type === 'engine.attempt') return { kind: 'attempt', text: cleanText(`${e.kind}${e.model ? ` (${e.model})` : ''}`) };
+  if (e.type === 'engine.attempt') {
+    const daybreak = e.daybreak && e.daybreak !== 'default' ? ` · Daybreak ${e.daybreak}` : '';
+    return { kind: 'attempt', text: cleanText(`${e.kind}${e.model ? ` (${e.model})` : ''}${daybreak}`), daybreak: cleanText(e.daybreak || 'default') };
+  }
   if (e.type === 'engine.attempt.finished' && e.exitCode !== 0) return { kind: 'error', text: `attempt ended with exit code ${e.exitCode}` };
   if (e.type === 'item.completed' && it.type === 'agent_message') return { kind: 'message', text: cleanText(it.text) };
   if (e.type === 'item.completed' && it.type === 'command_execution') return { kind: 'command', text: cleanText(it.command), exitCode: it.exit_code ?? null };
@@ -194,7 +197,10 @@ export class Runs {
       model: String(input.model ?? '').trim(),
       reasoningEffort: String(input.reasoningEffort ?? '').trim(),
       fallbackModel: String(input.fallbackModel ?? '').trim(),
+      // OpenAI Daybreak access program for every stage (see stage.js).
+      daybreak: String(input.daybreak || 'default').trim(),
     };
+    if (!DAYBREAK.includes(defaults.daybreak)) throw new HttpError(400, DAYBREAK_ERROR);
     const continueOnFailure = input.continueOnFailure === undefined ? true : input.continueOnFailure;
     if (typeof continueOnFailure !== 'boolean') throw new HttpError(400, 'continueOnFailure must be true or false');
 
@@ -209,6 +215,19 @@ export class Runs {
       }
       if (modelForTag.has(tag)) throw new HttpError(400, `Duplicate model override for stage ${tag}`);
       modelForTag.set(tag, o.model);
+    }
+
+    // Daybreak per stage tag, like the models (e.g. recon on blue, exploitation on red).
+    const daybreakList = input.daybreakOverrides ?? [];
+    if (!Array.isArray(daybreakList)) throw new HttpError(400, 'daybreakOverrides must be a list');
+    const daybreakForTag = new Map();
+    for (const o of daybreakList) {
+      const tag = String(o?.stage ?? '');
+      if (!STAGE_TAGS.includes(tag) || !DAYBREAK.includes(o?.daybreak)) {
+        throw new HttpError(400, 'Each Daybreak override needs a stage 1 to 4 and one of default, standard, blue, red');
+      }
+      if (daybreakForTag.has(tag)) throw new HttpError(400, `Duplicate Daybreak override for stage ${tag}`);
+      daybreakForTag.set(tag, o.daybreak);
     }
 
     // Follow-up prompts per stage tag (Windmill's "post-completion prompts"):
@@ -241,8 +260,8 @@ export class Runs {
     }
     if (requested.length < 1) throw new HttpError(400, 'A run needs at least one stage (send stages, or fromTags)');
     if (requested.length > MAX_STAGES) throw new HttpError(400, `At most ${MAX_STAGES} stages per run`);
-    if ((modelForTag.size || repromptsForTag.size) && input.fromTags === undefined && !requested.some((s) => s?.tag)) {
-      throw new HttpError(400, 'modelOverrides and reprompts apply to tagged stages (use fromTags, or set them on each stage)');
+    if ((modelForTag.size || repromptsForTag.size || daybreakForTag.size) && input.fromTags === undefined && !requested.some((s) => s?.tag)) {
+      throw new HttpError(400, 'modelOverrides, daybreakOverrides and reprompts apply to tagged stages (use fromTags, or set them on each stage)');
     }
 
     let stages;
@@ -253,7 +272,8 @@ export class Runs {
         if (tag && !STAGE_TAGS.includes(tag)) throw new StageError('Stage tag must be 1 to 4');
         const model = own.model ?? modelForTag.get(tag) ?? defaults.model;
         const reprompts = own.reprompts ?? repromptsForTag.get(tag) ?? [];
-        const stage = validateStage({ ...defaults, ...own, model, reprompts });
+        const daybreak = own.daybreak ?? daybreakForTag.get(tag) ?? defaults.daybreak;
+        const stage = validateStage({ ...defaults, ...own, model, reprompts, daybreak });
         return { index, tag, ...stage, status: 'pending', startedAt: null, finishedAt: null, exitCode: null,
           threadId: null, turns: 0, usage: null, result: '', errors: [], attempts: [], eventCount: 0 };
       });
@@ -279,6 +299,7 @@ export class Runs {
       source: input.fromTags !== undefined ? 'tags' : 'explicit',
       skip: input.fromTags?.skip ?? [],
       modelOverrides: [...modelForTag].map(([stage, model]) => ({ stage: Number(stage), model })),
+      daybreakOverrides: [...daybreakForTag].map(([stage, daybreak]) => ({ stage: Number(stage), daybreak })),
       reprompts: repromptList.map((r) => ({ stage: String(r.stage), prompt: r.prompt })),
       continueOnFailure,
       stages,
@@ -362,7 +383,7 @@ export class Runs {
     try {
       const live = startStage({
         stage: { profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
-          reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts },
+          reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts, daybreak: stage.daybreak },
         settings, codexAuth, ...this.stageOptions,
         onLog: (line) => write(log, `${line}\n`),
         onUpdate: (live, event) => {
