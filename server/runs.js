@@ -68,14 +68,19 @@ export class Runs {
   // getSecrets: async () => ({ settings, codexAuth }) — read fresh for every stage.
   // listProfiles: async (settings) => the user's profiles [{ id, tag }] (for fromTags).
   // stageOptions: passed through to startStage (tests use a stand-in image/API).
-  constructor({ dir, getSecrets, listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {} }) {
+  // onIdle: called after a run ends and the engine is free again (the scheduler
+  // starts a waiting scheduled run then).
+  constructor({ dir, getSecrets, listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {} }) {
     this.dir = dir;
+    this.onIdle = onIdle;
     this.getSecrets = getSecrets;
     this.listProfiles = listProfiles;
     this.stageOptions = stageOptions;
     this.active = null; // { run, stage (live stage record) }
     this.saveTimer = null;
   }
+
+  get busy() { return Boolean(this.active); }
 
   folder(id) {
     if (!RUN_ID.test(id)) throw new HttpError(404, 'Run not found');
@@ -279,7 +284,9 @@ export class Runs {
   }
 
   // create plans the run, saves it and starts it in the background.
-  async create(input = {}) {
+  // `schedule` ({ id, name }) marks a run started by a schedule; it is not part
+  // of the request, so "run again" makes an ordinary run.
+  async create(input = {}, { schedule = null } = {}) {
     if (this.active) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
     const plan = await this.plan(input);
     if (this.active) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
@@ -292,6 +299,9 @@ export class Runs {
       // The workspace it was started from (/run <workspace> in the CLI).
       workspace: input.workspace && typeof input.workspace === 'object'
         ? { id: String(input.workspace.id || ''), name: String(input.workspace.name || '') } : null,
+      // Who started it: the user, or a schedule (the engine, by itself).
+      trigger: schedule ? 'schedule' : 'user',
+      schedule: schedule ? { id: String(schedule.id), name: String(schedule.name || '') } : null,
     };
     await mkdir(this.folder(run.id), { recursive: true, mode: 0o700 });
     await writeJson(join(this.folder(run.id), 'run.json'), run);
@@ -331,6 +341,7 @@ export class Runs {
       run.finishedAt = new Date().toISOString();
       await this.save(run);
       this.active = null;
+      try { this.onIdle(); } catch (error) { console.error('onIdle:', error); }
     }
   }
 

@@ -49,7 +49,7 @@ It also restarts by itself after a reboot (`--restart unless-stopped`).
 ## Where your data is
 
 Everything stays on this machine, in the Docker volume `cysu-engine-data`:
-your token, passkey, LLM login, workspaces and runs. Your passkey is
+your token, passkey, LLM login, workspaces, schedules and runs. Your passkey is
 never sent to Cyber Supplies; it is only used inside your own containers.
 
 To remove the engine **and all its data**:
@@ -73,6 +73,11 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
 - **Workers are locked down.** Each stage runs in a fresh container as an
   unprivileged user, with a firewall that blocks your machine, your local
   network and cloud metadata addresses (the internet stays reachable).
+- **Scheduled runs need the engine running.** A schedule starts its run by
+  itself, but only while the engine is up (it restarts with Docker after a
+  reboot). If the computer is off or asleep at the time, that run is skipped
+  and noted in the schedule's history, not run late. If another run is still
+  going, the scheduled one waits and starts when it ends.
 - **Only targets you are authorized to test.**
 
 ## Troubleshooting

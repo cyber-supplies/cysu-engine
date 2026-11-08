@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cyber Supplies Engine API
-  version: 0.10.0
+  version: 0.11.0
   description: |
     Local API of cysu-engine: the self-hosted server that runs Cyber Supplies
     profiles as agents in hardened Docker containers. There is no web UI: the
@@ -91,6 +91,19 @@ tags:
   - name: Profiles
   - name: Runs
   - name: Workspaces
+  - name: Schedules
+    description: |
+      Runs the engine starts BY ITSELF at set times, with nobody at the
+      keyboard. A schedule points at a workspace (by id; edits to the
+      workspace reach future runs). Times are wall-clock in the schedule's
+      own timezone (`tz`, an IANA name: the CLI sends the user's own).
+      Only one run is active at a time: a time that comes during another
+      run **waits** and starts when that run ends (one waiting per
+      schedule; more are skipped and noted). Times that pass while the
+      engine is off or the computer asleep (more than 2 minutes late) are
+      **missed**: not run, noted in `history`. Waiting runs are dropped
+      (and noted) if the engine restarts. Schedules only fire while the
+      engine is running.
 
 paths:
   /:
@@ -268,6 +281,9 @@ paths:
     get:
       tags: [Runs]
       summary: List runs, newest first
+      parameters:
+        - { name: trigger, in: query, required: false, description: Only runs started by the user or by a schedule, schema: { type: string, enum: [user, schedule] } }
+        - { name: schedule, in: query, required: false, description: Only runs started by this schedule (its id), schema: { type: string } }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -278,6 +294,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/RunSummary' }
+        '400': { description: Unknown trigger, $ref: '#/components/responses/Error' }
     post:
       tags: [Runs]
       summary: Start a run
@@ -493,6 +510,7 @@ paths:
     delete:
       tags: [Workspaces]
       summary: Delete a workspace
+      description: Its schedules are paused (with a note in their history); they are not deleted.
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -555,6 +573,133 @@ paths:
         '400': { description: 'Not runnable yet (e.g. no objective or no stages), or setup missing', $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { description: Another run is active, $ref: '#/components/responses/Error' }
+
+  /api/schedules:
+    get:
+      tags: [Schedules]
+      summary: All schedules, oldest first, with next time, last run and history
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Schedule' } }
+    post:
+      tags: [Schedules]
+      summary: Create a schedule (keep the returned `id`)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workspaceId, when, tz]
+              properties:
+                workspaceId: { type: string, description: The workspace to run (exact id) }
+                when: { $ref: '#/components/schemas/ScheduleWhen' }
+                tz: { type: string, description: 'IANA timezone, e.g. Europe/London (any case; saved in its canonical spelling)', example: Europe/London }
+                name: { type: string, maxLength: 80, description: An optional label }
+                enabled: { type: boolean, default: true, description: false creates it paused }
+            examples:
+              weekdays:
+                summary: Every weekday at 09:00 London time
+                value: { workspaceId: 3f0c…, name: mornings, when: { type: weekdays, time: '09:00' }, tz: Europe/London }
+              tonight:
+                summary: Once, tonight at 23:00
+                value: { workspaceId: 3f0c…, when: { type: once, at: '2026-11-07T23:00' }, tz: Europe/London }
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { description: 'Bad timing rule or timezone, unknown workspace, or a one-off time in the past', $ref: '#/components/responses/Error' }
+        '409': { description: 'Too many schedules (100)', $ref: '#/components/responses/Error' }
+
+  /api/schedules/{scheduleId}:
+    parameters: [{ $ref: '#/components/parameters/ScheduleId' }]
+    get:
+      tags: [Schedules]
+      summary: One schedule (check on it any time)
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Schedules]
+      summary: Change name, workspace, timing, timezone or enabled
+      description: 'Changing `when` or `tz` restarts an `every` schedule without a `start` from now. A run already waiting keeps waiting (pausing cancels it).'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string, maxLength: 80 }
+                workspaceId: { type: string }
+                when: { $ref: '#/components/schemas/ScheduleWhen' }
+                tz: { type: string }
+                enabled: { type: boolean }
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { description: 'Bad input, a field that cannot be changed, unknown workspace, or a one-off time in the past', $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Schedules]
+      summary: Delete a schedule (its runs are kept)
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/schedules/{scheduleId}/pause:
+    parameters: [{ $ref: '#/components/parameters/ScheduleId' }]
+    post:
+      tags: [Schedules]
+      summary: Pause (no more runs; a waiting run is cancelled)
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200':
+          description: Paused
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/schedules/{scheduleId}/resume:
+    parameters: [{ $ref: '#/components/parameters/ScheduleId' }]
+    post:
+      tags: [Schedules]
+      summary: Resume from the next time after now (times while paused are not caught up)
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200':
+          description: Resumed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { description: "Its workspace no longer exists, or a one-off time that has passed", $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
 
   /api/runs/{runId}/feed:
     parameters: [{ $ref: '#/components/parameters/RunId' }]
@@ -671,6 +816,12 @@ components:
       in: path
       required: true
       description: The workspace's exact id (no names, prefixes or other spellings; anything else is 404)
+      schema: { type: string, format: uuid }
+    ScheduleId:
+      name: scheduleId
+      in: path
+      required: true
+      description: The schedule's exact id
       schema: { type: string, format: uuid }
     StageIndex:
       name: index
@@ -911,7 +1062,9 @@ components:
         cancelRequested: { type: boolean }
         request: { $ref: '#/components/schemas/RunRequest', description: What was asked for (used by rerun) }
         rerunOf: { type: [string, 'null'], description: The run this one repeats }
-        workspace: { type: [object, 'null'], description: 'The workspace it was started from (/run)', properties: { id: { type: string }, name: { type: string } } }
+        workspace: { type: [object, 'null'], description: 'The workspace it was started from (/run or a schedule)', properties: { id: { type: string }, name: { type: string } } }
+        trigger: { type: string, enum: [user, schedule], description: Who started it (older runs have none = user) }
+        schedule: { type: [object, 'null'], description: The schedule that started it, properties: { id: { type: string }, name: { type: string } } }
         stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
 
     Workspace:
@@ -949,6 +1102,9 @@ components:
         finishedAt: { type: [string, 'null'], format: date-time }
         globalProfile: { type: string }
         model: { type: string }
+        workspace: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string } } }
+        trigger: { type: string, enum: [user, schedule], description: Who started it (older runs have none = user) }
+        schedule: { type: [object, 'null'], description: The schedule that started it, properties: { id: { type: string }, name: { type: string } } }
         stageCount: { type: integer }
         stages:
           type: array
@@ -959,6 +1115,92 @@ components:
               profile: { type: string }
               tag: { type: string }
               status: { $ref: '#/components/schemas/StageStatus' }
+
+    ScheduleWhen:
+      description: |
+        When it runs; times are wall-clock in the schedule's `tz`. A time
+        skipped by a clock change runs as the clock jumps past it; a time that
+        happens twice runs once.
+      oneOf:
+        - type: object
+          title: once
+          required: [type, at]
+          additionalProperties: false
+          properties:
+            type: { const: once }
+            at: { type: string, pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$', description: 'Local date and time, YYYY-MM-DDTHH:MM', example: '2026-11-07T23:00' }
+        - type: object
+          title: daily / weekdays
+          required: [type, time]
+          additionalProperties: false
+          properties:
+            type: { enum: [daily, weekdays], description: weekdays = Monday to Friday }
+            time: { type: string, pattern: '^\d{2}:\d{2}$', description: 24-hour HH:MM, example: '09:00' }
+        - type: object
+          title: weekly
+          required: [type, time, days]
+          additionalProperties: false
+          properties:
+            type: { const: weekly }
+            time: { type: string, pattern: '^\d{2}:\d{2}$', example: '18:30' }
+            days: { type: array, minItems: 1, items: { type: string, enum: [mon, tue, wed, thu, fri, sat, sun] }, description: 'Full names work too (Thursday → thu)' }
+        - type: object
+          title: every N hours
+          required: [type, hours]
+          additionalProperties: false
+          properties:
+            type: { const: every }
+            hours: { type: integer, minimum: 1, maximum: 168 }
+            start: { type: string, description: 'Local YYYY-MM-DDTHH:MM of the first run; without it the first run is N hours after saving' }
+
+    ScheduleEvent:
+      type: object
+      required: [at, kind]
+      description: One line of a schedule's history (newest first, last 20).
+      properties:
+        at: { type: string, format: date-time, description: When it was noted }
+        kind:
+          type: string
+          enum: [started, waiting, skipped, missed, dropped, failed, paused]
+          description: |
+            started: a run was started (`runId`). waiting: another run was
+            active, so it waits. skipped: one was already waiting. missed: the
+            engine was off or asleep (`count` times). dropped: the engine
+            restarted while it waited. failed: the run could not start
+            (`reason`, e.g. no LLM login). paused: its workspace was deleted.
+        due: { type: [string, 'null'], format: date-time, description: The scheduled time this is about }
+        runId: { type: string }
+        count: { type: integer, description: 'missed: how many times' }
+        reason: { type: string }
+
+    Schedule:
+      type: object
+      required: [id, enabled, summary, when, tz, workspaceId, workspace, nextAt, history]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        enabled: { type: boolean, description: false = paused (or a one-off that has run) }
+        summary: { type: string, example: every weekday at 09:00 (Europe/London) }
+        when: { $ref: '#/components/schemas/ScheduleWhen' }
+        tz: { type: string }
+        workspaceId: { type: string }
+        workspace: { type: object, properties: { id: { type: string }, name: { type: [string, 'null'] }, exists: { type: boolean } } }
+        nextAt: { type: [string, 'null'], format: date-time, description: 'The next run time (null when paused or done)' }
+        waiting:
+          type: [object, 'null']
+          description: A run due earlier that waits for the active run to end
+          properties: { since: { type: string, format: date-time }, due: { type: string, format: date-time } }
+        lastRun:
+          type: [object, 'null']
+          properties:
+            runId: { type: [string, 'null'] }
+            startedAt: { type: string, format: date-time }
+            status: { type: string, description: "The run's live status; 'deleted' if the run was deleted, 'not started' if it could not start" }
+            finishedAt: { type: [string, 'null'], format: date-time }
+            error: { type: [string, 'null'] }
+        history: { type: array, items: { $ref: '#/components/schemas/ScheduleEvent' } }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
 
     Event:
       type: object

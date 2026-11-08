@@ -206,7 +206,7 @@ prefix ≥ 4).
 | `/load <id> --global <profile>` | `… {"global": "<profile>"}` (`""` = none) | the workspace |
 | `/unload <id> <profile…>` | `… {"remove": [...]}` | the workspace |
 | `/run <id>` | `POST /api/workspaces/<id>/run` → the run | "started run `<first 8 of id>`", then `/watch` it |
-| `/runs` | `GET /api/runs` | first 8 of `id`, `status`, `name`, `workspace.name`, `createdAt`, stage statuses |
+| `/runs` | `GET /api/runs` | first 8 of `id`, `status`, `name`, `workspace.name`, `createdAt`, stage statuses; mark `trigger: "schedule"` runs |
 | `/watch [run]` | feed loop (below) | live progress; Ctrl-C stops watching, not the run |
 | `/cancel [run]` | `POST /api/runs/<run>/cancel` | "cancelling" |
 | `/download [run] [dir]` | `GET /api/runs/<run>/download` | saves `run-<id>.tar.gz` (run.json, per stage events/log/result) |
@@ -280,6 +280,96 @@ number of follow-ups, and the stages from `plan`. If `plan` is null, show
 Workspaces built from tags (`fromTags`) take their stages from the profile
 tags; `/load`/`/unload` answer 409 on them (`/stages <id> picked` switches).
 
+### Scheduled runs
+
+New after engine 0.2.0 (not released yet). A schedule makes the engine start a workspace's run **by
+itself** at set times, with nobody at the keyboard; the user comes back later
+and checks on it. `<sched>` = a schedule's **exact id** (like workspaces). The
+command names are suggestions; with the non-interactive `cysu engine
+<subcommand>` style they map one to one (`get-schedules`, `create-schedule`, …).
+
+| Command | Request | Show |
+|---|---|---|
+| `/schedule <id> <when…> [--name N] [--tz Z]` | `POST /api/schedules {"workspaceId", "when", "tz", "name"}` | its `id`, `summary`, `nextAt` in local time |
+| `/schedules` | `GET /api/schedules` | one line each: first 8 of `id`, `name`, `workspace.name`, `summary`, on/paused, `nextAt`, `lastRun.status`, `waiting` |
+| `/schedule <sched>` | `GET /api/schedules/<sched>` | everything, plus `history` (below) |
+| `/schedule pause <sched>` / `resume <sched>` | `POST /api/schedules/<sched>/pause` / `resume` | the schedule |
+| `/schedule edit <sched> <when…>` / `--name` / `--tz` / `--workspace <id>` | `PATCH /api/schedules/<sched> {only the fields that change}` | the schedule |
+| `/schedule delete <sched>` | `DELETE /api/schedules/<sched>` → 204 (ask to confirm) | "deleted" (its runs are kept) |
+| `/runs --scheduled [sched]` | `GET /api/runs?trigger=schedule` / `?schedule=<sched>` | as `/runs` |
+
+Unlike workspaces, PATCH here takes **only the fields that change** (`name`,
+`workspaceId`, `when`, `tz`, `enabled`); anything else is 400.
+
+**`when`** (no cron; times are wall-clock in `tz`). Suggested wording → body:
+
+| User types | `when` |
+|---|---|
+| `once 2026-11-07 23:00` | `{"type":"once","at":"2026-11-07T23:00"}` |
+| `daily 09:00` | `{"type":"daily","time":"09:00"}` |
+| `weekdays 09:00` | `{"type":"weekdays","time":"09:00"}` (Mon–Fri) |
+| `weekly mon,thu 18:30` | `{"type":"weekly","time":"18:30","days":["mon","thu"]}` |
+| `every 6h [from 2026-11-08 08:00]` | `{"type":"every","hours":6}` (+ `"start":"2026-11-08T08:00"`: first run AT start; without it, first run 6h from now) |
+
+Times are 24-hour `HH:MM`; `hours` is 1–168. The engine's 400 messages say
+exactly what is wrong (`when.time must be HH:MM (24-hour), like "09:00"`,
+`Unknown timezone "…"`, `… is in the past`), so show `error` as it is.
+
+**`tz` is required**: send the user's own IANA timezone (e.g.
+`Europe/London`), not an offset, so 09:00 stays 09:00 across clock changes.
+Go's `time.Local.String()` is usually just `"Local"`, so:
+
+```go
+// localTZ: the machine's IANA timezone name, or "" if unknown.
+func localTZ() string {
+	if tz := os.Getenv("TZ"); tz != "" && !strings.HasPrefix(tz, ":") {
+		return tz
+	}
+	if p, err := filepath.EvalSymlinks("/etc/localtime"); err == nil { // Linux, macOS
+		if i := strings.Index(p, "zoneinfo/"); i >= 0 {
+			return p[i+len("zoneinfo/"):]
+		}
+	}
+	return "" // e.g. Windows: ask for --tz (or fall back to "UTC" and say so)
+}
+```
+
+`--tz` overrides it. Show times back in the user's local time (`nextAt`,
+`history[].due` are UTC ISO strings).
+
+**Showing a schedule** (`GET /api/schedules/<sched>`):
+
+```
+{ "id", "name", "enabled", "summary": "every weekday at 09:00 (Europe/London)",
+  "when", "tz", "workspaceId", "workspace": { "id", "name", "exists" },
+  "nextAt": "<UTC>" | null,
+  "waiting": { "since", "due" } | null,
+  "lastRun": { "runId", "startedAt", "status", "finishedAt", "error" } | null,
+  "history": [ { "at", "kind", "due", "runId" | "count" | "reason" } ]   (newest first, last 20) }
+```
+
+- `lastRun.status` is the run's **live** status (`running`, `succeeded`, …;
+  `deleted` if the run was deleted, `not started` if it could not start).
+  Offer `/watch <runId>` / `/download <runId>` from there.
+- `waiting` set → a run was due while another run was active; it starts the
+  moment that run ends.
+- `history[].kind`: `started` (→ `runId`), `waiting`, `skipped` (one was
+  already waiting), `missed` (the engine was off or the computer asleep:
+  `count` times; not run), `dropped` (the engine restarted while it waited),
+  `failed` (could not start: `reason`, e.g. no LLM login), `paused` (its
+  workspace was deleted). Print `reason` when there is one.
+- `enabled: false` with `nextAt: null` = paused, or a one-off that has run.
+- `workspace.exists: false` → its workspace was deleted; the schedule is
+  paused and can't be resumed until `--workspace <id>` points it elsewhere.
+
+**Tell users once** (e.g. when they create their first schedule): schedules
+only run while the engine is running. Times that pass while the computer is
+off or asleep are skipped and noted, not run late.
+
+Runs started by a schedule have `"trigger": "schedule"` and `"schedule":
+{"id", "name"}` (user runs: `"trigger": "user"`). Mark them in `/runs`, e.g.
+`⏱ <schedule name>`.
+
 ### `/watch` feed
 
 ```
@@ -301,8 +391,8 @@ Print items as they come (`kind`: `attempt` (first try / fallback / follow-up),
 | 400 | Bad input or setup missing (e.g. no LLM login), or a token Cyber Supplies refused at setup — show `error` |
 | 401 | Engine token: `setupRequired: true` → run setup; `false` → missing/wrong token (see *Authentication*) |
 | 403 | Request looked like it came from a web page (wrong Host/Origin/content type) — a CLI bug |
-| 404 | No such workspace (not that exact id) / run |
-| 409 | Busy or conflicting: a run is already active, a name is taken, a short run id matches several runs, a tag-built workspace can't `/load` |
+| 404 | No such workspace / schedule (not that exact id) / run |
+| 409 | Busy or conflicting: a run is already active, a name is taken, a short run id matches several runs, a tag-built workspace can't `/load`, 100 schedules already |
 | 429 | Too many wrong tokens: locked for `retryAfter` seconds, every request refused |
 | 502 | Cyber Supplies refused the stored token (revoked? → `/setup` with a new one), was unreachable, or answered badly |
 | 503 | Docker is not available, or (at setup) Cyber Supplies could not be reached to check the token |
@@ -319,4 +409,7 @@ printf '%s\n' "$H" | curl -s -H @- $E/status
 ID=$(printf '%s\n' "$H" | curl -s -H @- -X POST $E/workspaces -H 'Content-Type: application/json' -d '{"name":"Try"}' | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')
 printf '%s\n' "$H" | curl -s -H @- -X POST $E/workspaces/$ID/profiles -H 'Content-Type: application/json' -d '{"add":["recon"]}'
 printf '%s\n' "$H" | curl -s -H @- $E/workspaces/$ID
+# a schedule: every weekday at 09:00 in your timezone, then check on it
+printf '%s\n' "$H" | curl -s -H @- -X POST $E/schedules -H 'Content-Type: application/json' -d '{"workspaceId":"'$ID'","when":{"type":"weekdays","time":"09:00"},"tz":"Europe/London"}'
+printf '%s\n' "$H" | curl -s -H @- $E/schedules
 ```

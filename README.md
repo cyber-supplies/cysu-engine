@@ -40,7 +40,7 @@ npm run test:image           # everything with Docker (~5 min)
 | `.github/workflows/release.yml` | The release workflow (tag `v*` or Run workflow) |
 | `docs/INSTALL.md` | Install and run (for testers) |
 | `docs/CLI.md` | How the `cysu` CLI talks to the engine (setup, slash commands) |
-| `server/`   | Node server (no dependencies): JSON API, settings, Docker runs    |
+| `server/`   | Node server (no dependencies): JSON API, settings, Docker runs, schedules (`schedules.js` rules + storage, `scheduler.js` the timer) |
 | `image/`    | Workspace image: Node, Go, Python, ProjectDiscovery, cysu, Codex  |
 
 ## Environment

@@ -13,7 +13,9 @@ import { dockerAvailable, IMAGE } from './docker.js';
 import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth } from './llm.js';
 import { Runs } from './runs.js';
 import { API_URL, STAGE_TAGS, fetchProfiles } from './profiles.js';
-import { Workspaces } from './workspaces.js';
+import { Workspaces, WorkspaceError } from './workspaces.js';
+import { Schedules } from './schedules.js';
+import { Scheduler } from './scheduler.js';
 import { bearerToken, sameToken, UNAUTHORIZED, oneAtATime, AuthLimiter, tooManyMessage } from './auth.js';
 
 const ENGINE_VERSION = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -29,9 +31,26 @@ const runs = new Runs({
     return { settings, codexAuth: settings.llm?.mode === 'codex' ? await loadCodexAuth() : null };
   },
   listProfiles: (settings) => fetchProfiles(settings.token),
+  onIdle: () => scheduler.tick(),
 });
 
 const workspaces = new Workspaces();
+
+// Scheduled runs: the engine starts them by itself (see scheduler.js).
+const schedules = new Schedules({
+  workspaceExists: (id) => workspaces.get(id).then(() => true, (e) => { if (e instanceof WorkspaceError && e.status === 404) return false; throw e; }),
+});
+const startWorkspaceRun = (ws, schedule) => runs.create({ name: ws.name, ...ws.request, workspace: { id: ws.id, name: ws.name } }, { schedule });
+const scheduler = new Scheduler({
+  schedules,
+  getWorkspace: (id) => workspaces.get(id).catch((e) => { if (e instanceof WorkspaceError && e.status === 404) return null; throw e; }),
+  startRun: async (ws, s) => {
+    if (!(await dockerAvailable())) throw new Error('Docker is not available on this machine');
+    return startWorkspaceRun(ws, { id: s.id, name: s.name });
+  },
+  isBusy: () => runs.busy,
+  tickMs: Number(process.env.CYSU_ENGINE_TEST_SCHEDULER_TICK_MS) || undefined,
+});
 
 // Wrong engine tokens: 10 in a minute → every request refused for a minute.
 // For automated tests only: CYSU_ENGINE_TEST_AUTH_LOCK_MS (shorter lockout)
@@ -52,6 +71,27 @@ async function workspaceView(ws) {
     plan = { stages: p.stages.map((st) => ({ order: st.index + 1, tag: st.tag, profile: st.profile, model: st.model || 'default' })), globalProfile: p.globalProfile || '' };
   } catch (error) { planError = error.message; }
   return { ...ws, plan, planError };
+}
+
+// scheduleView: a schedule as the CLI shows it — its workspace's name, the
+// live status of its last run, and whether a run is waiting to start.
+async function scheduleView(s) {
+  const ws = await workspaces.get(s.workspaceId).catch(() => null);
+  let lastRun = null;
+  if (s.lastRun) {
+    lastRun = { runId: s.lastRun.runId, startedAt: s.lastRun.startedAt, status: s.lastRun.runId ? 'deleted' : 'not started', finishedAt: null, error: s.lastRun.error ?? null };
+    if (s.lastRun.runId) {
+      const run = await runs.get(s.lastRun.runId).catch(() => null);
+      if (run) Object.assign(lastRun, { status: run.status, finishedAt: run.finishedAt });
+    }
+  }
+  return {
+    id: s.id, name: s.name, enabled: s.enabled, summary: s.summary, when: s.when, tz: s.tz,
+    workspaceId: s.workspaceId, workspace: { id: s.workspaceId, name: ws ? ws.name : null, exists: Boolean(ws) },
+    nextAt: s.nextAt,
+    waiting: s.queued ? { since: s.queuedAt, due: s.queuedFor } : null,
+    lastRun, history: s.history, createdAt: s.createdAt, updatedAt: s.updatedAt,
+  };
 }
 
 async function engineStatus() {
@@ -242,7 +282,11 @@ async function api(req, res, path) {
       const input = await body(req);
       return send(res, 200, await workspaceView(await workspaces.update(id, { name: input.name, request: input.request })));
     }
-    if (req.method === 'DELETE') { await workspaces.delete(id); res.writeHead(204); return res.end(); }
+    if (req.method === 'DELETE') {
+      const ws = await workspaces.delete(id);
+      await schedules.pauseForWorkspace(ws.id, `Its workspace "${ws.name}" was deleted; the schedule is paused`);
+      res.writeHead(204); return res.end();
+    }
   }
   m = path.match(/^\/api\/workspaces\/([^/]+)\/profiles$/);
   if (m && req.method === 'POST') {
@@ -271,12 +315,52 @@ async function api(req, res, path) {
     // /run: start a run of the workspace.
     if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
     const ws = await workspaces.get(decodeURIComponent(m[1]));
-    return send(res, 201, await runs.create({ name: ws.name, ...ws.request, workspace: { id: ws.id, name: ws.name } }));
+    return send(res, 201, await startWorkspaceRun(ws, null));
+  }
+
+  // ---- schedules (runs the engine starts by itself) -------------------------
+  // {id} is the schedule's exact id. Times are wall-clock in the schedule's
+  // timezone (tz, an IANA name the CLI takes from the user's machine).
+  if (path === '/api/schedules') {
+    if (req.method === 'GET') return send(res, 200, await Promise.all((await schedules.list()).map(scheduleView)));
+    if (req.method === 'POST') {
+      const input = await body(req);
+      const s = await schedules.create({ workspaceId: input.workspaceId, when: input.when, tz: input.tz, name: input.name, enabled: input.enabled ?? true });
+      scheduler.tick();
+      return send(res, 201, await scheduleView(s));
+    }
+  }
+  m = path.match(/^\/api\/schedules\/([^/]+)(\/pause|\/resume)?$/);
+  if (m) {
+    const id = decodeURIComponent(m[1]);
+    const action = m[2];
+    if (!action && req.method === 'GET') return send(res, 200, await scheduleView(await schedules.get(id)));
+    if (!action && req.method === 'PATCH') {
+      const s = await schedules.update(id, await body(req));
+      scheduler.tick();
+      return send(res, 200, await scheduleView(s));
+    }
+    if (!action && req.method === 'DELETE') { await schedules.delete(id); res.writeHead(204); return res.end(); }
+    if (action && req.method === 'POST') {
+      const s = action === '/pause' ? await schedules.pause(id) : await schedules.resume(id);
+      scheduler.tick();
+      return send(res, 200, await scheduleView(s));
+    }
   }
 
   // ---- runs ----------------------------------------------------------------
   if (path === '/api/runs') {
-    if (req.method === 'GET') return send(res, 200, await runs.list());
+    if (req.method === 'GET') {
+      // ?trigger=user|schedule and ?schedule=<schedule id> narrow the list.
+      const q = new URL(req.url, 'http://localhost').searchParams;
+      const trigger = q.get('trigger');
+      if (trigger !== null && !['user', 'schedule'].includes(trigger)) return send(res, 400, { error: 'trigger must be user or schedule' });
+      const schedule = q.get('schedule');
+      let list = await runs.list();
+      if (trigger) list = list.filter((r) => (r.trigger || 'user') === trigger);
+      if (schedule) list = list.filter((r) => r.schedule?.id === schedule);
+      return send(res, 200, list);
+    }
     if (req.method === 'POST') {
       if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
       return send(res, 201, await runs.create(await body(req)));
@@ -323,6 +407,9 @@ async function api(req, res, path) {
 
 if (process.env.CYSU_ENGINE_TEST_AUTH_LOCK_MS || process.env.CYSU_ENGINE_TEST_AUTH_MAX) {
   console.warn('WARNING: CYSU_ENGINE_TEST_AUTH_* is set — the wrong-token limit is changed. For automated tests only.');
+}
+if (process.env.CYSU_ENGINE_TEST_SCHEDULER_TICK_MS) {
+  console.warn('WARNING: CYSU_ENGINE_TEST_SCHEDULER_TICK_MS is set — the scheduler checks at a different pace. For automated tests only.');
 }
 if (process.env.CYSU_ENGINE_TEST_NO_FIREWALL === '1') {
   console.warn('WARNING: CYSU_ENGINE_TEST_NO_FIREWALL=1 — worker firewall is OFF. For automated tests only.');
@@ -372,6 +459,7 @@ const server = createServer(async (req, res) => {
   }
 });
 await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
+await scheduler.start();
 
 server.listen(PORT, HOST, () => {
   console.log(`cysu-engine listening on http://${HOST}:${PORT}`);
@@ -381,6 +469,7 @@ server.listen(PORT, HOST, () => {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, async () => {
     server.close();
+    scheduler.stop();
     await runs.close();
     process.exit(0);
   });
