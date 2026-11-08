@@ -23,7 +23,7 @@ const SETTINGS = { token: TOKEN, passkey: 'sched-pk', llm: { mode: 'openai-api-k
 const MIN = 60_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const clock = { now: Date.parse('2026-11-09T08:59:00Z') };
-const WS = { id: 'ws-sched', name: 'sched recon', request: { prompt: 'scheduled hello', stages: [{ profile: 'recon', tag: '1' }] } };
+const WS = { id: 'ws-sched', name: 'sched recon', request: { stages: [{ profile: 'recon', tag: '1' }] } };
 let api, runs, schedules, scheduler;
 
 before(async () => {
@@ -41,7 +41,7 @@ before(async () => {
   scheduler = new Scheduler({
     schedules, now: () => clock.now, tickMs: 1e9,
     getWorkspace: async (id) => (id === WS.id ? WS : null),
-    startRun: (ws, s) => runs.create({ name: ws.name, ...ws.request, workspace: { id: ws.id, name: ws.name } }, { schedule: { id: s.id, name: s.name } }),
+    startRun: (ws, s) => runs.create({ name: ws.name, ...ws.request, objective: s.objective, workspace: { id: ws.id, name: ws.name } }, { schedule: { id: s.id, name: s.name } }),
     isBusy: () => runs.busy,
   });
 });
@@ -63,7 +63,7 @@ async function waitFor(fn, ms = 90_000) {
 }
 
 test('a schedule starts a real run, marked as started by the schedule', async () => {
-  const s = await schedules.create({ workspaceId: WS.id, name: 'nine o\'clock', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await schedules.create({ objective: 'scheduled hello', workspaceId: WS.id, name: 'nine o\'clock', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await scheduler.start();
   assert.equal(runs.busy, false);
   clock.now += MIN + 2_000;
@@ -75,6 +75,7 @@ test('a schedule starts a real run, marked as started by the schedule', async ()
   assert.equal(run.trigger, 'schedule');
   assert.deepEqual(run.schedule, { id: s.id, name: 'nine o\'clock' });
   assert.deepEqual(run.workspace, { id: WS.id, name: WS.name });
+  assert.equal(run.objective, 'scheduled hello', "the schedule's objective");
   assert.equal(run.request.schedule, undefined, '"run again" is an ordinary run');
   const onDisk = JSON.parse(await readFile(join(DATA, 'runs', run.id, 'run.json'), 'utf8'));
   assert.equal(onDisk.trigger, 'schedule');
@@ -83,9 +84,9 @@ test('a schedule starts a real run, marked as started by the schedule', async ()
 });
 
 test('while a user run is active the schedule waits, then starts when it ends', async () => {
-  const s = await schedules.create({ workspaceId: WS.id, when: { type: 'once', at: '2026-11-09T09:30' }, tz: 'UTC' });
+  const s = await schedules.create({ objective: 'scheduled hello', workspaceId: WS.id, when: { type: 'once', at: '2026-11-09T09:30' }, tz: 'UTC' });
   await waitFor(() => !runs.busy);
-  const userRun = await runs.create({ name: 'by hand', ...WS.request });
+  const userRun = await runs.create({ name: 'by hand', ...WS.request, objective: 'by hand' });
   assert.equal(userRun.trigger, 'user');
   clock.now = Date.parse('2026-11-09T09:30:05Z');
   await scheduler.tick();

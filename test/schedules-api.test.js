@@ -32,7 +32,7 @@ before(async () => {
     await sleep(200);
   }
   await http('/api/settings', 'PUT', { token: TOKEN, passkey: 'pk', llm: { mode: 'openai-api-key', apiKey: 'sk-schedapi' } });
-  ws = (await http('/api/workspaces', 'POST', { name: 'nightly recon', request: { prompt: 'scheduled hello', stages: [{ profile: 'recon', tag: '1' }] } })).body;
+  ws = (await http('/api/workspaces', 'POST', { name: 'nightly recon', request: { stages: [{ profile: 'recon', tag: '1' }] } })).body;
 });
 after(async () => {
   server?.kill('SIGINT');
@@ -63,7 +63,7 @@ test('schedules need the engine token', async () => {
 });
 
 test('create, list, get, edit, pause, resume, delete', async () => {
-  let r = await http('/api/schedules', 'POST', { workspaceId: ws.id, name: 'mornings', when: { type: 'weekdays', time: '09:00' }, tz: 'Europe/London' });
+  let r = await http('/api/schedules', 'POST', { objective: 'scheduled hello', workspaceId: ws.id, name: 'mornings', when: { type: 'weekdays', time: '09:00' }, tz: 'Europe/London' });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   const s = r.body;
   assert.equal(s.summary, 'every weekday at 09:00 (Europe/London)');
@@ -73,6 +73,7 @@ test('create, list, get, edit, pause, resume, delete', async () => {
   assert.equal(s.waiting, null);
   assert.equal(s.lastRun, null);
   assert.equal(s.anchorAt, undefined, 'internal fields are not shown');
+  assert.equal(s.objective, 'scheduled hello');
 
   assert.equal((await http('/api/schedules')).body.length, 1);
   assert.equal((await http(`/api/schedules/${s.id}`)).body.id, s.id);
@@ -83,6 +84,8 @@ test('create, list, get, edit, pause, resume, delete', async () => {
   assert.equal(r.body.summary, 'every sat at 18:30 (UTC)');
   assert.equal(new Date(r.body.nextAt).getUTCDay(), 6);
 
+  r = await http(`/api/schedules/${s.id}`, 'PATCH', { objective: 'weekend recon' });
+  assert.equal(r.body.objective, 'weekend recon');
   r = await http(`/api/schedules/${s.id}/pause`, 'POST');
   assert.equal(r.body.enabled, false);
   assert.equal(r.body.nextAt, null);
@@ -101,14 +104,15 @@ test('clear errors for bad input', async () => {
     assert.equal(r.status, status, JSON.stringify(r.body));
     assert.match(r.body.error, re);
   };
-  await bad({ when: { type: 'daily', time: '09:00' }, tz: 'UTC' }, /needs a workspaceId/);
-  await bad({ workspaceId: 'nope', when: { type: 'daily', time: '09:00' }, tz: 'UTC' }, /No workspace with id "nope"/);
-  await bad({ workspaceId: ws.id, when: { type: 'daily', time: '9am' }, tz: 'UTC' }, /HH:MM/);
-  await bad({ workspaceId: ws.id, when: { type: 'daily', time: '09:00' } }, /needs a timezone/);
-  await bad({ workspaceId: ws.id, when: { type: 'daily', time: '09:00' }, tz: 'Moon/Base' }, /Unknown timezone/);
-  await bad({ workspaceId: ws.id, when: { type: 'once', at: '2020-01-01T09:00' }, tz: 'UTC' }, /in the past/);
-  await bad({ workspaceId: ws.id, when: { type: 'cron', expr: '* * * * *' }, tz: 'UTC' }, /one of once, daily/);
-  const s = (await http('/api/schedules', 'POST', { workspaceId: ws.id, when: { type: 'daily', time: '09:00' }, tz: 'UTC' })).body;
+  await bad({ objective: 'o', when: { type: 'daily', time: '09:00' }, tz: 'UTC' }, /needs a workspaceId/);
+  await bad({ workspaceId: ws.id, when: { type: 'daily', time: '09:00' }, tz: 'UTC' }, /needs an objective/);
+  await bad({ objective: 'o', workspaceId: 'nope', when: { type: 'daily', time: '09:00' }, tz: 'UTC' }, /No workspace with id "nope"/);
+  await bad({ objective: 'o', workspaceId: ws.id, when: { type: 'daily', time: '9am' }, tz: 'UTC' }, /HH:MM/);
+  await bad({ objective: 'o', workspaceId: ws.id, when: { type: 'daily', time: '09:00' } }, /needs a timezone/);
+  await bad({ objective: 'o', workspaceId: ws.id, when: { type: 'daily', time: '09:00' }, tz: 'Moon/Base' }, /Unknown timezone/);
+  await bad({ objective: 'o', workspaceId: ws.id, when: { type: 'once', at: '2020-01-01T09:00' }, tz: 'UTC' }, /in the past/);
+  await bad({ objective: 'o', workspaceId: ws.id, when: { type: 'cron', expr: '* * * * *' }, tz: 'UTC' }, /one of once, daily/);
+  const s = (await http('/api/schedules', 'POST', { objective: 'scheduled hello', workspaceId: ws.id, when: { type: 'daily', time: '09:00' }, tz: 'UTC' })).body;
   const r = await http(`/api/schedules/${s.id}`, 'PATCH', { history: [] });
   assert.equal(r.status, 400);
   assert.match(r.body.error, /Can't change: history/);
@@ -118,12 +122,12 @@ test('clear errors for bad input', async () => {
 
 test('the engine starts the run by itself; the user checks on it later', async () => {
   const at = nextMinute();
-  let r = await http('/api/schedules', 'POST', { workspaceId: ws.id, name: 'soon', when: { type: 'once', at }, tz: 'UTC' });
+  let r = await http('/api/schedules', 'POST', { objective: 'scheduled hello', workspaceId: ws.id, name: 'soon', when: { type: 'once', at }, tz: 'UTC' });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   const id = r.body.id;
   assert.equal(r.body.nextAt, `${at}:00.000Z`);
   // A user run by hand, for the filters below.
-  const byHand = (await http(`/api/workspaces/${ws.id}/run`, 'POST')).body;
+  const byHand = (await http(`/api/workspaces/${ws.id}/run`, 'POST', { objective: 'by hand' })).body;
   assert.equal(byHand.trigger, 'user');
 
   // Nobody does anything now: wait for the engine to start it.
@@ -146,6 +150,7 @@ test('the engine starts the run by itself; the user checks on it later', async (
   assert.equal(run.trigger, 'schedule');
   assert.deepEqual(run.schedule, { id, name: 'soon' });
   assert.equal(run.workspace.id, ws.id);
+  assert.equal(run.objective, 'scheduled hello', "the schedule's objective");
   assert.deepEqual((await http(`/api/runs?schedule=${id}`)).body.map((x) => x.id), [run.id]);
   assert.deepEqual((await http('/api/runs?trigger=schedule')).body.map((x) => x.id), [run.id]);
   assert.ok((await http('/api/runs?trigger=user')).body.some((x) => x.id === byHand.id));
@@ -153,8 +158,8 @@ test('the engine starts the run by itself; the user checks on it later', async (
 });
 
 test('deleting a workspace pauses its schedules, with a note', async () => {
-  const other = (await http('/api/workspaces', 'POST', { name: 'to delete', request: { prompt: 'x', stages: [{ profile: 'recon' }] } })).body;
-  const s = (await http('/api/schedules', 'POST', { workspaceId: other.id, when: { type: 'daily', time: '09:00' }, tz: 'UTC' })).body;
+  const other = (await http('/api/workspaces', 'POST', { name: 'to delete', request: { stages: [{ profile: 'recon' }] } })).body;
+  const s = (await http('/api/schedules', 'POST', { objective: 'scheduled hello', workspaceId: other.id, when: { type: 'daily', time: '09:00' }, tz: 'UTC' })).body;
   assert.equal((await http(`/api/workspaces/${other.id}`, 'DELETE')).status, 204);
   const now = (await http(`/api/schedules/${s.id}`)).body;
   assert.equal(now.enabled, false);

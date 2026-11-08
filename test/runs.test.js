@@ -70,7 +70,8 @@ test('create validates the request', async () => {
   await rejects(runs.create({ prompt: 'x', stages: Array.from({ length: 21 }, () => ({ profile: 'attack' })) }), 400, /At most 20 stages/);
   await rejects(runs.create({ prompt: 'x', stages: [{ profile: 'attack' }], fromTags: {} }), 400, /either stages or fromTags/);
   await rejects(runs.create({ prompt: 'x', stages: [{ profile: 'bad id!' }] }), 400, /stage profile/);
-  await rejects(runs.create({ prompt: '', stages: [{ profile: 'attack' }] }), 400, /prompt/);
+  await rejects(runs.create({ prompt: '', stages: [{ profile: 'attack' }] }), 400, /An objective is required/);
+  await rejects(runs.create({ objective: '  ', stages: [{ profile: 'attack' }] }), 400, /An objective is required/);
   const saved = secrets;
   secrets = { settings: { token: '', passkey: '' } };
   await rejects(runs.create({ prompt: 'x', stages: [{ profile: 'attack' }] }), 400, /token and passkey/);
@@ -498,17 +499,19 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     assert.ok(!all.includes(TOKEN) && !all.includes(PASSKEY) && !all.includes(API_KEY), 'secret inside the download');
 
     // workspaces (basic HTTP, by exact id; the full /load, /run tests are in workspaces-api.test.js)
-    let r = await json('/api/workspaces', 'POST', { name: 'Weekly recon', request });
+    const { name: _n, prompt: _p, ...setup } = request; // a workspace has no objective
+    let r = await json('/api/workspaces', 'POST', { name: 'Weekly recon', request: setup });
     assert.equal(r.status, 201);
     const setupId = r.body.id;
-    r = await json(`/api/workspaces/${encodeURIComponent('Weekly recon')}`, 'PATCH', { request: { ...request, prompt: 'changed' } });
+    r = await json(`/api/workspaces/${encodeURIComponent('Weekly recon')}`, 'PATCH', { request: { ...setup, model: 'changed' } });
     assert.equal(r.status, 404, 'a name is not a reference');
-    r = await json(`/api/workspaces/${setupId}`, 'PATCH', { request: { ...request, prompt: 'changed' } });
+    r = await json(`/api/workspaces/${setupId}`, 'PATCH', { request: { ...setup, model: 'changed' } });
     assert.equal(r.status, 200);
     let list = (await json('/api/workspaces')).body;
     assert.equal(list.length, 1);
-    assert.equal(list[0].request.prompt, 'changed');
-    assert.equal((await json('/api/workspaces', 'POST', { name: '', request })).status, 400);
+    assert.equal(list[0].request.model, 'changed');
+    assert.equal((await json('/api/workspaces', 'POST', { name: 'x', request })).status, 400, 'an objective is refused');
+    assert.equal((await json('/api/workspaces', 'POST', { name: '', request: setup })).status, 400);
     assert.equal((await json('/api/workspaces', 'POST', { name: 'x', request: 'nope' })).status, 400);
     assert.equal((await json(`/api/workspaces/${setupId}`, 'DELETE')).status, 204);
     assert.deepEqual((await json('/api/workspaces')).body, []);

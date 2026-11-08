@@ -94,7 +94,7 @@ test('2. setup: user token (an LLM token is refused) + passkey, then the LLM log
 
 let tagged, picked;
 test('3. /workspace new from profile tags; the CLI keeps the returned id', async () => {
-  const r = await call('POST', '/api/workspaces', { name: 'Recon then attack', request: { prompt: 'Map example.com (authorized).', globalProfile: 'global', fromTags: { skip: ['3', '4'] } } });
+  const r = await call('POST', '/api/workspaces', { name: 'Recon then attack', request: { globalProfile: 'global', fromTags: { skip: ['3', '4'] } } });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   tagged = r.body.id;
   const view = (await call('GET', ws(tagged))).body;
@@ -103,7 +103,7 @@ test('3. /workspace new from profile tags; the CLI keeps the returned id', async
   assert.deepEqual((await call('GET', '/api/runs')).body, [], 'nothing started');
 });
 
-test('4. /workspace new + /load + /load --global + /unload, then /workspace shows what is missing', async () => {
+test('4. /workspace new + /load + /load --global + /unload, then /workspace shows the stages it would run', async () => {
   let r = await call('POST', '/api/workspaces', { name: 'Picked by hand' });
   assert.equal(r.status, 201);
   picked = r.body.id;
@@ -114,22 +114,21 @@ test('4. /workspace new + /load + /load --global + /unload, then /workspace show
   const view = (await call('GET', ws(picked))).body;
   assert.equal(view.name, 'Picked by hand');
   assert.deepEqual(view.request.stages.map((s) => s.profile), ['recon', 'escalate']);
-  assert.equal(view.plan, null);
-  assert.match(view.planError, /prompt/i, 'it says the objective is missing');
-  assert.equal((await call('POST', ws(picked, '/run'))).status, 400, '/run refuses until it is complete');
+  assert.equal(view.planError, null, 'ready: no objective needed in a workspace');
+  assert.deepEqual(view.plan.stages.map((s) => s.profile), ['recon', 'escalate']);
 });
 
-test('5. set the objective (PATCH the request)', async () => {
+test('5. a workspace is a blank template: /run asks for the objective', async () => {
+  const r = await call('POST', ws(picked, '/run'));
+  assert.equal(r.status, 400);
+  assert.match(r.body.error, /Give the run an objective/);
   const before_ = (await call('GET', ws(picked))).body.request;
-  const r = await call('PATCH', ws(picked), { request: { ...before_, prompt: 'Map example.com (authorized).' } });
-  assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.deepEqual(r.body.plan.stages.map((s) => s.profile), ['recon', 'escalate']);
-  assert.equal(r.body.planError, null);
+  assert.equal((await call('PATCH', ws(picked), { request: { ...before_, prompt: 'x' } })).status, 400, 'no objective in a workspace');
 });
 
 let shortId;
 test('6. /run + /watch until done', async () => {
-  const r = await call('POST', ws(picked, '/run'));
+  const r = await call('POST', ws(picked, '/run'), { objective: 'Map example.com (authorized).' });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   shortId = r.body.id.slice(0, 8);
   let cursor = '';

@@ -1,6 +1,7 @@
 // schedules.js: runs that start by themselves at set times. A schedule points
 // at one workspace (by exact id, so edits to the workspace reach future runs),
-// has a timing rule and the user's timezone, and can be paused. Stored in
+// carries the run's objective (workspaces have none), has a timing rule and the
+// user's timezone, and can be paused. Stored in
 // <data>/schedules.json.
 //
 // Timing rules (no cron), all times are wall-clock in the schedule's timezone:
@@ -166,6 +167,13 @@ export function describe(when, tz) {
 // ---- storage ---------------------------------------------------------------
 
 const cleanName = (name) => String(name ?? '').replace(/\s+/g, ' ').trim();
+export const MAX_OBJECTIVE = 100_000;
+const NO_OBJECTIVE = 'A schedule needs an objective: what its runs should do';
+function checkObjective(objective) {
+  if (typeof objective !== 'string' || !objective.trim()) throw new ScheduleError(400, NO_OBJECTIVE);
+  if (objective.length > MAX_OBJECTIVE) throw new ScheduleError(400, 'Objective is too long (100,000 characters max)');
+  return objective;
+}
 const iso = (ms) => (ms == null ? null : new Date(ms).toISOString());
 
 export class Schedules {
@@ -210,8 +218,9 @@ export class Schedules {
     if (!(await this.workspaceExists(workspaceId))) throw new ScheduleError(400, `No workspace with id "${workspaceId.slice(0, 100)}"`);
   }
 
-  async create({ workspaceId, when, tz, name, enabled = true } = {}) {
+  async create({ workspaceId, objective, when, tz, name, enabled = true } = {}) {
     await this.checkWorkspace(workspaceId);
+    objective = checkObjective(objective);
     when = checkWhen(when);
     tz = checkTimezone(tz);
     name = cleanName(name);
@@ -222,7 +231,7 @@ export class Schedules {
       if (items.length >= MAX_SCHEDULES) throw new ScheduleError(409, `You can have at most ${MAX_SCHEDULES} schedules; delete some first`);
       const now = this.now();
       const s = this.plan({
-        id: randomUUID(), name, workspaceId, when, tz, enabled,
+        id: randomUUID(), name, workspaceId, objective, when, tz, enabled,
         anchorAt: iso(now), createdAt: iso(now), updatedAt: iso(now),
         nextAt: null, queued: false, lastRun: null, history: [],
       }, now);
@@ -232,13 +241,14 @@ export class Schedules {
     });
   }
 
-  // update changes name, workspace, timing or timezone. Changing the timing
+  // update changes name, workspace, objective, timing or timezone. Changing the timing
   // restarts "every" schedules from now (unless they have a start).
   async update(id, changes = {}) {
-    const known = ['name', 'workspaceId', 'when', 'tz', 'enabled'];
+    const known = ['name', 'workspaceId', 'objective', 'when', 'tz', 'enabled'];
     const extra = Object.keys(changes).filter((k) => !known.includes(k));
     if (extra.length) throw new ScheduleError(400, `Can't change: ${extra.join(', ')}`);
     if (changes.workspaceId !== undefined) await this.checkWorkspace(changes.workspaceId);
+    const objective = changes.objective === undefined ? undefined : checkObjective(changes.objective);
     const when = changes.when === undefined ? undefined : checkWhen(changes.when);
     const tz = changes.tz === undefined ? undefined : checkTimezone(changes.tz);
     const name = changes.name === undefined ? undefined : cleanName(changes.name);
@@ -251,10 +261,12 @@ export class Schedules {
       const timingChanged = when !== undefined || tz !== undefined;
       const resumed = changes.enabled === true && !old.enabled;
       if (resumed && changes.workspaceId === undefined) await this.checkWorkspace(old.workspaceId);
+      if (resumed && objective === undefined && !old.objective) throw new ScheduleError(400, NO_OBJECTIVE);
       let s = {
         ...old,
         name: name ?? old.name,
         workspaceId: changes.workspaceId ?? old.workspaceId,
+        objective: objective ?? old.objective ?? '',
         when: when ?? old.when,
         tz: tz ?? old.tz,
         enabled: changes.enabled ?? old.enabled,
@@ -277,6 +289,22 @@ export class Schedules {
       const s = await this.get(id);
       await this.store.save('schedules', (await this.all()).filter((x) => x.id !== s.id));
       return s;
+    });
+  }
+
+  // adoptObjectives gives schedules without an objective the one their
+  // workspace used to hold (objectives: Map(workspace id → objective); see
+  // Workspaces.takeObjectives). Returns how many schedules got one.
+  async adoptObjectives(objectives) {
+    return this.write(async () => {
+      let count = 0;
+      const items = (await this.all()).map((x) => {
+        if (x.objective || !objectives.has(x.workspaceId)) return x;
+        count += 1;
+        return { ...x, objective: objectives.get(x.workspaceId) };
+      });
+      if (count) await this.store.save('schedules', items);
+      return count;
     });
   }
 

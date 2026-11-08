@@ -9,7 +9,7 @@ function memoryStore(initial = {}) {
   const data = structuredClone(initial);
   return { data, load: async (k, fallback) => (k in data ? structuredClone(data[k]) : fallback), save: async (k, v) => { data[k] = structuredClone(v); } };
 }
-const req = (prompt = 'p') => ({ prompt, fromTags: {} });
+const req = (model = 'gpt-5') => ({ model, fromTags: {} }); // a workspace has no objective
 
 test('create, list (newest first), find ONLY by exact id', async () => {
   const ws = new Workspaces({ store: memoryStore() });
@@ -46,9 +46,9 @@ test('update: rename and/or replace the request; renaming onto another name is r
   await assert.rejects(ws.update('A', { name: 'Alpha' }), (e) => e.status === 404, 'not by name');
   const renamed = await ws.update(a.id, { name: 'Alpha' });
   assert.equal(renamed.name, 'Alpha');
-  assert.equal(renamed.request.prompt, 'first', 'request kept when not given');
+  assert.equal(renamed.request.model, 'first', 'request kept when not given');
   const changed = await ws.update(a.id, { request: req('second') });
-  assert.equal(changed.request.prompt, 'second');
+  assert.equal(changed.request.model, 'second');
   assert.ok(changed.updatedAt >= renamed.updatedAt);
   await assert.rejects(ws.update(a.id, { name: 'b' }), (e) => e.status === 409);
 });
@@ -64,7 +64,7 @@ test('delete', async () => {
 
 test('old "saved setups" (workflows.json) become workspaces once', async () => {
   const store = memoryStore({ workflows: [
-    { id: 'w1', name: 'Old setup', request: req('old'), updatedAt: '2026-11-01T10:00:00.000Z' },
+    { id: 'w1', name: 'Old setup', request: { prompt: 'old', fromTags: {} }, updatedAt: '2026-11-01T10:00:00.000Z' },
     { id: 'w2', name: 'Legacy UI workflow', task: 'x', steps: [] }, // the very first base format: no request → skipped
   ] });
   const ws = new Workspaces({ store });
@@ -77,7 +77,7 @@ test('old "saved setups" (workflows.json) become workspaces once', async () => {
 
 test('/load keeps each profile\'s stage tag (so per-tag models and follow-ups reach it)', async () => {
   const ws = new Workspaces({ store: memoryStore() });
-  const w = await ws.create({ name: 'Picked', request: { prompt: 'p', stages: [] } });
+  const w = await ws.create({ name: 'Picked', request: { stages: [] } });
   const tags = { recon: '1', attack: '2' }; // odd: no single 1-4 tag
   const out = await ws.changeStages(w.id, { add: ['recon', 'odd', 'attack'], tagOf: (id) => tags[id] || '' });
   assert.deepEqual(out.workspace.request.stages, [{ profile: 'recon', tag: '1' }, { profile: 'odd' }, { profile: 'attack', tag: '2' }]);
@@ -89,4 +89,38 @@ test('concurrent creates do not lose each other', async () => {
   const ws = new Workspaces({ store: memoryStore() });
   await Promise.all(Array.from({ length: 10 }, (_, i) => ws.create({ name: `W${i}`, request: req() })));
   assert.equal((await ws.list()).length, 10);
+});
+
+test('no objective in a workspace: refused with a pointer to /run; an empty one is dropped', async () => {
+  const ws = new Workspaces({ store: memoryStore() });
+  for (const request of [{ prompt: 'scan it', fromTags: {} }, { stages: [{ profile: 'recon', prompt: 'scan it' }] }]) {
+    await assert.rejects(ws.create({ name: 'X', request }), (e) => e.status === 400 && /no objective; give it when you start a run/.test(e.message));
+  }
+  const a = await ws.create({ name: 'Blank', request: { prompt: '', stages: [{ profile: 'recon', prompt: '' }] } });
+  assert.deepEqual(a.request, { stages: [{ profile: 'recon' }] });
+  await assert.rejects(ws.update(a.id, { request: { prompt: 'scan it', stages: [] } }), (e) => e.status === 400);
+});
+
+test('takeObjectives: older workspaces hand their objective over, then lose it', async () => {
+  const store = memoryStore({ workspaces: [
+    { id: 'w1', name: 'Main', request: { prompt: 'recon example.com', stages: [{ profile: 'recon', prompt: 'stage own' }] }, createdAt: 'x', updatedAt: 'x' },
+    { id: 'w2', name: 'Stage only', request: { stages: [{ profile: 'recon' }, { profile: 'b', prompt: 'from stage b' }] }, createdAt: 'x', updatedAt: 'x' },
+    { id: 'w3', name: 'Empty', request: { prompt: '', fromTags: {} }, createdAt: 'x', updatedAt: 'x' },
+    { id: 'w4', name: 'New', request: { fromTags: {} }, createdAt: 'x', updatedAt: 'x' },
+  ] });
+  const ws = new Workspaces({ store });
+  let handed = null;
+  const found = await ws.takeObjectives(async (m) => { handed = new Map(m); assert.equal(store.data.workspaces[0].request.prompt, 'recon example.com', 'kept until handed over'); });
+  assert.deepEqual([...handed], [['w1', 'recon example.com'], ['w2', 'from stage b']]);
+  assert.equal(found.size, 2);
+  assert.deepEqual(store.data.workspaces.map((w) => w.request), [
+    { stages: [{ profile: 'recon' }] }, { stages: [{ profile: 'recon' }, { profile: 'b' }] }, { fromTags: {} }, { fromTags: {} }]);
+
+  // If handing over fails, nothing is removed (it runs again next start).
+  const store2 = memoryStore({ workspaces: [{ id: 'w1', name: 'Main', request: { prompt: 'keep me' }, createdAt: 'x', updatedAt: 'x' }] });
+  await assert.rejects(new Workspaces({ store: store2 }).takeObjectives(async () => { throw new Error('disk full'); }), /disk full/);
+  assert.equal(store2.data.workspaces[0].request.prompt, 'keep me');
+  let called = false;
+  assert.equal((await new Workspaces({ store }).takeObjectives(async () => { called = true; })).size, 0);
+  assert.equal(called, false, 'nothing to do the second time');
 });

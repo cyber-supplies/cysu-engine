@@ -40,13 +40,15 @@ const workspaces = new Workspaces();
 const schedules = new Schedules({
   workspaceExists: (id) => workspaces.get(id).then(() => true, (e) => { if (e instanceof WorkspaceError && e.status === 404) return false; throw e; }),
 });
-const startWorkspaceRun = (ws, schedule) => runs.create({ name: ws.name, ...ws.request, workspace: { id: ws.id, name: ws.name } }, { schedule });
+// startWorkspaceRun: a run of the workspace's setup with the given objective
+// (workspaces hold none; see workspaces.js).
+const startWorkspaceRun = (ws, objective, schedule) => runs.create({ name: ws.name, ...ws.request, objective, workspace: { id: ws.id, name: ws.name } }, { schedule });
 const scheduler = new Scheduler({
   schedules,
   getWorkspace: (id) => workspaces.get(id).catch((e) => { if (e instanceof WorkspaceError && e.status === 404) return null; throw e; }),
   startRun: async (ws, s) => {
     if (!(await dockerAvailable())) throw new Error('Docker is not available on this machine');
-    return startWorkspaceRun(ws, { id: s.id, name: s.name });
+    return startWorkspaceRun(ws, s.objective, { id: s.id, name: s.name });
   },
   isBusy: () => runs.busy,
   tickMs: Number(process.env.CYSU_ENGINE_TEST_SCHEDULER_TICK_MS) || undefined,
@@ -67,7 +69,8 @@ function authFailed() {
 async function workspaceView(ws) {
   let plan = null; let planError = null;
   try {
-    const p = await runs.plan(ws.request);
+    // Workspaces have no objective: plan with a stand-in to check the rest.
+    const p = await runs.plan({ ...ws.request, objective: 'objective given at run time' });
     plan = { stages: p.stages.map((st) => ({ order: st.index + 1, tag: st.tag, profile: st.profile, model: st.model || 'default' })), globalProfile: p.globalProfile || '' };
   } catch (error) { planError = error.message; }
   return { ...ws, plan, planError };
@@ -88,6 +91,7 @@ async function scheduleView(s) {
   return {
     id: s.id, name: s.name, enabled: s.enabled, summary: s.summary, when: s.when, tz: s.tz,
     workspaceId: s.workspaceId, workspace: { id: s.workspaceId, name: ws ? ws.name : null, exists: Boolean(ws) },
+    objective: s.objective || '',
     nextAt: s.nextAt,
     waiting: s.queued ? { since: s.queuedAt, due: s.queuedFor } : null,
     lastRun, history: s.history, createdAt: s.createdAt, updatedAt: s.updatedAt,
@@ -271,7 +275,7 @@ async function api(req, res, path) {
     if (req.method === 'GET') return send(res, 200, await workspaces.list());
     if (req.method === 'POST') {
       const input = await body(req);
-      return send(res, 201, await workspaces.create({ name: input.name, request: input.request ?? { prompt: '', stages: [] } }));
+      return send(res, 201, await workspaces.create({ name: input.name, request: input.request ?? { stages: [] } }));
     }
   }
   let m = path.match(/^\/api\/workspaces\/([^/]+)$/);
@@ -315,7 +319,9 @@ async function api(req, res, path) {
     // /run: start a run of the workspace.
     if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
     const ws = await workspaces.get(decodeURIComponent(m[1]));
-    return send(res, 201, await startWorkspaceRun(ws, null));
+    const objective = (await body(req))?.objective;
+    if (typeof objective !== 'string' || !objective.trim()) return send(res, 400, { error: 'Give the run an objective: {"objective": "what this run should do"}' });
+    return send(res, 201, await startWorkspaceRun(ws, objective, null));
   }
 
   // ---- schedules (runs the engine starts by itself) -------------------------
@@ -325,7 +331,7 @@ async function api(req, res, path) {
     if (req.method === 'GET') return send(res, 200, await Promise.all((await schedules.list()).map(scheduleView)));
     if (req.method === 'POST') {
       const input = await body(req);
-      const s = await schedules.create({ workspaceId: input.workspaceId, when: input.when, tz: input.tz, name: input.name, enabled: input.enabled ?? true });
+      const s = await schedules.create({ workspaceId: input.workspaceId, objective: input.objective, when: input.when, tz: input.tz, name: input.name, enabled: input.enabled ?? true });
       scheduler.tick();
       return send(res, 201, await scheduleView(s));
     }
@@ -459,6 +465,10 @@ const server = createServer(async (req, res) => {
   }
 });
 await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
+// Older engines kept the objective in the workspace: hand it to that
+// workspace's schedules (so they keep working), then drop it.
+const moved = await workspaces.takeObjectives((found) => schedules.adoptObjectives(found));
+if (moved.size) console.log(`workspaces: moved ${moved.size} objective(s) out of workspaces (objectives are now given per run; schedules keep their own)`);
 await scheduler.start();
 
 server.listen(PORT, HOST, () => {

@@ -51,12 +51,12 @@ test('/workspace: create returns the id; names do not work as references; drafts
   wsId = r.body.id;
   assert.match(wsId, /^[0-9a-f-]{36}$/);
   assert.equal(r.body.current, undefined, 'no current workspace');
-  assert.deepEqual(r.body.request, { prompt: '', stages: [] }, 'an empty draft to load profiles into');
+  assert.deepEqual(r.body.request, { stages: [] }, 'an empty draft to load profiles into');
   assert.equal((await http('/api/status')).body.workspace, undefined, 'status has no current workspace');
   const view = (await http(ws(wsId))).body;
   assert.equal(view.name, 'My recon');
   assert.equal(view.plan, null);
-  assert.match(view.planError, /stage|prompt/i, 'the draft says what it still needs');
+  assert.match(view.planError, /at least one stage/, 'the draft says what it still needs');
   for (const ref of ['My recon', 'my recon', 'current', wsId.slice(0, 8), wsId.toUpperCase()]) {
     for (const [method, rest] of [['GET', ''], ['PATCH', ''], ['DELETE', ''], ['POST', '/profiles'], ['POST', '/run']]) {
       const res = await http(ws(ref, rest), method, method === 'GET' || method === 'DELETE' ? undefined : { name: 'x', add: ['recon'] });
@@ -85,12 +85,12 @@ test('/load: add stage profiles in order, skip duplicates, refuse unknown ones, 
   // Per-tag model + follow-up reach /load-ed stages now (they carry their tag).
   const reqNow = (await http(ws(wsId))).body.request;
   assert.equal(reqNow.stages.length, 3);
-  r = await http(ws(wsId), 'PATCH', { request: { ...reqNow, prompt: 'p', modelOverrides: [{ stage: 2, model: 'gpt-attack' }], reprompts: [{ stage: '3', prompt: 'again' }] } });
+  r = await http(ws(wsId), 'PATCH', { request: { ...reqNow, modelOverrides: [{ stage: 2, model: 'gpt-attack' }], reprompts: [{ stage: '3', prompt: 'again' }] } });
   assert.equal(r.body.planError, null, r.body.planError);
   assert.deepEqual(r.body.plan.stages.map((s) => `${s.profile}:${s.tag}:${s.model}`), ['recon:1:default', 'attack:2:gpt-attack', 'escalate:3:default']);
-  const planned = (await http('/api/runs/plan', 'POST', r.body.request)).body;
+  const planned = (await http('/api/runs/plan', 'POST', { ...r.body.request, objective: 'p' })).body;
   assert.deepEqual(planned.stages.map((s) => s.reprompts), [[], [], ['again']]);
-  await http(ws(wsId), 'PATCH', { request: reqNow }); // back to the draft (no objective) for the next tests
+  await http(ws(wsId), 'PATCH', { request: reqNow }); // back to the plain draft for the next tests
   r = await http(ws(wsId, '/profiles'), 'POST', { remove: ['escalate'] });
   assert.deepEqual(r.body.request.stages.map((s) => s.profile), ['recon', 'attack']);
   r = await http(ws(wsId, '/profiles'), 'POST', { remove: ['triage'] });
@@ -99,7 +99,7 @@ test('/load: add stage profiles in order, skip duplicates, refuse unknown ones, 
   assert.equal((await http(ws(wsId, '/profiles'), 'POST', {})).status, 400);
   assert.equal((await http(ws(wsId, '/profiles'), 'POST', { add: 'recon' })).status, 400);
 
-  const tagged = (await http('/api/workspaces', 'POST', { name: 'Tagged', request: { prompt: 'p', fromTags: {} } })).body;
+  const tagged = (await http('/api/workspaces', 'POST', { name: 'Tagged', request: { fromTags: {} } })).body;
   r = await http(ws(tagged.id, '/profiles'), 'POST', { add: ['recon'] });
   assert.equal(r.status, 409);
   assert.match(r.body.error, /builds its stages from profile tags/);
@@ -116,13 +116,22 @@ test('the assistant, proposals and workspace selection are gone', async () => {
 });
 
 let runId;
-test('/run: refused while the workspace is incomplete; then it starts', async () => {
-  let r = await http(ws(wsId, '/run'), 'POST');
+test('/run: the objective comes with the run; the workspace stays a blank template', async () => {
+  const view = (await http(ws(wsId))).body;
+  assert.equal(view.planError, null, 'a workspace without an objective is complete');
+  for (const body of [undefined, {}, { objective: '  ' }, { objective: 42 }, null]) {
+    const r = await http(ws(wsId, '/run'), 'POST', body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match(r.body.error, /Give the run an objective/);
+  }
+  let r = await http(ws(wsId), 'PATCH', { request: { ...view.request, prompt: 'Map example.com (authorized).' } });
   assert.equal(r.status, 400);
-  assert.match(r.body.error, /prompt/i);
-  await http(ws(wsId), 'PATCH', { request: { ...(await http(ws(wsId))).body.request, prompt: 'Map example.com (authorized).' } });
-  r = await http(ws(wsId, '/run'), 'POST');
+  assert.match(r.body.error, /no objective; give it when you start a run/);
+  r = await http(ws(wsId, '/run'), 'POST', { objective: 'Map example.com (authorized).' });
   assert.equal(r.status, 201, JSON.stringify(r.body));
+  assert.equal(r.body.objective, 'Map example.com (authorized).');
+  assert.equal(r.body.request.objective, 'Map example.com (authorized).', '"run again" repeats it');
+  assert.deepEqual((await http(ws(wsId))).body.request, view.request, 'the workspace is unchanged');
   runId = r.body.id;
   assert.equal(r.body.name, 'My recon');
   assert.deepEqual(r.body.workspace, { id: wsId, name: 'My recon' });

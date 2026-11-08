@@ -24,7 +24,7 @@ import { orderProfiles, STAGE_TAGS, ProfileError } from './profiles.js';
 import { tarGz } from './tar.js';
 
 // The request fields a run remembers, so it can be run again.
-const REQUEST_FIELDS = ['name', 'prompt', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
+const REQUEST_FIELDS = ['name', 'objective', 'prompt', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
   'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts'];
 const requestOf = (input) => structuredClone(Object.fromEntries(REQUEST_FIELDS.filter((k) => input[k] !== undefined).map((k) => [k, input[k]])));
 
@@ -60,7 +60,7 @@ async function writeJson(file, value) {
 
 // summary is what a run list shows (no per-stage results).
 function summary(run) {
-  const { stages, prompt, ...rest } = run;
+  const { stages, prompt, objective, ...rest } = run;
   return { ...rest, stageCount: stages.length, stages: stages.map(({ index, profile, tag, status }) => ({ index, profile, tag, status })) };
 }
 
@@ -188,7 +188,8 @@ export class Runs {
     if (!llmReady) throw new HttpError(400, 'Log in to your LLM first: sign in with ChatGPT (Codex) or add an OpenAI API key');
 
     const defaults = {
-      prompt: String(input.prompt ?? ''),
+      // The objective: `objective`, or `prompt` (its older name).
+      prompt: String(input.objective ?? input.prompt ?? ''),
       globalProfile: String(input.globalProfile ?? settings.globalProfile ?? '').trim(),
       model: String(input.model ?? '').trim(),
       reasoningEffort: String(input.reasoningEffort ?? '').trim(),
@@ -274,6 +275,7 @@ export class Runs {
     return {
       name: String(input.name ?? '').trim().slice(0, 120),
       ...defaults,
+      objective: defaults.prompt, // the same text under the name users know
       source: input.fromTags !== undefined ? 'tags' : 'explicit',
       skip: input.fromTags?.skip ?? [],
       modelOverrides: [...modelForTag].map(([stage, model]) => ({ stage: Number(stage), model })),

@@ -40,8 +40,8 @@ export function validateStage(input = {}) {
   if (!PROFILE_ID.test(stage.profile)) throw new StageError('A valid stage profile ID is required');
   if (stage.globalProfile && !PROFILE_ID.test(stage.globalProfile)) throw new StageError('Invalid global profile ID');
   if (stage.globalProfile && stage.globalProfile === stage.profile) throw new StageError('The stage profile cannot be the global profile');
-  if (!stage.prompt.trim()) throw new StageError('A prompt is required');
-  if (stage.prompt.length > 100_000) throw new StageError('Prompt is too long (100,000 characters max)');
+  if (!stage.prompt.trim()) throw new StageError('An objective is required');
+  if (stage.prompt.length > 100_000) throw new StageError('Objective is too long (100,000 characters max)');
   if (stage.model && !MODEL.test(stage.model)) throw new StageError('Invalid model name');
   if (!REASONING_EFFORTS.includes(stage.reasoningEffort)) throw new StageError('Unknown reasoning effort');
   if (stage.fallbackModel && !MODEL.test(stage.fallbackModel)) throw new StageError('Invalid fallback model name');

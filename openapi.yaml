@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cyber Supplies Engine API
-  version: 0.11.0
+  version: 0.12.0
   description: |
     Local API of cysu-engine: the self-hosted server that runs Cyber Supplies
     profiles as agents in hardened Docker containers. There is no web UI: the
@@ -46,8 +46,14 @@ info:
 
     **Runs.** A run is a list of stages executed one after another, each in a
     fresh container: the global profile is installed as the user, the stage
-    profile in `/workspace`, then Codex works on the prompt. One run is
-    active at a time.
+    profile in `/workspace`, then Codex works on the run's **objective**. One
+    run is active at a time.
+
+    **Workspaces are blank templates; the objective comes with the run.** A
+    workspace keeps the setup (stages, global profile, models, follow-ups)
+    but no objective. The user gives the objective each time they start a
+    run (`POST /api/workspaces/{id}/run {"objective"}`), and a schedule
+    carries its own. A workspace request with an objective is refused (400).
 
     Stages are either listed explicitly (`stages`) or built from the user's
     profile tags (`fromTags`), like the old Windmill flow: every profile
@@ -57,7 +63,7 @@ info:
 
     Inside a stage, Codex runs one or more **attempts**: `initial`; if it
     fails and `fallbackModel` is set, one `fallback` with that model (same
-    prompt, same workspace); after success, one `reprompt` per follow-up
+    objective, same workspace); after success, one `reprompt` per follow-up
     prompt, each resuming the same Codex thread, in order. A stage fails if
     its initial (and fallback) attempt or any follow-up fails.
 
@@ -314,7 +320,7 @@ paths:
                 summary: All stage profiles in tag order (the Windmill flow)
                 value:
                   name: Example campaign
-                  prompt: Your target is example.com (in scope). Complete the instructions in your prompt.
+                  objective: Your target is example.com (in scope). Complete the instructions in your prompt.
                   globalProfile: global
                   fromTags: { skip: ['1'] }
                   modelOverrides: [{ stage: 2, model: gpt-5.6-sol }]
@@ -325,7 +331,7 @@ paths:
               explicit:
                 summary: One chosen profile
                 value:
-                  prompt: Your target is example.com (in scope). Map the attack surface and write notes.
+                  objective: Your target is example.com (in scope). Map the attack surface and write notes.
                   stages: [{ profile: attack }]
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -350,7 +356,7 @@ paths:
         content:
           application/json:
             schema: { $ref: '#/components/schemas/RunRequest' }
-            example: { prompt: Your target is example.com (in scope)., globalProfile: global, fromTags: { skip: ['1'] } }
+            example: { objective: Your target is example.com (in scope)., globalProfile: global, fromTags: { skip: ['1'] } }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -452,7 +458,7 @@ paths:
     post:
       tags: [Workspaces]
       summary: "Create a workspace (keep the returned `id`; it is the only way to refer to it)"
-      description: Without a request it starts as an empty draft (`{prompt:"", stages:[]}`) to load profiles into.
+      description: 'Without a request it starts as an empty draft (`{stages:[]}`) to load profiles into. No objective: that is given per run.'
       requestBody:
         required: true
         content:
@@ -462,7 +468,7 @@ paths:
               required: [name]
               properties:
                 name: { type: string, minLength: 1, maxLength: 80, description: 'A label, unique (any case); not usable as a reference' }
-                request: { $ref: '#/components/schemas/RunRequest' }
+                request: { $ref: '#/components/schemas/WorkspaceRequest' }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -495,7 +501,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { type: object, properties: { name: { type: string }, request: { $ref: '#/components/schemas/RunRequest' } } }
+            schema: { type: object, properties: { name: { type: string }, request: { $ref: '#/components/schemas/WorkspaceRequest' } } }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -561,7 +567,18 @@ paths:
     parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
     post:
       tags: [Workspaces]
-      summary: Start a run from the workspace (`/run`)
+      summary: Start a run from the workspace (`/run <id> <objective>`)
+      description: The workspace's setup with this objective. The workspace itself is not changed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [objective]
+              properties:
+                objective: { type: string, minLength: 1, maxLength: 100000, description: What this run should do (given to every stage) }
+            example: { objective: Your target is example.com (in scope). Map the attack surface and write notes. }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -570,7 +587,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
-        '400': { description: 'Not runnable yet (e.g. no objective or no stages), or setup missing', $ref: '#/components/responses/Error' }
+        '400': { description: 'No objective ("Give the run an objective"), not runnable (e.g. no stages), or setup missing', $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { description: Another run is active, $ref: '#/components/responses/Error' }
 
@@ -595,9 +612,10 @@ paths:
           application/json:
             schema:
               type: object
-              required: [workspaceId, when, tz]
+              required: [workspaceId, objective, when, tz]
               properties:
                 workspaceId: { type: string, description: The workspace to run (exact id) }
+                objective: { type: string, minLength: 1, maxLength: 100000, description: What each of its runs should do }
                 when: { $ref: '#/components/schemas/ScheduleWhen' }
                 tz: { type: string, description: 'IANA timezone, e.g. Europe/London (any case; saved in its canonical spelling)', example: Europe/London }
                 name: { type: string, maxLength: 80, description: An optional label }
@@ -605,10 +623,10 @@ paths:
             examples:
               weekdays:
                 summary: Every weekday at 09:00 London time
-                value: { workspaceId: 3f0c…, name: mornings, when: { type: weekdays, time: '09:00' }, tz: Europe/London }
+                value: { workspaceId: 3f0c…, objective: Your target is example.com (in scope). Look for anything new since yesterday., name: mornings, when: { type: weekdays, time: '09:00' }, tz: Europe/London }
               tonight:
                 summary: Once, tonight at 23:00
-                value: { workspaceId: 3f0c…, when: { type: once, at: '2026-11-07T23:00' }, tz: Europe/London }
+                value: { workspaceId: 3f0c…, objective: Your target is example.com (in scope). Map the attack surface., when: { type: once, at: '2026-11-07T23:00' }, tz: Europe/London }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -617,7 +635,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Schedule' }
-        '400': { description: 'Bad timing rule or timezone, unknown workspace, or a one-off time in the past', $ref: '#/components/responses/Error' }
+        '400': { description: 'No objective, bad timing rule or timezone, unknown workspace, or a one-off time in the past', $ref: '#/components/responses/Error' }
         '409': { description: 'Too many schedules (100)', $ref: '#/components/responses/Error' }
 
   /api/schedules/{scheduleId}:
@@ -636,7 +654,7 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
     patch:
       tags: [Schedules]
-      summary: Change name, workspace, timing, timezone or enabled
+      summary: Change name, workspace, objective, timing, timezone or enabled
       description: 'Changing `when` or `tz` restarts an `every` schedule without a `start` from now. A run already waiting keeps waiting (pausing cancels it).'
       requestBody:
         required: true
@@ -648,6 +666,7 @@ paths:
               properties:
                 name: { type: string, maxLength: 80 }
                 workspaceId: { type: string }
+                objective: { type: string, minLength: 1, maxLength: 100000 }
                 when: { $ref: '#/components/schemas/ScheduleWhen' }
                 tz: { type: string }
                 enabled: { type: boolean }
@@ -926,16 +945,17 @@ components:
 
     RunRequest:
       type: object
-      required: [prompt]
-      description: Give either `stages` or `fromTags`.
+      description: 'Give either `stages` or `fromTags`, and the objective (`objective`, or `prompt`, its older name).'
+      anyOf: [{ required: [objective] }, { required: [prompt] }]
       properties:
         name: { type: string, maxLength: 120 }
-        prompt: { type: string, minLength: 1, maxLength: 100000, description: Objective given to every stage }
+        objective: { type: string, minLength: 1, maxLength: 100000, description: What the run should do (given to every stage) }
+        prompt: { type: string, minLength: 1, maxLength: 100000, description: 'Older name of `objective` (used when `objective` is absent)' }
         globalProfile: { type: string, description: 'Profile installed as the user in every stage; "" for none. Defaults to the saved setting.' }
         model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: Default model for every stage }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
         continueOnFailure: { type: boolean, default: true, description: 'false: stop after the first failed stage (the rest become skipped)' }
-        fallbackModel: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: 'If a stage''s first attempt fails, retry it once with this model (same prompt, same workspace)' }
+        fallbackModel: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: 'If a stage''s first attempt fails, retry it once with this model (same objective, same workspace)' }
         reprompts:
           type: array
           description: Follow-up prompts per stage tag. After a stage's first attempt succeeds, each matching prompt is sent to the same Codex thread, in this order.
@@ -956,7 +976,7 @@ components:
             properties:
               profile: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' }
               tag: { type: string, enum: ['1', '2', '3', '4'], description: Optional stage number (lets modelOverrides apply) }
-              prompt: { type: string, description: Overrides the run prompt for this stage }
+              prompt: { type: string, description: 'Overrides the run objective for this stage (POST /api/runs only; not allowed in a workspace)' }
               model: { type: string }
               reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
               fallbackModel: { type: string }
@@ -980,12 +1000,24 @@ components:
               stage: { type: integer, enum: [1, 2, 3, 4] }
               model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$' }
 
+    WorkspaceRequest:
+      description: |
+        The setup a workspace keeps: the fields of RunRequest **without the
+        objective**: no `objective`/`prompt`, and no `prompt` on a stage. An
+        objective here is refused (400 "A workspace has no objective; give it
+        when you start a run"); an empty `prompt: ""` is accepted and dropped.
+      allOf:
+        - { $ref: '#/components/schemas/RunRequest' }
+      not: { anyOf: [{ required: [objective] }, { required: [prompt] }] }
+      example: { globalProfile: global, stages: [{ profile: recon, tag: '1' }, { profile: attack, tag: '2' }], reprompts: [{ stage: '2', prompt: Start the second wave. }] }
+
     RunPlan:
       type: object
       description: A planned run (from `POST /api/runs/plan`); a created run has these fields plus id, status and times.
       properties:
         name: { type: string }
-        prompt: { type: string }
+        objective: { type: string }
+        prompt: { type: string, description: Same as `objective` (older name) }
         globalProfile: { type: string }
         model: { type: string }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
@@ -1043,7 +1075,7 @@ components:
 
     Run:
       type: object
-      required: [id, status, createdAt, prompt, stages]
+      required: [id, status, createdAt, objective, stages]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
@@ -1051,7 +1083,8 @@ components:
         createdAt: { type: string, format: date-time }
         startedAt: { type: [string, 'null'], format: date-time }
         finishedAt: { type: [string, 'null'], format: date-time }
-        prompt: { type: string }
+        objective: { type: string, description: What this run was asked to do }
+        prompt: { type: string, description: Same as `objective` (older name; runs from before 0.12 have only this) }
         globalProfile: { type: string }
         model: { type: string }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
@@ -1073,7 +1106,7 @@ components:
       properties:
         id: { type: string }
         name: { type: string }
-        request: { $ref: '#/components/schemas/RunRequest' }
+        request: { $ref: '#/components/schemas/WorkspaceRequest' }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
 
@@ -1088,7 +1121,7 @@ components:
               properties:
                 globalProfile: { type: string }
                 stages: { type: array, items: { type: object, properties: { order: { type: integer }, tag: { type: string }, profile: { type: string }, model: { type: string } } } }
-            planError: { type: [string, 'null'], description: 'Why it cannot run yet (e.g. no objective, no stages, unknown profile)' }
+            planError: { type: [string, 'null'], description: 'Why it cannot run yet (e.g. no stages, unknown profile). The objective is not needed here.' }
 
     RunSummary:
       type: object
@@ -1167,7 +1200,8 @@ components:
             active, so it waits. skipped: one was already waiting. missed: the
             engine was off or asleep (`count` times). dropped: the engine
             restarted while it waited. failed: the run could not start
-            (`reason`, e.g. no LLM login). paused: its workspace was deleted.
+            (`reason`, e.g. no LLM login). paused: its workspace was deleted,
+            or it has no objective (only older schedules; `reason` says which).
         due: { type: [string, 'null'], format: date-time, description: The scheduled time this is about }
         runId: { type: string }
         count: { type: integer, description: 'missed: how many times' }
@@ -1175,7 +1209,7 @@ components:
 
     Schedule:
       type: object
-      required: [id, enabled, summary, when, tz, workspaceId, workspace, nextAt, history]
+      required: [id, enabled, summary, when, tz, workspaceId, workspace, objective, nextAt, history]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
@@ -1185,6 +1219,7 @@ components:
         tz: { type: string }
         workspaceId: { type: string }
         workspace: { type: object, properties: { id: { type: string }, name: { type: [string, 'null'] }, exists: { type: boolean } } }
+        objective: { type: string, description: 'What its runs do ("" only for an older schedule whose workspace had none to hand over)' }
         nextAt: { type: [string, 'null'], format: date-time, description: 'The next run time (null when paused or done)' }
         waiting:
           type: [object, 'null']

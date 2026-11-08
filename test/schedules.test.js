@@ -89,10 +89,10 @@ test('storage: create, list, get, update, pause, resume, delete', async () => {
   let now = at('2026-11-07T10:00:00Z');
   const s = new Schedules({ store, now: () => now, workspaceExists: async (id) => id === 'ws-1' || id === 'ws-2' });
 
-  await assert.rejects(s.create({ workspaceId: 'nope', when: { type: 'daily', time: '09:00' }, tz: 'UTC' }), /No workspace/);
-  await assert.rejects(s.create({ workspaceId: 'ws-1', when: { type: 'once', at: '2026-11-01T09:00' }, tz: 'UTC' }), /in the past/);
+  await assert.rejects(s.create({ objective: 'scan it', workspaceId: 'nope', when: { type: 'daily', time: '09:00' }, tz: 'UTC' }), /No workspace/);
+  await assert.rejects(s.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'once', at: '2026-11-01T09:00' }, tz: 'UTC' }), /in the past/);
 
-  const a = await s.create({ workspaceId: 'ws-1', name: '  morning   recon ', when: { type: 'weekdays', time: '09:00' }, tz: 'Europe/London' });
+  const a = await s.create({ objective: 'scan it', workspaceId: 'ws-1', name: '  morning   recon ', when: { type: 'weekdays', time: '09:00' }, tz: 'Europe/London' });
   assert.equal(a.name, 'morning recon');
   assert.equal(a.nextAt, '2026-11-09T09:00:00.000Z');
   assert.equal(a.summary, 'every weekday at 09:00 (Europe/London)');
@@ -100,7 +100,7 @@ test('storage: create, list, get, update, pause, resume, delete', async () => {
   assert.deepEqual(a.history, []);
   assert.equal(store.data.schedules.length, 1);
 
-  const b = await s.create({ workspaceId: 'ws-2', when: { type: 'every', hours: 4 }, tz: 'UTC' });
+  const b = await s.create({ objective: 'scan it', workspaceId: 'ws-2', when: { type: 'every', hours: 4 }, tz: 'UTC' });
   assert.equal(b.nextAt, '2026-11-07T14:00:00.000Z');
   assert.deepEqual((await s.list()).map((x) => x.id), [a.id, b.id]);
   assert.equal((await s.get(a.id)).workspaceId, 'ws-1');
@@ -130,7 +130,7 @@ test('storage: create, list, get, update, pause, resume, delete', async () => {
 test('change keeps a short newest-first history', async () => {
   const store = memoryStore();
   const s = new Schedules({ store, now: () => at('2026-11-07T10:00:00Z') });
-  const a = await s.create({ workspaceId: 'ws', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const a = await s.create({ objective: 'scan it', workspaceId: 'ws', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   for (let i = 0; i < HISTORY_LIMIT + 5; i++) {
     await s.change(a.id, (x) => ({ schedule: x, event: { kind: 'missed', n: i } }));
   }
@@ -145,5 +145,27 @@ test('limit on the number of schedules', async () => {
   const store = memoryStore();
   store.data.schedules = Array.from({ length: 100 }, (_, i) => ({ id: `s${i}`, createdAt: '2026-01-01T00:00:00.000Z' }));
   const s = new Schedules({ store });
-  await assert.rejects(s.create({ workspaceId: 'ws', when: { type: 'daily', time: '09:00' }, tz: 'UTC' }), (e) => e.status === 409 && /at most 100/.test(e.message));
+  await assert.rejects(s.create({ objective: 'scan it', workspaceId: 'ws', when: { type: 'daily', time: '09:00' }, tz: 'UTC' }), (e) => e.status === 409 && /at most 100/.test(e.message));
+});
+
+test('objective: required, can be changed, older schedules adopt their workspace\'s', async () => {
+  const store = memoryStore();
+  const s = new Schedules({ store, now: () => at('2026-11-07T10:00:00Z') });
+  const when = { type: 'daily', time: '09:00' };
+  for (const objective of [undefined, '', '   ', 42]) {
+    await assert.rejects(s.create({ objective, workspaceId: 'ws', when, tz: 'UTC' }), (e) => e.status === 400 && /needs an objective/.test(e.message));
+  }
+  await assert.rejects(s.create({ objective: 'x'.repeat(100_001), workspaceId: 'ws', when, tz: 'UTC' }), /too long/);
+  const a = await s.create({ objective: 'recon', workspaceId: 'ws', when, tz: 'UTC' });
+  assert.equal(a.objective, 'recon');
+  assert.equal((await s.update(a.id, { objective: 'deeper recon' })).objective, 'deeper recon');
+  await assert.rejects(s.update(a.id, { objective: '' }), /needs an objective/);
+
+  // Migration: schedules without one get their workspace's old objective.
+  store.data.schedules.push({ ...store.data.schedules[0], id: 'old-1', workspaceId: 'ws-old', objective: undefined },
+    { ...store.data.schedules[0], id: 'old-2', workspaceId: 'ws-none', objective: undefined });
+  assert.equal(await s.adoptObjectives(new Map([['ws-old', 'from the workspace'], ['ws', 'not used']])), 1);
+  assert.equal((await s.get('old-1')).objective, 'from the workspace');
+  assert.equal((await s.get(a.id)).objective, 'deeper recon', 'a schedule keeps its own');
+  assert.equal((await s.get('old-2')).objective, undefined);
 });

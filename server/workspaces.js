@@ -1,7 +1,8 @@
-// workspaces.js: named, saved run setups. A workspace holds a run request
-// (global profile, stage profiles from tags or picked in order, objective,
-// models, follow-ups…). The user starts one with /run in the CLI. Stored in
-// <data>/workspaces.json.
+// workspaces.js: named, saved run setups. A workspace is a blank template:
+// global profile, stage profiles (from tags or picked in order), models,
+// follow-ups… but NO objective. The user gives the objective when they start a
+// run (/run in the CLI, POST /api/workspaces/{id}/run {"objective"}), and a
+// schedule carries its own. Stored in <data>/workspaces.json.
 //
 // A workspace is referred to ONLY by its exact id. Its name is a label for
 // people (unique, so lists stay readable), never a way to look it up.
@@ -17,6 +18,22 @@ export class WorkspaceError extends Error {
 }
 
 const cleanName = (name) => String(name ?? '').replace(/\s+/g, ' ').trim();
+
+export const NO_OBJECTIVE = 'A workspace has no objective; give it when you start a run (POST /api/workspaces/{id}/run {"objective"})';
+
+// objectiveOf: the objective an older workspace stored ('' if none): its
+// prompt, else the first stage's own prompt.
+const objectiveOf = (request) => {
+  const stagePrompt = (Array.isArray(request?.stages) ? request.stages : []).map((st) => st?.prompt).find((p) => typeof p === 'string' && p.trim());
+  return typeof request?.prompt === 'string' && request.prompt.trim() ? request.prompt : (stagePrompt || '');
+};
+
+// withoutObjective: the request with every objective removed.
+const withoutObjective = (request) => {
+  const { prompt, ...rest } = request;
+  if (Array.isArray(rest.stages)) rest.stages = rest.stages.map((st) => { if (!st || typeof st !== 'object') return st; const { prompt: p, ...own } = st; return own; });
+  return rest;
+};
 
 export class Workspaces {
   constructor({ store = { load, save } } = {}) {
@@ -91,6 +108,22 @@ export class Workspaces {
     if (!name) throw new WorkspaceError(400, 'A workspace needs a name');
     if (name.length > 80) throw new WorkspaceError(400, 'Workspace names are limited to 80 characters');
     if (!request || typeof request !== 'object' || Array.isArray(request)) throw new WorkspaceError(400, 'A workspace needs a run request');
+    // An empty prompt is allowed (older clients send one) and dropped.
+    if (objectiveOf(request)) throw new WorkspaceError(400, NO_OBJECTIVE);
+  }
+
+  // takeObjectives moves objectives out of workspaces saved by older engines.
+  // It returns Map(workspace id → objective) and calls keep(map) BEFORE removing
+  // them, so a crash in between loses nothing (keep runs again next start).
+  async takeObjectives(keep) {
+    return this.write(async () => {
+      const items = await this.all();
+      const found = new Map(items.filter((w) => objectiveOf(w.request)).map((w) => [w.id, objectiveOf(w.request)]));
+      const dirty = items.some((w) => w.request && ('prompt' in w.request || (Array.isArray(w.request.stages) && w.request.stages.some((st) => st && 'prompt' in st))));
+      if (found.size) await keep(found);
+      if (dirty) await this.store.save('workspaces', items.map((w) => (w.request ? { ...w, request: withoutObjective(w.request) } : w)));
+      return found;
+    });
   }
 
   async create({ name, request }) {
@@ -100,7 +133,7 @@ export class Workspaces {
       const items = await this.all();
       if (items.some((w) => w.name.toLowerCase() === name.toLowerCase())) throw new WorkspaceError(409, `A workspace called "${name}" already exists`);
       const now = new Date().toISOString();
-      const ws = { id: randomUUID(), name, request: structuredClone(request), createdAt: now, updatedAt: now };
+      const ws = { id: randomUUID(), name, request: withoutObjective(structuredClone(request)), createdAt: now, updatedAt: now };
       await this.store.save('workspaces', [...items, ws]);
       return ws;
     });
@@ -112,6 +145,7 @@ export class Workspaces {
       const ws = await this.get(id);
       const next = { ...ws, name: name === undefined ? ws.name : cleanName(name), request: request === undefined ? ws.request : structuredClone(request) };
       Workspaces.check(next.name, next.request);
+      next.request = withoutObjective(next.request);
       if (items.some((w) => w.id !== ws.id && w.name.toLowerCase() === next.name.toLowerCase())) throw new WorkspaceError(409, `A workspace called "${next.name}" already exists`);
       next.updatedAt = new Date().toISOString();
       await this.store.save('workspaces', items.map((w) => (w.id === ws.id ? next : w)));

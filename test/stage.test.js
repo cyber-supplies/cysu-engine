@@ -31,7 +31,7 @@ test('stage definitions are validated before anything starts', () => {
   for (const [input, message] of [
     [{ prompt: 'x' }, /stage profile/],
     [{ profile: 'a b', prompt: 'x' }, /stage profile/],
-    [{ profile: 'attack', prompt: '   ' }, /prompt/],
+    [{ profile: 'attack', prompt: '   ' }, /An objective is required/],
     [{ profile: 'attack', globalProfile: 'attack', prompt: 'x' }, /cannot be the global/],
     [{ profile: 'attack', prompt: 'x', model: 'gpt 5' }, /model/],
     [{ profile: 'attack', prompt: 'x', model: 'x"; rm -rf /' }, /model/],

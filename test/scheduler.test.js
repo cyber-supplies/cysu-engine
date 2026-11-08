@@ -25,7 +25,7 @@ function setup({ start = '2026-11-09T08:00:00Z', workspaces = { 'ws-1': { id: 'w
       if (fake.failWith) throw fake.failWith;
       fake.busy = true;
       const run = { id: `run-${++fake.n}`, createdAt: new Date(clock.now).toISOString() };
-      fake.started.push({ run: run.id, workspace: ws.id, schedule: s.id });
+      fake.started.push({ run: run.id, workspace: ws.id, schedule: s.id, objective: s.objective });
       return run;
     },
   });
@@ -37,12 +37,12 @@ const kinds = (s) => s.history.map((h) => h.kind);
 
 test('starts a run when the time comes, then moves to the next time', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', name: 'morning', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', name: 'morning', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   await t.advance(59 * MIN);
   assert.equal(t.fake.started.length, 0, 'not before 09:00');
   await t.advance(1 * MIN + 3_000); // 09:00:03, a tick later
-  assert.deepEqual(t.fake.started, [{ run: 'run-1', workspace: 'ws-1', schedule: s.id }]);
+  assert.deepEqual(t.fake.started, [{ run: 'run-1', workspace: 'ws-1', schedule: s.id, objective: 'scan it' }]);
   const after = await t.schedules.get(s.id);
   assert.equal(after.nextAt, '2026-11-10T09:00:00.000Z');
   assert.equal(after.queued, false);
@@ -56,7 +56,7 @@ test('starts a run when the time comes, then moves to the next time', async () =
 
 test('engine busy: waits, then starts the moment the run ends', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   t.fake.busy = true; // the user's own run is going
   await t.advance(60 * MIN + 1_000);
@@ -76,8 +76,8 @@ test('engine busy: waits, then starts the moment the run ends', async () => {
 
 test('at most one waiting per schedule; several schedules start in the order they came due', async () => {
   const t = setup();
-  const hourly = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'every', hours: 1 }, tz: 'UTC' }); // 09:00, 10:00…
-  const daily = await t.schedules.create({ workspaceId: 'ws-2', when: { type: 'daily', time: '09:30' }, tz: 'UTC' });
+  const hourly = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'every', hours: 1 }, tz: 'UTC' }); // 09:00, 10:00…
+  const daily = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-2', when: { type: 'daily', time: '09:30' }, tz: 'UTC' });
   await t.scheduler.start();
   t.fake.busy = true;
   await t.advance(60 * MIN + 1_000); // 09:00 hourly waits
@@ -95,7 +95,7 @@ test('at most one waiting per schedule; several schedules start in the order the
 
 test('missed while off or asleep: not run, noted once with a count', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'every', hours: 1 }, tz: 'UTC' }); // 09:00, 10:00, …
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'every', hours: 1 }, tz: 'UTC' }); // 09:00, 10:00, …
   await t.scheduler.start();
   await t.advance(5 * 60 * MIN + 30 * MIN); // "asleep" until 13:30: 09,10,11,12,13 all missed
   assert.equal(t.fake.started.length, 0);
@@ -110,7 +110,7 @@ test('missed while off or asleep: not run, noted once with a count', async () =>
 
 test('a little late (within 2 minutes) still runs', async () => {
   const t = setup();
-  await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   await t.advance(61 * MIN + 50_000); // 09:01:50
   assert.equal(t.fake.started.length, 1);
@@ -118,7 +118,7 @@ test('a little late (within 2 minutes) still runs', async () => {
 
 test('missed at startup: times that passed while the engine was off', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   t.clock.now = at('2026-11-11T12:00:00Z'); // the engine was off for 3 days
   await t.scheduler.start();
   assert.equal(t.fake.started.length, 0);
@@ -130,7 +130,7 @@ test('missed at startup: times that passed while the engine was off', async () =
 
 test('a restart drops runs that were waiting, with a note', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   t.fake.busy = true;
   await t.advance(60 * MIN + 1_000);
@@ -149,7 +149,7 @@ test('a restart drops runs that were waiting, with a note', async () => {
 
 test('one-off: runs once, then switches itself off', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'once', at: '2026-11-09T09:15' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'once', at: '2026-11-09T09:15' }, tz: 'UTC' });
   await t.scheduler.start();
   t.fake.busy = true; // and it still starts after waiting, although it is switched off
   await t.advance(75 * MIN + 1_000);
@@ -167,7 +167,7 @@ test('one-off: runs once, then switches itself off', async () => {
 
 test('pausing while waiting cancels the wait', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   t.fake.busy = true;
   await t.advance(60 * MIN + 1_000);
@@ -178,7 +178,7 @@ test('pausing while waiting cancels the wait', async () => {
 
 test('deleted workspace: the schedule pauses itself and says why', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   delete t.workspaces['ws-1'];
   await t.scheduler.start();
   await t.advance(60 * MIN + 1_000);
@@ -192,7 +192,7 @@ test('deleted workspace: the schedule pauses itself and says why', async () => {
 
 test("a run that can't start is noted and not retried", async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   t.fake.failWith = Object.assign(new Error('Log in to your LLM first'), { status: 400 });
   await t.advance(60 * MIN + 1_000);
@@ -209,7 +209,7 @@ test("a run that can't start is noted and not retried", async () => {
 
 test('the user starting a run at the same moment wins; the schedule keeps waiting', async () => {
   const t = setup();
-  const s = await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  const s = await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   t.fake.failWith = Object.assign(new Error('A run is already active'), { status: 409 });
   const realBusy = t.scheduler.isBusy;
@@ -225,9 +225,30 @@ test('the user starting a run at the same moment wins; the schedule keeps waitin
 
 test('ticks never overlap', async () => {
   const t = setup();
-  await t.schedules.create({ workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  await t.schedules.create({ objective: 'scan it', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
   await t.scheduler.start();
   t.clock.now += 60 * MIN + 1_000;
   await Promise.all([t.scheduler.tick(), t.scheduler.tick(), t.scheduler.tick()]);
   assert.equal(t.fake.started.length, 1);
+});
+
+test("runs get the schedule's own objective; a schedule without one pauses itself", async () => {
+  const t = setup();
+  await t.schedules.create({ objective: 'nightly recon of example.com', workspaceId: 'ws-1', when: { type: 'daily', time: '09:00' }, tz: 'UTC' });
+  await t.scheduler.start();
+  await t.advance(60 * MIN);
+  assert.equal(t.fake.started[0].objective, 'nightly recon of example.com');
+  await t.finishRun();
+
+  // An older schedule saved before objectives moved (none to adopt).
+  const old = await t.schedules.create({ objective: 'x', workspaceId: 'ws-2', when: { type: 'daily', time: '09:30' }, tz: 'UTC' });
+  t.data.schedules = t.data.schedules.map((x) => (x.id === old.id ? { ...x, objective: '' } : x));
+  await t.advance(30 * MIN);
+  const got = await t.schedules.get(old.id);
+  assert.equal(got.enabled, false);
+  assert.equal(got.history[0].kind, 'paused');
+  assert.match(got.history[0].reason, /no objective/);
+  assert.equal(t.fake.started.length, 1, 'no run without an objective');
+  await assert.rejects(t.schedules.resume(old.id), /needs an objective/);
+  assert.equal((await t.schedules.update(old.id, { objective: 'triage', enabled: true })).enabled, true);
 });

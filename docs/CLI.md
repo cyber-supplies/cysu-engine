@@ -62,7 +62,15 @@ ids). These changes are needed for it to work with the engine now:
    accepts an OpenAI API key (`PUT /api/settings {"llm": {"mode":
    "openai-api-key", "apiKey": "sk-…"}}`), so `llm.ready` from
    `GET /api/status` is the better check.
-6. The branch starts from `main` as of 2026-10-16 (`285392e`) and is 7
+6. **The objective moved from the workspace to the run (engine API 0.12).**
+   A workspace is now a blank template; the user gives the objective each
+   time they start a run. `create-workflow` / `edit-workflow` must not send
+   `prompt` in the request (a non-empty one → 400 "A workspace has no
+   objective; give it when you start a run"), and `run` must send it:
+   `POST /api/workspaces/<id>/run {"objective": "…"}` (without one → 400
+   "Give the run an objective"). Schedules carry their own `objective`. See
+   *Starting a run* and *Scheduled runs* below.
+7. The branch starts from `main` as of 2026-10-16 (`285392e`) and is 7
    commits behind it now; expect to rebase or merge before opening the PR.
 
 ## Basics
@@ -205,7 +213,8 @@ prefix ≥ 4).
 | `/load <id> <profile…>` | `POST /api/workspaces/<id>/profiles {"add": [...]}` | `added`, `skipped` (already there), then the workspace |
 | `/load <id> --global <profile>` | `… {"global": "<profile>"}` (`""` = none) | the workspace |
 | `/unload <id> <profile…>` | `… {"remove": [...]}` | the workspace |
-| `/run <id>` | `POST /api/workspaces/<id>/run` → the run | "started run `<first 8 of id>`", then `/watch` it |
+| `/run <id> [objective]` | `POST /api/workspaces/<id>/run {"objective"}` → the run | "started run `<first 8 of id>`", then `/watch` it. See *Starting a run* |
+| `/rerun [run]` | `POST /api/runs/<run>/rerun` → a new run | Same setup **and the same objective** as that run |
 | `/runs` | `GET /api/runs` | first 8 of `id`, `status`, `name`, `workspace.name`, `createdAt`, stage statuses; mark `trigger: "schedule"` runs |
 | `/watch [run]` | feed loop (below) | live progress; Ctrl-C stops watching, not the run |
 | `/cancel [run]` | `POST /api/runs/<run>/cancel` | "cancelling" |
@@ -219,10 +228,28 @@ works for `~/cysu/profiles/<name>`, i.e. `reconcileEditedProfile(name)`), then
 add `<name>`. The engine only loads profiles that exist in the account
 (unknown ones → 400 `Not one of your profiles: …`).
 
+### Starting a run
+
+**A workspace is a blank template; the objective comes with the run.** The
+workspace keeps the setup (stages, global profile, models, follow-ups). Each
+`/run` asks for what this particular run should do:
+
+- `/run <id> <objective…>`: the rest of the line is the objective.
+- `/run <id>` with no text: open `$EDITOR` (objectives are often long, up to
+  100 000 characters), or prompt for it. Refuse an empty one locally.
+- Also handy: `/run <id> --file <path>` reads it from a file.
+
+Send `POST /api/workspaces/<id>/run {"objective": "<text>"}`. The workspace
+is not changed. The run shows the objective as `objective`, and `/rerun`
+repeats it. Errors: 400 "Give the run an objective" (missing or blank), 400
+with the plan's message if the workspace isn't runnable (e.g. no stages), 409
+if another run is active.
+
 ### Workspace settings
 
-Everything else about a workspace is set with these commands. **The objective
-is required**: a new workspace cannot run until `/objective` is set.
+Everything else about a workspace is set with these commands. A workspace
+has **no objective** (see *Starting a run*), so there is no `/objective`
+command any more.
 
 All of them work the same way: `GET /api/workspaces/<id>`, change the one
 field in its `request`, then `PATCH /api/workspaces/<id> {"request": <the whole
@@ -234,7 +261,6 @@ lists the request field each command changes.
 
 | Command | Changes | Notes |
 |---|---|---|
-| `/objective <id> [text]` | `prompt` | No text → open `$EDITOR` (objectives are often long; up to 100 000 characters) |
 | `/rename <id> <name>` | the name: `PATCH {"name": "<name>"}` | 409 if another workspace has that name |
 | `/model <id> <model>` | `model` | Every stage's model. `""` → remove it (Codex's default) |
 | `/model <id> --stage <1-4> <model>` | `modelOverrides` (`[{"stage": <int>, "model"}]`) | Model for the stages with that tag. Replace an existing entry for the same stage; `""` removes it |
@@ -258,25 +284,29 @@ lists the request field each command changes.
   says "modelOverrides and reprompts apply to tagged stages". (Stages loaded by an
   older engine have no tag: `/unload` + `/load` them again.)
 - `/load <id> --global <profile>` (above) sets `globalProfile`.
-- Per-stage settings (`stages[].prompt`, `model`, `reasoningEffort`,
-  `fallbackModel`, `reprompts`) exist in the API (see `RunRequest` in
-  `openapi.yaml`) but have no command yet; add them later if testers ask.
+- Never put `prompt` in a workspace request (top level or on a stage):
+  the engine refuses a non-empty one. An empty `"prompt": ""` from an older
+  client is accepted and dropped.
+- Per-stage settings (`model`, `reasoningEffort`, `fallbackModel`,
+  `reprompts`) exist in the API (see `WorkspaceRequest` in `openapi.yaml`)
+  but have no command yet; add them later if testers ask.
 
 ### Showing a workspace
 
 `GET /api/workspaces/<id>`:
 
 ```
-{ "id", "name", "request": { "prompt", "globalProfile", "stages" | "fromTags", … },
+{ "id", "name", "request": { "globalProfile", "stages" | "fromTags", … },
   "plan": { "globalProfile", "stages": [ { "order", "tag", "profile", "model" } ] } | null,
   "planError": "<why it cannot run yet>" | null }
 ```
 
-Show the objective (`request.prompt`, first line), the global profile, the
+Show the global profile, the
 models (`model`, `modelOverrides`, `fallbackModel`, `reasoningEffort`), the
 number of follow-ups, and the stages from `plan`. If `plan` is null, show
-`planError` instead ("A prompt is required", "Not one of your profiles: …",
-…): it is exactly what still needs doing before `/run`.
+`planError` instead ("A run needs at least one stage", "Not one of your
+profiles: …", …): it is exactly what still needs doing before `/run`. (The
+objective is not part of a workspace, so it never appears here.)
 Workspaces built from tags (`fromTags`) take their stages from the profile
 tags; `/load`/`/unload` answer 409 on them (`/stages <id> picked` switches).
 
@@ -290,16 +320,20 @@ command names are suggestions; with the non-interactive `cysu engine
 
 | Command | Request | Show |
 |---|---|---|
-| `/schedule <id> <when…> [--name N] [--tz Z]` | `POST /api/schedules {"workspaceId", "when", "tz", "name"}` | its `id`, `summary`, `nextAt` in local time |
+| `/schedule <id> <when…> [--name N] [--tz Z]` | `POST /api/schedules {"workspaceId", "objective", "when", "tz", "name"}` | its `id`, `summary`, `nextAt` in local time. Ask for the objective as `/run` does (`$EDITOR`, or `--objective <text>` / `--file <path>`) |
 | `/schedules` | `GET /api/schedules` | one line each: first 8 of `id`, `name`, `workspace.name`, `summary`, on/paused, `nextAt`, `lastRun.status`, `waiting` |
-| `/schedule <sched>` | `GET /api/schedules/<sched>` | everything, plus `history` (below) |
+| `/schedule <sched>` | `GET /api/schedules/<sched>` | everything (including its `objective`), plus `history` (below) |
 | `/schedule pause <sched>` / `resume <sched>` | `POST /api/schedules/<sched>/pause` / `resume` | the schedule |
-| `/schedule edit <sched> <when…>` / `--name` / `--tz` / `--workspace <id>` | `PATCH /api/schedules/<sched> {only the fields that change}` | the schedule |
+| `/schedule edit <sched> <when…>` / `--name` / `--tz` / `--workspace <id>` / `--objective` | `PATCH /api/schedules/<sched> {only the fields that change}` | the schedule |
 | `/schedule delete <sched>` | `DELETE /api/schedules/<sched>` → 204 (ask to confirm) | "deleted" (its runs are kept) |
 | `/runs --scheduled [sched]` | `GET /api/runs?trigger=schedule` / `?schedule=<sched>` | as `/runs` |
 
 Unlike workspaces, PATCH here takes **only the fields that change** (`name`,
-`workspaceId`, `when`, `tz`, `enabled`); anything else is 400.
+`workspaceId`, `objective`, `when`, `tz`, `enabled`); anything else is 400.
+
+**Each schedule has its own `objective`** (required): workspaces have none,
+so the schedule says what its runs do. One workspace can back several
+schedules with different objectives. Its runs show that objective.
 
 **`when`** (no cron; times are wall-clock in `tz`). Suggested wording → body:
 
@@ -342,6 +376,7 @@ func localTZ() string {
 ```
 { "id", "name", "enabled", "summary": "every weekday at 09:00 (Europe/London)",
   "when", "tz", "workspaceId", "workspace": { "id", "name", "exists" },
+  "objective": "<what its runs do>",
   "nextAt": "<UTC>" | null,
   "waiting": { "since", "due" } | null,
   "lastRun": { "runId", "startedAt", "status", "finishedAt", "error" } | null,
@@ -357,7 +392,8 @@ func localTZ() string {
   already waiting), `missed` (the engine was off or the computer asleep:
   `count` times; not run), `dropped` (the engine restarted while it waited),
   `failed` (could not start: `reason`, e.g. no LLM login), `paused` (its
-  workspace was deleted). Print `reason` when there is one.
+  workspace was deleted, or, for an older schedule, it has no objective:
+  set one with `--objective` and resume). Print `reason` when there is one.
 - `enabled: false` with `nextAt: null` = paused, or a one-off that has run.
 - `workspace.exists: false` → its workspace was deleted; the schedule is
   paused and can't be resumed until `--workspace <id>` points it elsewhere.
@@ -409,7 +445,9 @@ printf '%s\n' "$H" | curl -s -H @- $E/status
 ID=$(printf '%s\n' "$H" | curl -s -H @- -X POST $E/workspaces -H 'Content-Type: application/json' -d '{"name":"Try"}' | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')
 printf '%s\n' "$H" | curl -s -H @- -X POST $E/workspaces/$ID/profiles -H 'Content-Type: application/json' -d '{"add":["recon"]}'
 printf '%s\n' "$H" | curl -s -H @- $E/workspaces/$ID
+# start a run: the objective goes with the run, not the workspace
+printf '%s\n' "$H" | curl -s -H @- -X POST $E/workspaces/$ID/run -H 'Content-Type: application/json' -d '{"objective":"Say hello and list your tools. Do not scan anything."}'
 # a schedule: every weekday at 09:00 in your timezone, then check on it
-printf '%s\n' "$H" | curl -s -H @- -X POST $E/schedules -H 'Content-Type: application/json' -d '{"workspaceId":"'$ID'","when":{"type":"weekdays","time":"09:00"},"tz":"Europe/London"}'
+printf '%s\n' "$H" | curl -s -H @- -X POST $E/schedules -H 'Content-Type: application/json' -d '{"workspaceId":"'$ID'","objective":"Say hello. Do not scan anything.","when":{"type":"weekdays","time":"09:00"},"tz":"Europe/London"}'
 printf '%s\n' "$H" | curl -s -H @- $E/schedules
 ```

@@ -14,6 +14,7 @@
 //                        surprise late runs).
 //   workspace deleted  → the schedule is paused and the reason noted.
 //   can't start        → (no LLM login, a profile is gone…) noted, not retried.
+//   no objective       → (an older schedule) paused, with a note.
 //
 // Every one of these is written to the schedule's history, so the user can
 // come back any time and see what happened.
@@ -27,7 +28,7 @@ const iso = (ms) => (ms == null ? null : new Date(ms).toISOString());
 export class Scheduler {
   // schedules: a Schedules store.
   // getWorkspace(id) → workspace, or null if it no longer exists.
-  // startRun(workspace, schedule) → the created run (throws when it can't).
+  // startRun(workspace, schedule) → the created run with the schedule's objective (throws when it can't).
   // isBusy() → true while a run is active.
   constructor({ schedules, getWorkspace, startRun, isBusy, now = () => Date.now(), tickMs = TICK_MS, graceMs = GRACE_MS, log = console }) {
     Object.assign(this, { schedules, getWorkspace, startRun, isBusy, now, tickMs, graceMs, log });
@@ -133,6 +134,13 @@ export class Scheduler {
       await this.schedules.change(s.id, (x) => ({
         schedule: { ...clear(x), enabled: false, nextAt: null },
         event: { kind: 'paused', due, reason: `Its workspace (${s.workspaceId}) was deleted; the schedule is paused` },
+      }));
+      return 'failed';
+    }
+    if (!s.objective) { // only older schedules whose workspace had none to give
+      await this.schedules.change(s.id, (x) => ({
+        schedule: { ...clear(x), enabled: false, nextAt: null },
+        event: { kind: 'paused', due, reason: 'This schedule has no objective; give it one (PATCH objective) and resume it' },
       }));
       return 'failed';
     }
