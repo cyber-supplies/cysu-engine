@@ -17,13 +17,15 @@ const CPUS = process.env.CYSU_ENGINE_CPUS || '';
 
 // hardeningArgs are the `docker run` flags every worker container gets.
 // Only the capabilities root needs at start are kept: NET_ADMIN for the
-// firewall, SETUID/SETGID to drop to runner, KILL so the root init (tini) can
-// forward stop signals to runner's processes. The agent ends up with none.
+// firewall, CHOWN to restrict the proxy environment file to runner,
+// SETUID/SETGID to drop to runner, KILL so the root init (tini) can forward
+// stop signals to runner's processes. The agent ends up with none.
 export function hardeningArgs() {
   return [
     '--init',
     '--cap-drop', 'ALL',
     '--cap-add', 'NET_ADMIN',
+    '--cap-add', 'CHOWN',
     '--cap-add', 'SETUID',
     '--cap-add', 'SETGID',
     '--cap-add', 'KILL',

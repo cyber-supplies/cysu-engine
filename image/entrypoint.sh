@@ -3,8 +3,8 @@
 # global profile as the user and the stage profile in /workspace, then runs
 # Codex (see the stage section below, CYSU_STAGE_JSON).
 #
-# Secrets never come in as env vars or files (both show up in `docker inspect`
-# or on disk). With CYSU_SECRETS=stdin the engine writes ONE JSON line to the
+# Secrets arrive over stdin, so they do not appear in `docker inspect`.
+# With CYSU_SECRETS=stdin the engine writes ONE JSON line to the
 # container's stdin and closes it:
 #   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}}
 # The passphrase is used once, by `cysu key init` as runner, to create
@@ -12,12 +12,15 @@
 # login (an OpenAI API key, or a saved Codex/ChatGPT auth.json) is written to
 # ~/.codex/auth.json and is NOT left in the agent's environment. The agent
 # gets CYSU_TOKEN (the CLI only reads it from env), the key file and auth.json.
+# The proxy installer also writes the token to /etc/environment inside this
+# ephemeral container; the entrypoint limits that file to root and runner.
 #
 # Other inputs (env, set by the engine, not secret):
 #   CYSU_STAGE_JSON     {profile, globalProfile, prompt, model, reasoningEffort, fallbackModel, reprompts}
 #   CYSU_EGRESS_GUARD   0 disables the outbound firewall (local debugging and tests only)
+#   CYSU_WORKER_TEST_BOOTSTRAP=0  skips CLI refresh and proxy install in tests
 #
-# Started as root with only NET_ADMIN/SETUID/SETGID/KILL: installs the egress
+# Started as root with only NET_ADMIN/CHOWN/SETUID/SETGID/KILL: installs the egress
 # firewall, reads the secrets, then permanently drops to `runner` (uid 10001,
 # no capabilities) before any profile or agent code runs. With arguments, runs
 # that command as `runner` instead (tests, engine tooling).
@@ -48,6 +51,16 @@ if [ "$(id -u)" = "0" ]; then
     fi
   else
     log "WARNING: egress firewall disabled (CYSU_EGRESS_GUARD=0)" >&2
+  fi
+
+  # Resolve the npm latest tag at each worker start. A failed refresh must
+  # never leave the stage running with a stale CLI.
+  if [ "${CYSU_SECRETS:-}" = "stdin" ] && [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
+    log "installing the latest Cyber Supplies CLI"
+    if ! npm install -g --no-audit --no-fund --prefer-online @cyber-supplies/cysu@latest >/dev/null; then
+      log "refusing to run: could not install the latest Cyber Supplies CLI"
+      exit 4
+    fi
   fi
 
   # The cysu skill, copied into the home dir at start (see Dockerfile: folders
@@ -93,6 +106,30 @@ if [ "$(id -u)" = "0" ]; then
 
     export CYSU_TOKEN="$token"
     unset token
+
+    if [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
+      # cysu installs the proxy CA and the managed /etc/environment block.
+      # The CLI defaults to a world-readable file; limit it to the agent user.
+      if ! cysu proxy install >/dev/null; then
+        log "refusing to run: could not install the Cyber Supplies proxy"
+        exit 4
+      fi
+      chown root:runner /etc/environment
+      chmod 0640 /etc/environment
+      proxy_url=$(sed -n 's/^https_proxy="\(.*\)"$/\1/p' /etc/environment)
+      if [ -z "$proxy_url" ]; then
+        log "refusing to run: the Cyber Supplies proxy has no URL"
+        exit 4
+      fi
+      export http_proxy="$proxy_url" https_proxy="$proxy_url" HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url"
+      export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+      unset proxy_url
+      if ! as_runner cysu proxy status | jq -e '.installed == true and .active == true' >/dev/null; then
+        log "refusing to run: the Cyber Supplies proxy is not active"
+        exit 4
+      fi
+      log "Cyber Supplies proxy installed"
+    fi
   fi
   unset CYSU_SECRETS
 

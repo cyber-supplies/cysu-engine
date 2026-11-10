@@ -24,7 +24,7 @@ function docker(args, input) {
 
 // worker starts a hardened container the way the engine does (secrets on stdin).
 function worker(command, { input = secretsLine(settings), env = { CYSU_SECRETS: 'stdin' }, extra = [] } = {}) {
-  const envArgs = Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
+  const envArgs = Object.entries({ CYSU_WORKER_TEST_BOOTSTRAP: '0', ...env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   return docker(['run', '--rm', '-i', ...hardeningArgs(), ...envArgs, ...extra, IMAGE, ...command], input);
 }
 
@@ -49,7 +49,7 @@ test('the key file is derived from the passkey (cysu key verify accepts it, reje
 test('passphrase is in no process (environ or argv); token search proves the scan works', async () => {
   const name = `cysu-secrets-test-${randomBytes(4).toString('hex')}`;
   containers.push(name);
-  const started = await docker(['run', '-d', '-i', '--name', name, ...hardeningArgs(), '-e', 'CYSU_SECRETS=stdin', IMAGE, 'sleep', '120']);
+  const started = await docker(['run', '-d', '-i', '--name', name, ...hardeningArgs(), '-e', 'CYSU_WORKER_TEST_BOOTSTRAP=0', '-e', 'CYSU_SECRETS=stdin', IMAGE, 'sleep', '120']);
   assert.equal(started.code, 0, started.stderr);
   // `docker run -d -i` keeps stdin open; send the secrets through attach.
   const attach = spawn('docker', ['attach', '--sig-proxy=false', name], { stdio: ['pipe', 'ignore', 'ignore'] });

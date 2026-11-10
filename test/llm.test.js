@@ -33,7 +33,7 @@ function docker(args, input) {
   });
 }
 const worker = (command, input) =>
-  docker(['run', '--rm', '-i', ...hardeningArgs(), '-e', 'CYSU_SECRETS=stdin', IMAGE, 'sh', '-c', command], input);
+  docker(['run', '--rm', '-i', ...hardeningArgs(), '-e', 'CYSU_WORKER_TEST_BOOTSTRAP=0', '-e', 'CYSU_SECRETS=stdin', IMAGE, 'sh', '-c', command], input);
 
 async function waitFor(fn, ms = 60_000) {
   const end = Date.now() + ms;
@@ -66,7 +66,7 @@ test('Codex login mode: the saved auth.json is installed exactly, owner-only', a
 });
 
 test('no LLM login: worker still starts, and says so', async () => {
-  const r = await docker(['run', '--rm', '-i', ...hardeningArgs(), '-e', 'CYSU_SECRETS=stdin', IMAGE, 'true'], secretsLine({ ...base, llm: { mode: 'none' } }));
+  const r = await docker(['run', '--rm', '-i', ...hardeningArgs(), '-e', 'CYSU_WORKER_TEST_BOOTSTRAP=0', '-e', 'CYSU_SECRETS=stdin', IMAGE, 'true'], secretsLine({ ...base, llm: { mode: 'none' } }));
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout + r.stderr, /LLM login: none/);
 });

@@ -17,7 +17,7 @@ function sh(file, args) {
 
 // worker runs `command` as the hardened runner user (entrypoint command mode).
 function worker(command, { env = {}, flags = hardeningArgs() } = {}) {
-  const envArgs = Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
+  const envArgs = Object.entries({ CYSU_WORKER_TEST_BOOTSTRAP: '0', ...env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   return sh('docker', ['run', '--rm', ...flags, ...envArgs, IMAGE, 'sh', '-c', command]);
 }
 
@@ -77,7 +77,7 @@ test('refuses to run when the firewall cannot be installed (no NET_ADMIN)', asyn
 
 test('docker stop is forwarded to the agent (graceful stop, needed for cancel)', async () => {
   const name = `cysu-stop-test-${process.pid}`;
-  const started = await sh('docker', ['run', '-d', '--name', name, ...hardeningArgs(), IMAGE,
+  const started = await sh('docker', ['run', '-d', '--name', name, ...hardeningArgs(), '-e', 'CYSU_WORKER_TEST_BOOTSTRAP=0', IMAGE,
     'sh', '-c', 'trap "echo GOT-SIGTERM; exit 0" TERM; while :; do sleep 0.2; done']);
   assert.equal(started.code, 0, started.stderr);
   try {

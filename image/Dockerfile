@@ -2,11 +2,10 @@
 # Node + Go + Python + ProjectDiscovery tools + curl/utilities + cysu CLI + Codex.
 #
 #   docker build -t cysu-engine-workspace:dev image
-#   (multi-arch, as the release workflow does: docker buildx build --platform linux/amd64,linux/arm64 image)
+#   (release target: docker buildx build --platform linux/amd64 image)
 
 # ---- ProjectDiscovery tools, built once ------------------------------------
-# Cross-compiled on the build machine's own platform for the target platform
-# (fast; no emulation for arm64 images). Static binaries (CGO off).
+# Compiled on the build machine for the target platform. Static binaries (CGO off).
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS pd
 ARG TARGETOS TARGETARCH
 RUN set -e; export GOOS="$TARGETOS" GOARCH="$TARGETARCH" CGO_ENABLED=0; \
@@ -40,11 +39,11 @@ COPY --from=gotoolchain /usr/local/go /usr/local/go
 COPY --from=pd /go/bin/ /usr/local/bin/
 ENV PATH="/usr/local/go/bin:${PATH}"
 
-# Cyber Supplies CLI (public npm) + agent harness (Codex for now; Claude/Kimi/GLM later).
-# CYSU_VERSION / CODEX_VERSION pin a release when reproducing an older image.
-ARG CYSU_VERSION=latest
+# The entrypoint refreshes the CLI on every start. Keep a baseline copy in the
+# image for test tooling and to make the image useful before a stage starts.
+# Codex is pinned only when reproducing an older image.
 ARG CODEX_VERSION=latest
-RUN npm install -g @cyber-supplies/cysu@${CYSU_VERSION} @openai/codex@${CODEX_VERSION} \
+RUN npm install -g @cyber-supplies/cysu@latest @openai/codex@${CODEX_VERSION} \
  && npm cache clean --force \
  && cysu help >/dev/null
 
@@ -66,7 +65,7 @@ RUN git clone -q --depth 1 https://github.com/cyber-supplies/cysu-cli.git /tmp/c
 
 # The entrypoint starts as root only to install the egress firewall, then
 # drops to runner for good. The engine starts containers with
-# --cap-drop ALL --cap-add NET_ADMIN,SETUID,SETGID and no-new-privileges.
+# --cap-drop ALL --cap-add NET_ADMIN,CHOWN,SETUID,SETGID,KILL and no-new-privileges.
 USER root
 WORKDIR /workspace
 ENTRYPOINT ["cysu-entrypoint"]

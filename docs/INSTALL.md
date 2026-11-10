@@ -7,7 +7,8 @@ time, and then takes your commands (`/help` lists them).
 ## What you need
 
 - **Docker** — Docker Engine on Linux, or Docker Desktop on macOS/Windows.
-  Check with `docker ps` (no error = good).
+  Check with `docker ps` (no error = good). Published engine and worker images
+  target `linux/amd64`; ARM hosts require emulation and are not tested.
 - **The `cysu` CLI** (`npm install -g @cyber-supplies/cysu`).
 - Your **Cyber Supplies user token** (starts with `usr_`) and a **passkey**
   you choose (it encrypts your data; keep using the same one). The token
@@ -73,6 +74,11 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
 - **Workers are locked down.** Each stage runs in a fresh container as an
   unprivileged user, with a firewall that blocks your machine, your local
   network and cloud metadata addresses (the internet stays reachable).
+- **Worker tools refresh at startup.** Each worker resolves and installs the
+  latest published `cysu` CLI before running a stage, then installs the Cyber
+  Supplies proxy and its CA using the run token. Worker startup needs access
+  to npm and the proxy's CA endpoint. The proxy token is stored only in that
+  worker's ephemeral `/etc/environment`, readable by root and the worker user.
 - **Scheduled runs need the engine running.** A schedule starts its run by
   itself, but only while the engine is up (it restarts with Docker after a
   reboot). If the computer is off or asleep at the time, that run is skipped
