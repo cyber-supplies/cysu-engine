@@ -79,6 +79,9 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
   Supplies proxy and its CA using the run token. Worker startup needs access
   to npm and the proxy's CA endpoint. The proxy token is stored only in that
   worker's ephemeral `/etc/environment`, readable by root and the worker user.
+  The agent's own model traffic (OpenAI API and ChatGPT sign-in for Codex)
+  bypasses the proxy and goes direct, so prompts and model credentials are
+  never intercepted; the agent's research traffic still uses the proxy.
 - **Scheduled runs need the engine running.** A schedule starts its run by
   itself, but only while the engine is up (it restarts with Docker after a
   reboot). If the computer is off or asleep at the time, that run is skipped

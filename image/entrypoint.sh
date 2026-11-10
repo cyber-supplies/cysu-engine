@@ -122,7 +122,15 @@ if [ "$(id -u)" = "0" ]; then
         exit 4
       fi
       export http_proxy="$proxy_url" https_proxy="$proxy_url" HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url"
-      export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+      # The model's own traffic (Codex: OpenAI API, ChatGPT login and token
+      # refresh, streamed responses) goes direct, never through the
+      # intercepting proxy: it is not research traffic, it carries the user's
+      # prompts and credentials, and a proxy restart would cut every stream.
+      # An entry also covers its subdomains. Not all of openai.com: it can be
+      # a research target itself.
+      no_proxy_hosts=localhost,127.0.0.1,::1,api.openai.com,auth.openai.com,files.openai.com,chatgpt.com
+      export no_proxy="$no_proxy_hosts" NO_PROXY="$no_proxy_hosts"
+      unset no_proxy_hosts
       unset proxy_url
       if ! as_runner cysu proxy status | jq -e '.installed == true and .active == true' >/dev/null; then
         log "refusing to run: the Cyber Supplies proxy is not active"
