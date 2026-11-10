@@ -13,6 +13,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
+import { daybreakHint } from './daybreak.js';
 import { hardeningArgs, secretsLine, IMAGE, LABEL, removeContainer, copyFileFromContainer } from './docker.js';
 
 export const REASONING_EFFORTS = ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
@@ -67,6 +68,11 @@ export function validateStage(input = {}) {
 // not fail the stage (the container's exit code is the final word).
 function applyEvent(run, event) {
   const current = run.attempts.at(-1);
+  // A Daybreak access error also gets plain advice in run.hints (once each).
+  const advise = (message) => {
+    const hint = daybreakHint(message, { daybreak: current?.daybreak || run.stage.daybreak, model: current ? current.model : run.stage.model });
+    if (hint && !run.hints.includes(hint)) run.hints.push(hint);
+  };
   switch (event.type) {
     case 'engine.attempt':
       run.attempts.push({ kind: String(event.kind || ''), model: String(event.model || ''), daybreak: String(event.daybreak || 'default'), startedAt: event.time, finishedAt: null, exitCode: null, turns: 0, status: 'running' });
@@ -89,10 +95,10 @@ function applyEvent(run, event) {
       break;
     case 'turn.failed':
       run.agentError = true;
-      if (event.error?.message) run.errors.push(String(event.error.message));
+      if (event.error?.message) { run.errors.push(String(event.error.message)); advise(event.error.message); }
       break;
     case 'error':
-      if (event.message) run.errors.push(String(event.message));
+      if (event.message) { run.errors.push(String(event.message)); advise(event.message); }
       break;
     case 'item.completed':
       if (event.item?.type === 'agent_message' && typeof event.item.text === 'string') run.result = event.item.text;
@@ -112,7 +118,7 @@ export function startStage({ stage: input, settings, codexAuth = null, image = I
   const run = {
     id, container, stage: { ...stage }, status: 'running',
     startedAt: new Date().toISOString(), finishedAt: null, exitCode: null,
-    threadId: null, turns: 0, usage: null, result: '', agentError: false, errors: [], attempts: [],
+    threadId: null, turns: 0, usage: null, result: '', agentError: false, errors: [], hints: [], attempts: [],
     events: [], log: '', cancelled: false,
   };
 

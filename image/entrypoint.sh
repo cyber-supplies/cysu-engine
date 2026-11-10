@@ -164,6 +164,41 @@ log "tools: node $(node -v), go $(go version | cut -d' ' -f3), python $(python3 
 # stdout carries ONLY JSONL: Codex's events plus engine.attempt /
 # engine.attempt.finished markers. [engine] lines, cysu output and Codex
 # stderr go to stderr.
+# ---- Daybreak access check ----------------------------------------------------
+# CYSU_DAYBREAK_CHECK_JSON (not secret): {"programs": ["standard","blue","red"], "model": "..."}
+# Asks Codex for a one-word reply once per access program (a few tokens each)
+# and prints one JSON line per program on stdout:
+#   {"type":"engine.daybreak.check","program":"red","ok":false,"exitCode":1,"error":"..."}
+if [ -n "${CYSU_DAYBREAK_CHECK_JSON:-}" ]; then
+  check_model=$(printf '%s' "$CYSU_DAYBREAK_CHECK_JSON" | jq -r '.model // empty | strings')
+  if [ -n "$check_model" ] && ! printf '%s' "$check_model" | grep -Eq '^[A-Za-z0-9._:/-]{1,120}$'; then
+    log "refusing to run: invalid model name" >&2
+    exit 5
+  fi
+  mkdir -p /tmp/daybreak-check
+  for program in $(printf '%s' "$CYSU_DAYBREAK_CHECK_JSON" | jq -r '.programs // [] | .[] | strings'); do
+    case "$program" in
+      standard) flag=standard ;;
+      blue) flag=daybreak_blue ;;
+      red) flag=daybreak_red ;;
+      *) log "refusing to run: unknown Daybreak program" >&2; exit 5 ;;
+    esac
+    set -- codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C /tmp/daybreak-check --cyber-access-program "$flag"
+    [ -z "$check_model" ] || set -- "$@" --model "$check_model"
+    out=/tmp/daybreak-check/$program.jsonl
+    log "checking Daybreak $program${check_model:+ (model $check_model)}" >&2
+    rc=0
+    printf 'Reply with the single word OK and nothing else. Do not run any commands.' | timeout 120 "$@" - > "$out" 2>/dev/null || rc=$?
+    error=$(jq -Rrn '[inputs | fromjson? | select(.type? == "turn.failed" or .type? == "error") | (.error.message? // .message?) | strings] | last // empty' "$out")
+    failed=$(jq -Rn '[inputs | fromjson? | select(.type? == "turn.failed")] | length' "$out")
+    [ "$rc" = 0 ] && [ "$failed" = 0 ] && ok=true || ok=false
+    [ "$rc" != 124 ] || error=${error:-"no answer within 120 seconds"}
+    jq -cn --arg program "$program" --argjson ok "$ok" --argjson exitCode "$rc" --arg error "$error" \
+      '{type: "engine.daybreak.check", program: $program, ok: $ok, exitCode: $exitCode, error: $error}'
+  done
+  exit 0
+fi
+
 if [ -z "${CYSU_STAGE_JSON:-}" ]; then
   log "workspace ready (no stage given)"
   exit 0

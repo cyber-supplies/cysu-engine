@@ -9,6 +9,9 @@
 #   FAIL-TURN        emit turn.failed, exit 1      REFRESH-LOGIN  rewrite ~/.codex/auth.json
 #   FAIL-THIS-STAGE  (AGENTS.md) fail              HANG-THIS-STAGE (AGENTS.md) hang
 #   --model bad-model  fail (to exercise the fallback model)
+#   Daybreak check prompt ("Reply with the single word OK"): answers OK, except
+#     --cyber-access-program daybreak_red with a non-cyber model → OpenAI's real denial
+#   --model daybreak-denied  fail with OpenAI's real "no Daybreak access" error (2026-11-08)
 [ "${1:-}" = "exec" ] || exec codex-real "$@"
 shift
 mode=new
@@ -16,9 +19,10 @@ if [ "${1:-}" = "resume" ]; then mode=resume; shift; fi
 
 # Parse the flags the engine uses; the thread ID (resume) is the last
 # argument before "-".
-model='' thread='' prev=''
+model='' thread='' prev='' program=''
 for arg in "$@"; do
   [ "$prev" = "--model" ] && model=$arg
+  [ "$prev" = "--cyber-access-program" ] && program=$arg
   [ "$arg" = "-" ] && thread=$prev
   prev=$arg
 done
@@ -40,6 +44,20 @@ if [ "$mode" = new ] && grep -q HANG-THIS-STAGE /workspace/AGENTS.md 2>/dev/null
 if [ "$model" = "bad-model" ]; then
   echo "bad-model" >> /workspace/.attempts
   emit '{"type":"turn.failed","error":{"message":"model bad-model is not available"}}'
+  exit 1
+fi
+case "$prompt" in "Reply with the single word OK"*)
+  case "$program:$model" in daybreak_red:*cyber*) ;; daybreak_red:*) model=daybreak-denied ;; esac
+  if [ "$model" != daybreak-denied ]; then
+    emit "$(jq -cn --arg p "$program" --arg m "$model" '{type: "item.completed", item: {type: "agent_message", text: "OK", program: $p, model: $m}}')"
+    emit '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":1}}'
+    exit 0
+  fi ;;
+esac
+if [ "$model" = "daybreak-denied" ]; then
+  err='{"type":"error","error":{"message":"You do not have Daybreak access. If you’re doing authorized security work, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying.","type":"invalid_request_error","param":"access_programs.cyber","code":"invalid_access_program"},"status":400}'
+  emit "$(jq -cn --arg m "$err" '{type: "error", message: $m}')"
+  emit "$(jq -cn --arg m "$err" '{type: "turn.failed", error: {message: $m}}')"
   exit 1
 fi
 case "$prompt" in *FAIL-TURN*)

@@ -47,6 +47,16 @@ RUN npm install -g @cyber-supplies/cysu@latest @openai/codex@${CODEX_VERSION} \
  && npm cache clean --force \
  && cysu help >/dev/null
 
+# Daybreak (stage setting `daybreak`) needs Codex >= 0.166, which added
+# --cyber-access-program to `codex exec` and `exec resume`. Fail the build
+# rather than ship an image whose stages would reject the flag.
+RUN v=$(codex --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) \
+ && printf '0.166.0\n%s\n' "$v" | sort -C -V \
+ || { echo "Codex ${v:-unknown} is too old: Daybreak needs 0.166.0 or newer" >&2; exit 1; } \
+ && codex exec --help | grep -q -- '--cyber-access-program' \
+ && codex exec resume --help | grep -q -- '--cyber-access-program' \
+ || { echo "This Codex has no --cyber-access-program flag (needed for Daybreak)" >&2; exit 1; }
+
 # Unprivileged user (fixed uid so engine-side files line up); the global
 # profile is installed as this user, workspace profiles go in /workspace.
 RUN useradd -m -u 10001 -s /bin/bash runner && mkdir -p /workspace && chown runner:runner /workspace

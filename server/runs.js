@@ -17,6 +17,7 @@ import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { daybreakHint } from './daybreak.js';
 import { startStage, cancelStage, validateStage, StageError, DAYBREAK, DAYBREAK_ERROR } from './stage.js';
 import { removeOrphanContainers } from './docker.js';
 import { keepRefreshedCodexAuth } from './llm.js';
@@ -50,7 +51,11 @@ function feedItem(e) {
   if (e.type === 'engine.attempt.finished' && e.exitCode !== 0) return { kind: 'error', text: `attempt ended with exit code ${e.exitCode}` };
   if (e.type === 'item.completed' && it.type === 'agent_message') return { kind: 'message', text: cleanText(it.text) };
   if (e.type === 'item.completed' && it.type === 'command_execution') return { kind: 'command', text: cleanText(it.command), exitCode: it.exit_code ?? null };
-  if (e.type === 'turn.failed' || e.type === 'error') return { kind: 'error', text: cleanText(e.error?.message || e.message) };
+  if (e.type === 'turn.failed' || e.type === 'error') {
+    const message = e.error?.message || e.message;
+    const hint = daybreakHint(message);
+    return hint ? { kind: 'error', text: cleanText(message), hint } : { kind: 'error', text: cleanText(message) };
+  }
   if (e.type === 'turn.completed') return { kind: 'turn', text: `turn finished · ${e.usage?.input_tokens ?? '?'} in / ${e.usage?.output_tokens ?? '?'} out` };
   return null;
 }
@@ -80,10 +85,11 @@ export class Runs {
     this.listProfiles = listProfiles;
     this.stageOptions = stageOptions;
     this.active = null; // { run, stage (live stage record) }
+    this.hold = ''; // set while something else uses the LLM login (a Daybreak check): new runs wait
     this.saveTimer = null;
   }
 
-  get busy() { return Boolean(this.active); }
+  get busy() { return Boolean(this.active || this.hold); }
 
   folder(id) {
     if (!RUN_ID.test(id)) throw new HttpError(404, 'Run not found');
@@ -275,7 +281,7 @@ export class Runs {
         const daybreak = own.daybreak ?? daybreakForTag.get(tag) ?? defaults.daybreak;
         const stage = validateStage({ ...defaults, ...own, model, reprompts, daybreak });
         return { index, tag, ...stage, status: 'pending', startedAt: null, finishedAt: null, exitCode: null,
-          threadId: null, turns: 0, usage: null, result: '', errors: [], attempts: [], eventCount: 0 };
+          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], eventCount: 0 };
       });
     } catch (error) {
       if (error instanceof StageError) throw new HttpError(400, error.message);
@@ -311,8 +317,10 @@ export class Runs {
   // of the request, so "run again" makes an ordinary run.
   async create(input = {}, { schedule = null } = {}) {
     if (this.active) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
+    if (this.hold) throw new HttpError(409, this.hold);
     const plan = await this.plan(input);
     if (this.active) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
+    if (this.hold) throw new HttpError(409, this.hold);
     const run = {
       id: randomUUID(), status: 'queued', createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
       cancelRequested: false, ...plan,
@@ -391,7 +399,7 @@ export class Runs {
             stage.eventCount += 1;
             write(events, `${JSON.stringify({ seq: stage.eventCount, ...event })}\n`);
           }
-          Object.assign(stage, { threadId: live.threadId, turns: live.turns, usage: live.usage, result: live.result, errors: [...live.errors], attempts: structuredClone(live.attempts) });
+          Object.assign(stage, { threadId: live.threadId, turns: live.turns, usage: live.usage, result: live.result, errors: [...live.errors], hints: [...live.hints], attempts: structuredClone(live.attempts) });
           this.saveSoon(run);
         },
       });
@@ -403,7 +411,7 @@ export class Runs {
       const done = await live.done;
       Object.assign(stage, {
         status: done.status, exitCode: done.exitCode, finishedAt: done.finishedAt,
-        threadId: done.threadId, turns: done.turns, usage: done.usage, result: done.result, errors: [...done.errors],
+        threadId: done.threadId, turns: done.turns, usage: done.usage, result: done.result, errors: [...done.errors], hints: [...done.hints],
         attempts: structuredClone(done.attempts),
       });
       if (await keepRefreshedCodexAuth(codexAuth, done.refreshedCodexAuth)) {

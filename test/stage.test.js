@@ -249,3 +249,27 @@ test('Daybreak: every attempt (initial, fallback, follow-ups) asks Codex for the
     assert.equal(one.attempts[0].daybreak, daybreak);
   }
 });
+
+test('Daybreak access error: the stage gets plain advice in hints (once), next to the raw error', async () => {
+  const r = await run({ profile: 'attack', prompt: 'go', model: 'daybreak-denied', daybreak: 'red' }).done;
+  assert.equal(r.status, 'failed');
+  assert.ok(r.errors.some((e) => /You do not have Daybreak access/.test(e)), 'raw OpenAI error kept');
+  assert.equal(r.hints.length, 1, 'error + turn.failed carry the same message: one hint');
+  assert.match(r.hints[0], /also appears for approved accounts/);
+  assert.match(r.hints[0], /"daybreak-denied" is not a cyber model/);
+
+  const ok = await run({ profile: 'attack', prompt: 'go', daybreak: 'red' }).done;
+  assert.deepEqual(ok.hints, [], 'no hint without an error');
+  const other = await run({ profile: 'attack', prompt: 'go FAIL-TURN', daybreak: 'red' }).done;
+  assert.deepEqual(other.hints, [], 'no hint for unrelated errors');
+});
+
+test('Daybreak access check: the real worker asks Codex once per program and reports each', async () => {
+  const { checkDaybreak } = await import('../server/daybreak.js');
+  const r = await checkDaybreak({ settings, image: TEST_IMAGE });
+  assert.deepEqual(r.results.map((x) => `${x.program}:${x.ok}`), ['standard:true', 'blue:true', 'red:false']);
+  assert.match(r.results[2].error, /You do not have Daybreak access/);
+  assert.match(r.results[2].hint, /Red only works with the cyber models/);
+  const cyber = await checkDaybreak({ settings, image: TEST_IMAGE, model: 'gpt-5.6-cyber' });
+  assert.ok(cyber.results.every((x) => x.ok), JSON.stringify(cyber.results));
+});

@@ -10,7 +10,8 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DATA_DIR, load, save } from './store.js';
 import { dockerAvailable, IMAGE } from './docker.js';
-import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth } from './llm.js';
+import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth, keepRefreshedCodexAuth } from './llm.js';
+import { checkDaybreak } from './daybreak.js';
 import { Runs } from './runs.js';
 import { API_URL, STAGE_TAGS, fetchProfiles } from './profiles.js';
 import { Workspaces, WorkspaceError } from './workspaces.js';
@@ -98,6 +99,37 @@ async function scheduleView(s) {
   };
 }
 
+// The last Daybreak access check (POST /api/daybreak/check), for /status.
+async function daybreakStatus() {
+  const last = await load('daybreak-check', null);
+  return { checking: Boolean(runs.hold), lastCheck: last };
+}
+
+// runDaybreakCheck asks Codex for a one-word reply under each access program
+// (standard, blue, red) with the saved LLM login. It costs a few tokens, so it
+// only runs when asked. Runs wait meanwhile (one LLM login, one user of it).
+async function runDaybreakCheck(input) {
+  const { settings, codexAuth } = await runs.getSecrets();
+  const llmMode = settings.llm?.mode || 'none';
+  if (!settings.token || !settings.passkey) throw Object.assign(new Error('Set your Cyber Supplies token and passkey first'), { status: 400 });
+  if (!((llmMode === 'openai-api-key' && settings.llm?.apiKey) || (llmMode === 'codex' && codexAuth))) {
+    throw Object.assign(new Error('Set an LLM login first (OpenAI API key or Sign in with ChatGPT)'), { status: 400 });
+  }
+  if (runs.active) throw Object.assign(new Error('A run is active; check Daybreak access when it has finished'), { status: 409 });
+  if (runs.hold) throw Object.assign(new Error('A Daybreak check is already running'), { status: 409 });
+  if (!(await dockerAvailable())) throw Object.assign(new Error('Docker is not available on this machine'), { status: 503 });
+  runs.hold = 'A Daybreak access check is running; start the run again in a minute';
+  try {
+    const result = await checkDaybreak({ settings, codexAuth, model: input?.model });
+    await keepRefreshedCodexAuth(codexAuth, result.refreshedCodexAuth);
+    await save('daybreak-check', result);
+    return result;
+  } finally {
+    runs.hold = '';
+    scheduler.tick();
+  }
+}
+
 async function engineStatus() {
   const settings = await load('settings', defaultSettings);
   const llmMode = settings.llm?.mode || 'none';
@@ -107,6 +139,7 @@ async function engineStatus() {
     version: ENGINE_VERSION, docker: await dockerAvailable(), image: IMAGE, apiUrl: API_URL,
     cysu: cysuReady, llm: { mode: llmMode, ready: llmReady },
     configured: cysuReady && llmReady, // everything a run needs is set up
+    daybreak: await daybreakStatus(),
   };
 }
 
@@ -264,6 +297,12 @@ async function api(req, res, path) {
   if (path === '/api/llm/codex-auth' && req.method === 'DELETE') {
     await forgetCodexAuth();
     return send(res, 200, await publicSettings(await load('settings', defaultSettings)));
+  }
+
+  // Daybreak access check: which access programs this LLM login can use.
+  if (path === '/api/daybreak/check') {
+    if (req.method === 'GET') return send(res, 200, await daybreakStatus());
+    if (req.method === 'POST') return send(res, 200, await runDaybreakCheck(hasBody(req) ? await body(req) : {}));
   }
 
   // Profiles come from the user's Cyber Supplies account via the gateway.

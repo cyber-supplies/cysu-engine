@@ -272,6 +272,8 @@ lists the request field each command changes.
 | `/stages <id> tags [--skip 3,4]` | sets `fromTags: {"skip": [...]}`, **deletes `stages`** | Stages come from the profile tags 1–4 (the global profile is left out). `/load` and `/unload` then answer 409 |
 | `/stages <id> picked` | sets `stages`, **deletes `fromTags`** | Start from the stages the tags give now (`plan.stages` → `[{"profile", "tag"}]`), so nothing is lost; then `/load` / `/unload` |
 | `/on-failure <id> continue\|stop` | `continueOnFailure` (`true` / `false`) | Default `continue`: a failed stage is recorded and the next stages still run |
+| `/daybreak <id> default\|standard\|blue\|red` | `daybreak` | OpenAI Daybreak program for every stage (see *Daybreak* below). `default` → remove it |
+| `/daybreak <id> --stage <1-4> <program>` | `daybreakOverrides` (`[{"stage": <int>, "daybreak"}]`) | Program for the stages with that tag, like `/model --stage`; `default` removes the entry |
 
 - Never send both `stages` and `fromTags` (the plan says "Send either stages
   or fromTags, not both").
@@ -290,6 +292,36 @@ lists the request field each command changes.
 - Per-stage settings (`model`, `reasoningEffort`, `fallbackModel`,
   `reprompts`) exist in the API (see `WorkspaceRequest` in `openapi.yaml`)
   but have no command yet; add them later if testers ask.
+
+### Daybreak (OpenAI Trusted Access for Cyber)
+
+`daybreak` picks the access program Codex asks OpenAI for: `default` (OpenAI
+decides), `standard` (off), `blue` (fewer refusals) or `red` (the cyber
+models). `blue` and `red` need an approved OpenAI account. What testers will
+hit (seen live):
+
+- **Red needs a cyber model and an API key.** `red` with a regular model is
+  refused with "You do not have Daybreak access", even for approved
+  accounts, and a cyber model (`gpt-5.6-cyber`) is refused on a ChatGPT
+  login. Red = `/model <id> gpt-5.6-cyber` + an OpenAI API key from a
+  Red-approved project. On a ChatGPT login, use `blue`.
+- The engine explains these errors: a failed stage has `hints` next to its
+  `errors` (in `/runs/<run>`), and a `/watch` error item gets a `hint`. Show
+  the hint under the error.
+
+Access check (a few tokens per program, so only when the user asks, e.g.
+`/daybreak check [--model <m>]`):
+
+```
+POST /api/daybreak/check {"model": "gpt-5.6-cyber"}      (body optional)
+→ { "checkedAt", "model", "results": [ { "program": "standard"|"blue"|"red", "ok", "error", "hint" } ] }
+```
+
+Takes up to a few minutes (show a spinner). 409 while a run is active, or
+another check is running; runs started during a check also get 409 and
+scheduled runs wait. The last result is in `GET /api/status` →
+`daybreak.lastCheck` (`daybreak.checking` while one runs): show it in
+`/status`, e.g. `Daybreak: standard ✓ blue ✓ red ✗ (checked 10 Nov 14:02)`.
 
 ### Showing a workspace
 
@@ -411,12 +443,13 @@ Runs started by a schedule have `"trigger": "schedule"` and `"schedule":
 ```
 GET /api/runs/<run>/feed?cursor=<c>&wait=20000      (start with cursor "")
 → { "run": { "status", "stages": [ { "index", "profile", "tag", "status" } ] },
-    "items": [ { "stage", "profile", "kind", "text", "exitCode" } ],
+    "items": [ { "stage", "profile", "kind", "text", "exitCode", "hint" } ],
     "cursor": "<c>", "done": bool }
 ```
 
 Print items as they come (`kind`: `attempt` (first try / fallback / follow-up),
-`command` (`text` + `exitCode`), `message` (the stage agent's words), `error`,
+`command` (`text` + `exitCode`), `message` (the stage agent's words), `error`
+(with `hint` for a Daybreak access error: print it under the error),
 `turn`), print stage status changes from `run.stages`, continue with the new
 `cursor`, stop when `done` and no items.
 
@@ -428,7 +461,7 @@ Print items as they come (`kind`: `attempt` (first try / fallback / follow-up),
 | 401 | Engine token: `setupRequired: true` → run setup; `false` → missing/wrong token (see *Authentication*) |
 | 403 | Request looked like it came from a web page (wrong Host/Origin/content type) — a CLI bug |
 | 404 | No such workspace / schedule (not that exact id) / run |
-| 409 | Busy or conflicting: a run is already active, a name is taken, a short run id matches several runs, a tag-built workspace can't `/load`, 100 schedules already |
+| 409 | Busy or conflicting: a run or a Daybreak check is already active, a name is taken, a short run id matches several runs, a tag-built workspace can't `/load`, 100 schedules already |
 | 429 | Too many wrong tokens: locked for `retryAfter` seconds, every request refused |
 | 502 | Cyber Supplies refused the stored token (revoked? → `/setup` with a new one), was unreachable, or answered badly |
 | 503 | Docker is not available, or (at setup) Cyber Supplies could not be reached to check the token |

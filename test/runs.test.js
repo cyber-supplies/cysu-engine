@@ -276,6 +276,26 @@ test('Daybreak reaches each stage\'s Codex and shows in the run and the /watch f
   assert.deepEqual(feed.items.filter((it) => it.kind === 'attempt').map((it) => it.text), ['initial · Daybreak blue', 'initial · Daybreak red', 'initial · Daybreak red']);
 });
 
+test('Daybreak access error: advice saved on the stage and attached to the /watch feed error', async () => {
+  const created = await runs.create({ prompt: 'p', stages: [{ profile: 'attack', model: 'daybreak-denied' }], daybreak: 'red' });
+  const run = await finished(created.id, 180_000);
+  assert.equal(run.status, 'failed');
+  assert.equal(run.stages[0].hints.length, 1);
+  assert.match(run.stages[0].hints[0], /Red only works with the cyber models/);
+  const errors = (await runs.feed(run.id, { cursor: '' })).items.filter((it) => it.kind === 'error');
+  assert.ok(errors.some((it) => /You do not have Daybreak access/.test(it.text) && /use daybreak "blue" instead/.test(it.hint)), JSON.stringify(errors));
+  assert.ok(errors.filter((it) => /exit code/.test(it.text)).every((it) => !('hint' in it)), 'plain errors have no hint field');
+});
+
+test('while a Daybreak check holds the LLM login, new runs are refused with a clear 409', async () => {
+  runs.hold = 'A Daybreak access check is running; start the run again in a minute';
+  try {
+    assert.equal(runs.busy, true, 'the scheduler sees the engine as busy and waits');
+    await rejects(runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] }), 409, /Daybreak access check is running/);
+  } finally { runs.hold = ''; }
+  assert.equal(runs.busy, false);
+});
+
 test('ordered run: every stage in order, each in a FRESH container with global + its own profile', async () => {
   const created = await runs.create({ prompt: 'Objective X', globalProfile: 'global', fromTags: {} });
   const run = await finished(created.id, 180_000);
