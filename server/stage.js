@@ -111,7 +111,10 @@ function applyEvent(run, event) {
 // run is final. With a Codex (ChatGPT) login, the container's possibly
 // refreshed ~/.codex/auth.json is copied out first and exposed as the
 // non-enumerable `run.refreshedCodexAuth` (never serialized with the run).
-export function startStage({ stage: input, settings, codexAuth = null, image = IMAGE, extraEnv = {}, onUpdate = () => {}, onLog = () => {} }) {
+// `link` ({ network, ip, port, key }, engine linked): the worker joins that
+// network and gets CYSU_ENGINE_URL; its firewall lets through that one
+// address:port; the read-only key goes in with the other secrets (stdin).
+export function startStage({ stage: input, settings, codexAuth = null, image = IMAGE, extraEnv = {}, link = null, onUpdate = () => {}, onLog = () => {} }) {
   const stage = validateStage(input);
   const id = randomUUID();
   const container = `cysu-stage-${id.slice(0, 8)}`;
@@ -123,17 +126,22 @@ export function startStage({ stage: input, settings, codexAuth = null, image = I
   };
 
   const env = { CYSU_SECRETS: 'stdin', CYSU_STAGE_JSON: JSON.stringify(stage), ...extraEnv };
+  if (link) {
+    env.CYSU_ENGINE_URL = `http://${link.ip}:${link.port}`;
+    env.CYSU_ENGINE_ALLOW = `${link.ip}:${link.port}`;
+  }
   // Tests only: lets workers reach a stand-in API on this machine.
   if (process.env.CYSU_ENGINE_TEST_NO_FIREWALL === '1') env.CYSU_EGRESS_GUARD = '0';
   if (process.env.CYSU_API_URL && !env.CYSU_API_URL) env.CYSU_API_URL = process.env.CYSU_API_URL;
   // No --rm: the engine copies the refreshed login out after exit, then removes it.
   const args = ['run', '-i', '--name', container, '--label', `${LABEL}=stage`, ...hardeningArgs()];
+  if (link) args.push('--network', link.network);
   for (const [key, value] of Object.entries(env)) args.push('-e', `${key}=${value}`);
   args.push(image);
 
   const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdin.on('error', () => {});
-  child.stdin.end(secretsLine(settings, codexAuth));
+  child.stdin.end(secretsLine(settings, codexAuth, link?.key || ''));
 
   const appendLog = (line) => {
     onLog(line);

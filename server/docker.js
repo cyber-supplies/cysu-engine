@@ -3,6 +3,8 @@
 // out of a stopped container).
 
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { hostname } from 'node:os';
 
 export const IMAGE = process.env.CYSU_ENGINE_IMAGE || 'cysu-engine-workspace:dev';
 
@@ -48,8 +50,10 @@ export function dockerAvailable() {
 // secretsLine is the one JSON line the entrypoint reads from stdin
 // (CYSU_SECRETS=stdin). Secrets never go in env vars, args or files.
 // The LLM login is either an OpenAI API key or a saved Codex (ChatGPT) login.
-export function secretsLine(settings, codexAuth = null) {
+// engineKey (engine linked): the stage's read-only engine key.
+export function secretsLine(settings, codexAuth = null, engineKey = '') {
   const secrets = { token: settings.token, passphrase: settings.passkey };
+  if (engineKey) secrets.engineKey = engineKey;
   if (settings.llm?.mode === 'openai-api-key' && settings.llm.apiKey) secrets.openaiApiKey = settings.llm.apiKey;
   if (settings.llm?.mode === 'codex' && codexAuth) secrets.codexAuth = codexAuth;
   return `${JSON.stringify(secrets)}\n`;
@@ -61,6 +65,47 @@ function docker(args, { encoding = 'utf8' } = {}) {
       resolve({ ok: !error, stdout, stderr: String(stderr || '') });
     });
   });
+}
+
+// ---- engine linked ------------------------------------------------------------
+// With "engine linked", a stage's worker joins a private Docker network that
+// the engine's own container is also on, and may reach the engine there (its
+// agent port only; the worker firewall still blocks everything else private).
+export const ENGINE_NETWORK = process.env.CYSU_ENGINE_NETWORK || 'cysu-engine-net';
+export const AGENT_PORT = Number(process.env.CYSU_ENGINE_AGENT_PORT || 8788);
+
+const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+
+// networkIp: the container's IPv4 address on ENGINE_NETWORK, or ''.
+async function networkIp(container) {
+  const out = await docker(['inspect', '-f', `{{with index .NetworkSettings.Networks "${ENGINE_NETWORK}"}}{{.IPAddress}}{{end}}`, container]);
+  const ip = out.ok ? out.stdout.trim() : '';
+  return IPV4.test(ip) ? ip : '';
+}
+
+// connectEngine puts the engine's own container on ENGINE_NETWORK (creating
+// the network the first time) and returns { network, ip }. Only works when
+// the engine runs in its container (scripts/engine.sh); throws otherwise.
+// CYSU_ENGINE_CONTAINER names the container when its hostname is not its id.
+export async function connectEngine() {
+  const self = process.env.CYSU_ENGINE_CONTAINER || (existsSync('/.dockerenv') ? hostname() : '');
+  if (!self) throw new Error('engine linked needs the engine to run in its container (scripts/engine.sh start)');
+  const me = await docker(['inspect', '-f', '{{.Id}}', self]);
+  if (!me.ok) throw new Error(`engine linked: could not find the engine's own container (${self})`);
+  const id = me.stdout.trim();
+  const net = await docker(['network', 'inspect', '-f', '{{.Id}}', ENGINE_NETWORK]);
+  if (!net.ok) {
+    const made = await docker(['network', 'create', '--driver', 'bridge', '--label', `${LABEL}=network`, ENGINE_NETWORK]);
+    if (!made.ok && !/already exists/i.test(made.stderr)) throw new Error(`engine linked: could not create the ${ENGINE_NETWORK} network: ${made.stderr.trim()}`);
+  }
+  let ip = await networkIp(id);
+  if (!ip) {
+    const joined = await docker(['network', 'connect', ENGINE_NETWORK, id]);
+    if (!joined.ok && !/already exists|already attached/i.test(joined.stderr)) throw new Error(`engine linked: could not join the ${ENGINE_NETWORK} network: ${joined.stderr.trim()}`);
+    ip = await networkIp(id);
+  }
+  if (!ip) throw new Error(`engine linked: the engine has no IPv4 address on ${ENGINE_NETWORK}`);
+  return { network: ENGINE_NETWORK, ip };
 }
 
 export async function removeContainer(name) {

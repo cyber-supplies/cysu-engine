@@ -6,7 +6,9 @@
 # Secrets arrive over stdin, so they do not appear in `docker inspect`.
 # With CYSU_SECRETS=stdin the engine writes ONE JSON line to the
 # container's stdin and closes it:
-#   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}}
+#   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}, "engineKey": "..."}
+# engineKey (engine linked only) becomes CYSU_ENGINE_TOKEN: a read-only key for
+# this stage's engine access, revoked by the engine when the stage ends.
 # The passphrase is used once, by `cysu key init` as runner, to create
 # ~/.config/cysu/master.key; no long-lived process ever holds it. The LLM
 # login (an OpenAI API key, or a saved Codex/ChatGPT auth.json) is written to
@@ -17,6 +19,8 @@
 #
 # Other inputs (env, set by the engine, not secret):
 #   CYSU_STAGE_JSON     {profile, globalProfile, prompt, model, reasoningEffort, fallbackModel, reprompts}
+#   CYSU_ENGINE_URL     engine linked: the engine's agent address (read by `cysu engine`)
+#   CYSU_ENGINE_ALLOW   engine linked: <ip>:<port> the firewall lets through
 #   CYSU_EGRESS_GUARD   0 disables the outbound firewall (local debugging and tests only)
 #   CYSU_WORKER_TEST_BOOTSTRAP=0  skips CLI refresh and proxy install in tests
 #
@@ -37,7 +41,7 @@ as_runner() {
 }
 
 if [ "$(id -u)" = "0" ]; then
-  for name in CYSU_TOKEN CYSU_PASSPHRASE OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do
+  for name in CYSU_TOKEN CYSU_ENGINE_TOKEN CYSU_PASSPHRASE OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do
     if [ -n "$(printenv "$name" || true)" ]; then
       log "refusing to run: $name was passed as an env var (visible in docker inspect); send secrets on stdin with CYSU_SECRETS=stdin" >&2
       exit 4
@@ -73,6 +77,7 @@ if [ "$(id -u)" = "0" ]; then
     token=$(field token)
     passphrase=$(field passphrase)
     openai_key=$(field openaiApiKey)
+    engine_key=$(field engineKey)
     codex_auth=$(printf '%s' "$secrets" | jq -c '.codexAuth // empty | objects' 2>/dev/null || true)
     unset secrets
     if [ -z "$token" ] || [ -z "$passphrase" ]; then
@@ -106,6 +111,13 @@ if [ "$(id -u)" = "0" ]; then
 
     export CYSU_TOKEN="$token"
     unset token
+    # Engine linked: the stage's read-only engine key (for `cysu engine
+    # --token "$CYSU_ENGINE_TOKEN"` against CYSU_ENGINE_URL). Only with a URL.
+    if [ -n "$engine_key" ] && [ -n "${CYSU_ENGINE_URL:-}" ]; then
+      export CYSU_ENGINE_TOKEN="$engine_key"
+      log "engine linked: read-only access to earlier runs at $CYSU_ENGINE_URL"
+    fi
+    unset engine_key
 
     if [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
       # cysu installs the proxy CA and the managed /etc/environment block.
@@ -122,7 +134,9 @@ if [ "$(id -u)" = "0" ]; then
         exit 4
       fi
       export http_proxy="$proxy_url" https_proxy="$proxy_url" HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url"
-      export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+      # Engine linked: the engine is on the local Docker network, never via the proxy.
+      no_proxy=localhost,127.0.0.1,::1${CYSU_ENGINE_ALLOW:+,${CYSU_ENGINE_ALLOW%:*}}
+      export no_proxy NO_PROXY="$no_proxy"
       unset proxy_url
       if ! as_runner cysu proxy status | jq -e '.installed == true and .active == true' >/dev/null; then
         log "refusing to run: the Cyber Supplies proxy is not active"
@@ -268,6 +282,14 @@ if has_cysu_skill; then
 else
   mkdir -p "$HOME/.agents/skills" && cp -R /opt/cysu/skill "$HOME/.agents/skills/cysu"
   log "cysu skill: added the built-in one (the profiles did not include it)" >&2
+fi
+
+# Engine linked: the engine-history skill tells the agent how to read earlier
+# runs. Added after the profiles (a global profile replaces skill folders).
+if [ -n "${CYSU_ENGINE_TOKEN:-}" ] && [ -n "${CYSU_ENGINE_URL:-}" ]; then
+  mkdir -p "$HOME/.agents/skills" && rm -rf "$HOME/.agents/skills/engine-history" &&
+    cp -R /opt/cysu/engine-history-skill "$HOME/.agents/skills/engine-history"
+  log "engine-history skill: added (engine linked)" >&2
 fi
 
 # Codex ignores /workspace/.codex/config.toml (the stage profile's MCP

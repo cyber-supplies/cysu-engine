@@ -26,7 +26,7 @@ import { tarGz } from './tar.js';
 
 // The request fields a run remembers, so it can be run again.
 const REQUEST_FIELDS = ['name', 'objective', 'prompt', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
-  'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts', 'daybreak', 'daybreakOverrides'];
+  'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts', 'daybreak', 'daybreakOverrides', 'engineLinked'];
 const requestOf = (input) => structuredClone(Object.fromEntries(REQUEST_FIELDS.filter((k) => input[k] !== undefined).map((k) => [k, input[k]])));
 
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -80,7 +80,12 @@ export class Runs {
   // stageOptions: passed through to startStage (tests use a stand-in image/API).
   // onIdle: called after a run ends and the engine is free again (the scheduler
   // starts a waiting scheduled run then).
-  constructor({ dir, getSecrets, agentToken = async (settings) => ({ kind: 'user', token: settings.token }), listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {} }) {
+  // engineLink: async (run, stage) => ({ network, ip, port, key, release }) for
+  // an "engine linked" stage: `key` is the stage's read-only engine key and
+  // release() revokes it (called when the stage ends). Throws when the engine
+  // cannot be linked.
+  constructor({ dir, getSecrets, agentToken = async (settings) => ({ kind: 'user', token: settings.token }), listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {}, engineLink = async () => { throw new Error('engine linked is not available here'); } }) {
+    this.engineLink = engineLink;
     this.dir = dir;
     this.onIdle = onIdle;
     this.getSecrets = getSecrets;
@@ -210,6 +215,10 @@ export class Runs {
       daybreak: String(input.daybreak || 'default').trim(),
     };
     if (!DAYBREAK.includes(defaults.daybreak)) throw new HttpError(400, DAYBREAK_ERROR);
+    // Engine linked: stages may read this engine's earlier runs (of the same
+    // workspace). The run's own choice, else the engine setting (default off).
+    const engineLinked = input.engineLinked === undefined ? Boolean(settings.engineLinked) : input.engineLinked;
+    if (typeof engineLinked !== 'boolean') throw new HttpError(400, 'engineLinked must be true or false');
     const continueOnFailure = input.continueOnFailure === undefined ? true : input.continueOnFailure;
     if (typeof continueOnFailure !== 'boolean') throw new HttpError(400, 'continueOnFailure must be true or false');
 
@@ -284,7 +293,7 @@ export class Runs {
         const daybreak = own.daybreak ?? daybreakForTag.get(tag) ?? defaults.daybreak;
         const stage = validateStage({ ...defaults, ...own, model, reprompts, daybreak });
         return { index, tag, ...stage, status: 'pending', startedAt: null, finishedAt: null, exitCode: null,
-          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], eventCount: 0, agentToken: null };
+          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], eventCount: 0, agentToken: null, engineLinked: false };
       });
     } catch (error) {
       if (error instanceof StageError) throw new HttpError(400, error.message);
@@ -311,6 +320,7 @@ export class Runs {
       daybreakOverrides: [...daybreakForTag].map(([stage, daybreak]) => ({ stage: Number(stage), daybreak })),
       reprompts: repromptList.map((r) => ({ stage: String(r.stage), prompt: r.prompt })),
       continueOnFailure,
+      engineLinked,
       stages,
     };
   }
@@ -389,6 +399,7 @@ export class Runs {
     const write = (handle, text) => { writes = writes.then(() => handle.appendFile(text)).catch(() => {}); };
 
     const { settings, codexAuth } = await this.getSecrets();
+    let link = null; // engine linked: released (its key revoked) when the stage ends
     stage.status = 'running';
     stage.startedAt = new Date().toISOString();
     try {
@@ -397,10 +408,21 @@ export class Runs {
       const agent = await this.agentToken(settings);
       stage.agentToken = agent.kind;
       write(log, `[engine] agent token: ${agent.kind === 'llm' ? 'LLM token (restricted)' : 'user token (full access)'}\n`);
+      // Engine linked: if the engine cannot be linked, the stage runs without
+      // it (it is extra context, not something the stage depends on).
+      if (run.engineLinked) {
+        try {
+          link = await this.engineLink(run, stage);
+          write(log, `[engine] engine linked: the agent can read earlier runs at http://${link.ip}:${link.port}\n`);
+        } catch (error) {
+          write(log, `[engine] engine linked: not available, running without it (${error.message})\n`);
+        }
+      }
+      stage.engineLinked = Boolean(link);
       const live = startStage({
         stage: { profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
           reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts, daybreak: stage.daybreak },
-        settings: { ...settings, token: agent.token }, codexAuth, ...this.stageOptions,
+        settings: { ...settings, token: agent.token }, codexAuth, link, ...this.stageOptions,
         onLog: (line) => write(log, `${line}\n`),
         onUpdate: (live, event) => {
           if (event) {
@@ -431,6 +453,7 @@ export class Runs {
       stage.errors.push(error.message);
       write(log, `[engine] stage could not run: ${error.message}\n`);
     } finally {
+      try { link?.release?.(); } catch (error) { console.error('engine link release:', error); }
       if (this.active) this.active.stage = null;
       await writes;
       await events.close();

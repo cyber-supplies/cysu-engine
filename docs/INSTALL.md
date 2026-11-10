@@ -80,6 +80,22 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
   read your profiles, accounts and emails but not change them. To give agents
   your full user token instead: `PUT /api/settings {"agentToken": "user"}`
   (`"llm"` switches back).
+- **Engine linked (off by default) lets agents learn from earlier runs.**
+  With `PUT /api/settings {"engineLinked": true}` (or `"engineLinked": true`
+  on one run or workspace request), each stage's agent can **read** this
+  engine's earlier runs of the **same workspace**: their results, transcripts
+  and logs. It cannot start, change or delete anything, see other
+  workspaces, or touch settings. How it works: the engine puts itself and
+  the worker on a private Docker network (`cysu-engine-net`) and opens a
+  second, read-only port (8788) there only; the worker's firewall lets
+  through that one address and port. The agent gets `CYSU_ENGINE_URL` and a
+  read-only key `CYSU_ENGINE_TOKEN` (`usr_engine_…`, not a Cyber Supplies
+  token) that stops working when the stage ends:
+  `cysu engine list-runs --token "$CYSU_ENGINE_TOKEN"`. Linked workers also
+  get an `engine-history` skill that tells the agent this. It needs the engine
+  running as its container (`scripts/engine.sh`); otherwise stages run
+  without it and say so in their log. Keep in mind that earlier transcripts
+  hold whatever earlier agents printed.
 - **Worker tools refresh at startup.** Each worker resolves and installs the
   latest published `cysu` CLI before running a stage, then installs the Cyber
   Supplies proxy and its CA using the run token. Worker startup needs access

@@ -325,6 +325,57 @@ test('agent token "llm": the worker\'s agent gets the llm_ token (profiles insta
   assert.equal(run.stages[0].agentToken, 'user', '"user": the full user token, as before');
 });
 
+test('engine linked: off by default; on (setting or per run) the worker gets CYSU_ENGINE_URL on the link network; unavailable → runs without it', async () => {
+  await rejects(runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: 'yes' }), 400, /engineLinked must be true or false/);
+  const { createServer } = await import('node:http');
+  const fakeEngine = createServer((req, res) => res.end(req.url === '/api/health' ? '{"ok":true}' : 'nope'));
+  await new Promise((resolve) => fakeEngine.listen(0, gateway, resolve));
+  const port = fakeEngine.address().port;
+  const calls = [];
+  let released = 0;
+  runs.engineLink = async (run, stage) => { calls.push([run.id, stage.index]); return { network: 'bridge', ip: gateway, port, release: () => { released += 1; } }; };
+  const report = (run) => JSON.parse(run.stages[0].result);
+  try {
+    let run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+    assert.equal(run.engineLinked, false, 'off by default');
+    assert.equal(run.stages[0].engineLinked, false);
+    assert.equal(report(run).engineUrl, '', 'no engine address without the setting');
+    assert.doesNotMatch(report(run).files, /engine-history/, 'no engine-history skill without the link');
+    assert.equal(calls.length, 0);
+
+    run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: true })).id);
+    assert.equal(run.status, 'succeeded', JSON.stringify(run.stages[0].errors));
+    assert.equal(run.engineLinked, true);
+    assert.equal(run.request.engineLinked, true, 'run again keeps it');
+    assert.equal(run.stages[0].engineLinked, true);
+    assert.equal(report(run).engineUrl, `http://${gateway}:${port}`);
+    assert.equal(report(run).engineProbe, '{"ok":true}', 'the agent reached the engine address');
+    assert.match(await runs.log(run.id, 0), /\[engine\] engine linked: the agent can read earlier runs/);
+    assert.deepEqual(calls, [[run.id, 0]]);
+    assert.equal(released, 1, 'the stage key is released when the stage ends');
+
+    const saved = secrets;
+    secrets = { ...structuredClone(saved), settings: { ...structuredClone(saved.settings), engineLinked: true } };
+    try {
+      run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+      assert.equal(run.engineLinked, true, 'the engine setting turns it on');
+      run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: false })).id);
+      assert.equal(run.engineLinked, false, 'a run can turn it off');
+      assert.equal(report(run).engineUrl, '');
+    } finally { secrets = saved; }
+
+    runs.engineLink = async () => { throw new Error('engine linked needs the engine to run in its container'); };
+    run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: true })).id);
+    assert.equal(run.status, 'succeeded', 'the stage still runs');
+    assert.equal(run.stages[0].engineLinked, false);
+    assert.equal(report(run).engineUrl, '');
+    assert.match(await runs.log(run.id, 0), /engine linked: not available, running without it \(engine linked needs the engine to run in its container\)/);
+  } finally {
+    fakeEngine.close();
+    runs.engineLink = async () => { throw new Error('engine linked is not available here'); };
+  }
+});
+
 test('ordered run: every stage in order, each in a FRESH container with global + its own profile', async () => {
   const created = await runs.create({ prompt: 'Objective X', globalProfile: 'global', fromTags: {} });
   const run = await finished(created.id, 180_000);

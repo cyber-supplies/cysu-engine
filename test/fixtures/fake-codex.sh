@@ -11,6 +11,8 @@
 #   --model bad-model  fail (to exercise the fallback model)
 #   Daybreak check prompt ("Reply with the single word OK"): answers OK, except
 #     --cyber-access-program daybreak_red with a non-cyber model → OpenAI's real denial
+#   CYSU_ENGINE_URL set (engine linked): the report has engineUrl and its /api/health answer
+#   ENGINE-READ      (engine linked) read the engine with the stage key; report in engineRead
 #   --model daybreak-denied  fail with OpenAI's real "no Daybreak access" error (2026-11-08)
 [ "${1:-}" = "exec" ] || exec codex-real "$@"
 shift
@@ -65,6 +67,28 @@ case "$prompt" in *FAIL-TURN*)
   exit 1 ;;
 esac
 
+# ENGINE-READ (engine linked): read the engine like an agent would, with the
+# real cysu CLI and the stage's key, and try things it must not be able to do.
+engine_read=''
+case "$prompt" in *ENGINE-READ*)
+  other_run=$(printf '%s' "$prompt" | sed -n 's/.*OTHER=\([0-9a-f-]*\).*/\1/p')
+  first_run=$(cysu engine list-runs --token "$CYSU_ENGINE_TOKEN" 2>/dev/null | jq -r '[.[] | select(.status != "running" and .status != "queued")][0].id // empty')
+  engine_read=$(jq -n \
+    --arg key "${CYSU_ENGINE_TOKEN:-}" \
+    --arg status "$(cysu engine status --token "$CYSU_ENGINE_TOKEN" 2>&1)" \
+    --arg runs "$(cysu engine list-runs --token "$CYSU_ENGINE_TOKEN" 2>&1)" \
+    --arg workflows "$(cysu engine list-workflows --token "$CYSU_ENGINE_TOKEN" 2>&1)" \
+    --arg events "$(curl -sS -m 5 -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/runs/$first_run/stages/0/events" 2>&1)" \
+    --arg plain "$(cysu engine list-runs 2>&1)" \
+    --arg delete "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/runs/$first_run")" \
+    --arg settings "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/settings")" \
+    --arg withUserToken "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CYSU_TOKEN" "$CYSU_ENGINE_URL/api/runs")" \
+    --arg otherRun "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/runs/$other_run")" \
+    --arg skill "$(head -3 ~/.agents/skills/engine-history/SKILL.md 2>&1)" \
+    --arg getRun "$(cysu engine get-run --token "$CYSU_ENGINE_TOKEN" --run "$first_run" 2>&1)" \
+    '{skill:$skill,getRun:$getRun,otherRun:$otherRun,key:$key,status:$status,runs:$runs,workflows:$workflows,events:$events,plain:$plain,delete:$delete,settings:$settings,withUserToken:$withUserToken}')
+esac
+
 if [ "$mode" = resume ]; then
   report=$(jq -n --arg prompt "$prompt" --arg thread "$thread" --arg model "$model" --arg args "$*" \
     '{resumed: true, thread: $thread, prompt: $prompt, model: $model, args: $args}')
@@ -76,8 +100,11 @@ else
     --arg mcp "$(cd /workspace && codex-real mcp list 2>&1)" \
     --arg earlierAttempts "$(cat /workspace/.attempts 2>/dev/null)" \
     --arg cysuSkill "$(head -10 ~/.agents/skills/cysu/SKILL.md 2>/dev/null)" \
+    --arg engineUrl "${CYSU_ENGINE_URL:-}" \
+    --arg engineRead "$engine_read" \
+    --arg engineProbe "$([ -z "${CYSU_ENGINE_URL:-}" ] || curl -sS -m 5 "$CYSU_ENGINE_URL/api/health" 2>&1)" \
     --arg files "$(cd / && find /workspace ~/.codex ~/.agents -path '*/log' -prune -o -path '*/tmp' -prune -o -path '*/sessions' -prune -o -name .attempts -prune -o -type f -print 2>/dev/null | sort)" \
-    '{prompt:$prompt,args:$args,model:$model,cwd:$cwd,user:$user,workspaceAgents:$workspaceAgents,globalAgents:$globalAgents,mcp:$mcp,earlierAttempts:$earlierAttempts,cysuSkill:$cysuSkill,files:$files}')
+    '{prompt:$prompt,args:$args,model:$model,cwd:$cwd,user:$user,workspaceAgents:$workspaceAgents,globalAgents:$globalAgents,mcp:$mcp,earlierAttempts:$earlierAttempts,cysuSkill:$cysuSkill,engineUrl:$engineUrl,engineProbe:$engineProbe,engineRead:$engineRead,files:$files}')
 fi
 emit '{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"echo hi","exit_code":0}}'
 jq -cn --arg text "$report" '{type:"item.completed",item:{id:"item_1",type:"agent_message",text:$text}}'

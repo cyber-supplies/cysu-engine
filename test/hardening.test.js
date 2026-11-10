@@ -67,6 +67,25 @@ test('host machine, LAN and cloud metadata are blocked', async () => {
   }
 });
 
+test('engine linked: CYSU_ENGINE_ALLOW lets through exactly that address:port; the rest of the host stays blocked', async () => {
+  const other = createServer((req, res) => res.end('other-port'));
+  await new Promise((resolve) => other.listen(0, new URL(hostUrl).hostname, resolve));
+  const otherUrl = `http://${new URL(hostUrl).hostname}:${other.address().port}/`;
+  try {
+    const allow = `${new URL(hostUrl).hostname}:${new URL(hostUrl).port}`;
+    const r = await worker(`curl -sS --max-time 5 ${hostUrl}; echo; curl -sS --max-time 5 ${otherUrl}; echo "exit=$?"; curl -sS --max-time 5 http://169.254.169.254/; echo "meta=$?"`, { env: { CYSU_ENGINE_ALLOW: allow } });
+    assert.match(r.stdout, /^host-reached$/m, `the allowed address:port: ${r.stdout} ${r.stderr}`);
+    assert.doesNotMatch(r.stdout, /other-port/);
+    assert.match(r.stdout, /exit=7$/m, 'another port on the same address is still rejected');
+    assert.match(r.stdout, /meta=7$/m, 'metadata still rejected');
+    for (const bad of ['not-an-ip:80', '10.0.0.1', '10.0.0.1:http', '10.0.0.1:80;id']) {
+      const b = await worker('echo SHOULD-NOT-RUN', { env: { CYSU_ENGINE_ALLOW: bad } });
+      assert.equal(b.code, 3, bad);
+      assert.doesNotMatch(b.stdout, /SHOULD-NOT-RUN/);
+    }
+  } finally { other.close(); }
+});
+
 test('refuses to run when the firewall cannot be installed (no NET_ADMIN)', async () => {
   const flags = hardeningArgs().filter((a, i, all) => !(a === 'NET_ADMIN' || (a === '--cap-add' && all[i + 1] === 'NET_ADMIN')));
   const r = await worker('echo SHOULD-NOT-RUN', { flags });

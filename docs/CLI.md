@@ -197,7 +197,18 @@ as defaults since the CLI already uses them.
    Show the current value from `GET /api/settings` (`agentToken`). A stage
    whose lookup fails ends with an error saying to switch to `user`; each
    stage records which it got (`stages[].agentToken`).
-4. `GET /api/status` again; `configured` should now be `true`.
+4. **Engine linked** (optional, e.g. `/setup engine-linked on|off`):
+   `PUT /api/settings {"engineLinked": true | false}` (default `false`).
+   On: each stage's agent can read this engine's earlier runs of the same
+   workspace (read-only; see INSTALL.md). A run or workspace request can
+   override it with `"engineLinked": true | false`; each run records it
+   (`engineLinked`) and each stage whether it actually got the link
+   (`stages[].engineLinked`; false with a log line when the engine is not
+   running as its container). Inside the worker the agent uses the normal
+   commands with its stage key: `cysu engine list-runs --token
+   "$CYSU_ENGINE_TOKEN"` (`CYSU_ENGINE_URL` is already set); linked workers
+   get an `engine-history` skill (image/engine-history) that says so.
+5. `GET /api/status` again; `configured` should now be `true`.
 
 ## 3. Slash commands
 

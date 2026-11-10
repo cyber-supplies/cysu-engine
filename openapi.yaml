@@ -215,6 +215,7 @@ paths:
                     apiKey: { type: string, description: OpenAI API key (for mode openai-api-key) }
                 globalProfile: { type: string, description: Default global profile ID for new runs ("" for none) }
                 agentToken: { $ref: '#/components/schemas/AgentToken' }
+                engineLinked: { type: boolean, description: 'Default for new runs: stages may read earlier runs of their workspace (see EngineLinked)' }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -943,6 +944,7 @@ components:
                       savedAt: { type: string, format: date-time }
               globalProfile: { type: string }
               agentToken: { $ref: '#/components/schemas/AgentToken' }
+              engineLinked: { type: boolean }
               configured: { type: boolean }
               tokenChanged: { type: boolean, description: 'Only after PUT changed the token: use the new one from now on' }
     CodexLogin:
@@ -977,6 +979,24 @@ components:
         starts and never stored; the agent can read profiles, accounts and
         emails but not change them. If the lookup fails, the stage fails
         (it never falls back to the user token). `user`: the full usr_ token.
+    EngineLinked:
+      type: boolean
+      default: false
+      description: |
+        Engine linked: each stage's agent may READ this engine's earlier runs
+        of the same workspace (runs without a workspace see each other), to
+        learn from them. The worker joins a private Docker network with the
+        engine and gets CYSU_ENGINE_URL (http://<engine>:8788, a separate,
+        read-only listener on that network only) and CYSU_ENGINE_TOKEN, a
+        per-stage key (usr_engine_…, not a Cyber Supplies token) revoked when
+        the stage ends. On that port, with that key, only GET works:
+        /api/status (plus `agent: {readOnly, workspace, runId}`),
+        /api/workspaces[/{id}] (its own), /api/runs, /api/runs/{id} and its
+        /stages/{n}/events, /stages/{n}/log, /feed, /download. Other
+        workspaces' runs are 404, changes 403; the engine token is refused.
+        Linked workers also get an `engine-history` skill describing this.
+        The worker firewall allows only that address:port. Needs the engine
+        running as its container (scripts/engine.sh).
     Daybreak:
       type: string
       enum: [default, standard, blue, red]
@@ -1036,6 +1056,7 @@ components:
         model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: Default model for every stage }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
         continueOnFailure: { type: boolean, default: true, description: 'false: stop after the first failed stage (the rest become skipped)' }
+        engineLinked: { type: boolean, description: 'Stages may read earlier runs of the same workspace (see EngineLinked). Default: the saved setting.' }
         fallbackModel: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: 'If a stage''s first attempt fails, retry it once with this model (same objective, same workspace)' }
         daybreak: { $ref: '#/components/schemas/Daybreak' }
         daybreakOverrides:
@@ -1153,6 +1174,7 @@ components:
         result: { type: string, description: The agent's last message }
         errors: { type: array, items: { type: string }, description: Errors from all attempts (a failure rescued by the fallback model is kept here) }
         agentToken: { type: [string, 'null'], enum: [llm, user, null], description: 'Which token the stage''s agent got (null until the stage starts)' }
+        engineLinked: { type: boolean, description: 'The stage''s agent could read earlier runs (false when the run did not ask, or the link was unavailable; the stage log says why)' }
         hints: { type: array, items: { type: string }, description: 'Plain advice for Daybreak access errors in `errors` (OpenAI''s own messages are misleading), once each' }
         attempts:
           type: array
@@ -1190,6 +1212,7 @@ components:
         skip: { type: array, items: { type: string } }
         modelOverrides: { type: array, items: { type: object, properties: { stage: { type: integer }, model: { type: string } } } }
         continueOnFailure: { type: boolean }
+        engineLinked: { type: boolean, description: 'Whether this run asked for engine linked' }
         cancelRequested: { type: boolean }
         request: { $ref: '#/components/schemas/RunRequest', description: What was asked for (used by rerun) }
         rerunOf: { type: [string, 'null'], description: The run this one repeats }

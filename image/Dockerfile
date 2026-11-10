@@ -62,6 +62,8 @@ RUN v=$(codex --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) \
 RUN useradd -m -u 10001 -s /bin/bash runner && mkdir -p /workspace && chown runner:runner /workspace
 COPY --chmod=755 entrypoint.sh /usr/local/bin/cysu-entrypoint
 COPY --chmod=755 egress-guard.sh /usr/local/bin/cysu-egress-guard
+# Engine linked: a skill added to linked workers only (see entrypoint.sh).
+COPY engine-history /opt/cysu/engine-history-skill
 
 # The cysu skill, from the public cysu-cli repo. It is kept OUTSIDE the home
 # directory and copied into ~/.codex/skills and ~/.agents/skills at container
