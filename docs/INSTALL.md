@@ -74,6 +74,12 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
 - **Workers are locked down.** Each stage runs in a fresh container as an
   unprivileged user, with a firewall that blocks your machine, your local
   network and cloud metadata addresses (the internet stays reachable).
+- **Agents get a restricted token by default.** Each worker gives its agent
+  your Cyber Supplies **LLM token** (`llm_…`), which the engine fetches with
+  your user token when the worker starts (it is never saved). The agent can
+  read your profiles, accounts and emails but not change them. To give agents
+  your full user token instead: `PUT /api/settings {"agentToken": "user"}`
+  (`"llm"` switches back).
 - **Worker tools refresh at startup.** Each worker resolves and installs the
   latest published `cysu` CLI before running a stage, then installs the Cyber
   Supplies proxy and its CA using the run token. Worker startup needs access

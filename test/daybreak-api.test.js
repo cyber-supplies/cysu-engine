@@ -80,3 +80,14 @@ test('POST /api/daybreak/check: per-program results with advice, saved for /stat
   assert.deepEqual((await http('/api/daybreak/check')).body.lastCheck, r.body);
   assert.ok(!JSON.stringify(status).includes('sk-daybreakapi'), 'no secret in the result');
 });
+
+test('settings: agentToken defaults to "llm", accepts "user", refuses anything else', async () => {
+  assert.equal((await http('/api/settings')).body.agentToken, 'llm');
+  let r = await http('/api/settings', 'PUT', { agentToken: 'admin' });
+  assert.deepEqual([r.status, r.body.error], [400, 'agentToken must be llm or user']);
+  r = await http('/api/settings', 'PUT', { agentToken: 'user' });
+  assert.equal(r.body.agentToken, 'user');
+  r = await http('/api/settings', 'PUT', { agentToken: 'llm' });
+  assert.equal(r.body.agentToken, 'llm');
+  assert.ok(!JSON.stringify(r.body).includes('llm_'), 'the LLM token itself is never shown');
+});

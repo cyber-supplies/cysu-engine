@@ -189,7 +189,15 @@ as defaults since the CLI already uses them.
      `failed` / `cancelled` → show `error`. Ctrl-C → `DELETE /api/llm/codex-login`.
    - **OpenAI API key:** hidden input →
      `PUT /api/settings {"llm": {"mode": "openai-api-key", "apiKey": "sk-…"}}`.
-3. `GET /api/status` again; `configured` should now be `true`.
+3. **Agent token** (optional, e.g. `/setup agent-token llm|user`):
+   `PUT /api/settings {"agentToken": "llm" | "user"}`. `llm` (the default):
+   agents get the user's restricted `llm_` token, which the engine fetches
+   from Cyber Supplies when each worker starts; they can read profiles,
+   accounts and emails but not change them. `user`: the full user token.
+   Show the current value from `GET /api/settings` (`agentToken`). A stage
+   whose lookup fails ends with an error saying to switch to `user`; each
+   stage records which it got (`stages[].agentToken`).
+4. `GET /api/status` again; `configured` should now be `true`.
 
 ## 3. Slash commands
 

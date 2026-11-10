@@ -74,14 +74,17 @@ function summary(run) {
 
 export class Runs {
   // getSecrets: async () => ({ settings, codexAuth }) — read fresh for every stage.
+  // agentToken: async (settings) => ({ kind: 'llm' | 'user', token }) — the
+  // Cyber Supplies token the stage's agent gets (default: the user token).
   // listProfiles: async (settings) => the user's profiles [{ id, tag }] (for fromTags).
   // stageOptions: passed through to startStage (tests use a stand-in image/API).
   // onIdle: called after a run ends and the engine is free again (the scheduler
   // starts a waiting scheduled run then).
-  constructor({ dir, getSecrets, listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {} }) {
+  constructor({ dir, getSecrets, agentToken = async (settings) => ({ kind: 'user', token: settings.token }), listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {} }) {
     this.dir = dir;
     this.onIdle = onIdle;
     this.getSecrets = getSecrets;
+    this.agentToken = agentToken;
     this.listProfiles = listProfiles;
     this.stageOptions = stageOptions;
     this.active = null; // { run, stage (live stage record) }
@@ -281,7 +284,7 @@ export class Runs {
         const daybreak = own.daybreak ?? daybreakForTag.get(tag) ?? defaults.daybreak;
         const stage = validateStage({ ...defaults, ...own, model, reprompts, daybreak });
         return { index, tag, ...stage, status: 'pending', startedAt: null, finishedAt: null, exitCode: null,
-          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], eventCount: 0 };
+          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], eventCount: 0, agentToken: null };
       });
     } catch (error) {
       if (error instanceof StageError) throw new HttpError(400, error.message);
@@ -389,10 +392,15 @@ export class Runs {
     stage.status = 'running';
     stage.startedAt = new Date().toISOString();
     try {
+      // The agent's token: the user's llm_ token unless they chose "user".
+      // A failed lookup fails the stage; it never falls back to the user token.
+      const agent = await this.agentToken(settings);
+      stage.agentToken = agent.kind;
+      write(log, `[engine] agent token: ${agent.kind === 'llm' ? 'LLM token (restricted)' : 'user token (full access)'}\n`);
       const live = startStage({
         stage: { profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
           reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts, daybreak: stage.daybreak },
-        settings, codexAuth, ...this.stageOptions,
+        settings: { ...settings, token: agent.token }, codexAuth, ...this.stageOptions,
         onLog: (line) => write(log, `${line}\n`),
         onUpdate: (live, event) => {
           if (event) {

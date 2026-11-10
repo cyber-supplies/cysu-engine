@@ -10,14 +10,14 @@ import { mkdtemp, rm, readFile, readdir, stat, mkdir, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { startFakeApi } from './fixtures/fake-api.js';
+import { startFakeApi, llmTokenFor } from './fixtures/fake-api.js';
 
 const DATA = await mkdtemp(join(tmpdir(), 'cysu-engine-runs-'));
 process.env.CYSU_ENGINE_DATA = DATA; // before the server modules load
 const { Runs } = await import('../server/runs.js');
 const { save, load } = await import('../server/store.js');
 const { LABEL } = await import('../server/docker.js');
-const { fetchProfiles } = await import('../server/profiles.js');
+const { fetchProfiles, fetchLlmToken } = await import('../server/profiles.js');
 
 const TEST_IMAGE = 'cysu-engine-workspace:test';
 const TOKEN = 'usr_runs-test-token-91c2';
@@ -294,6 +294,35 @@ test('while a Daybreak check holds the LLM login, new runs are refused with a cl
     await rejects(runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] }), 409, /Daybreak access check is running/);
   } finally { runs.hold = ''; }
   assert.equal(runs.busy, false);
+});
+
+test('agent token "llm": the worker\'s agent gets the llm_ token (profiles install with it); a failed lookup fails the stage', async () => {
+  const userDefault = runs.agentToken;
+  runs.agentToken = async (settings) => ({ kind: 'llm', token: await fetchLlmToken(settings.token, { apiUrl: api.url }) });
+  try {
+    api.requests.length = 0;
+    let run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+    assert.equal(run.status, 'succeeded', JSON.stringify(run.stages[0].errors));
+    assert.equal(run.stages[0].agentToken, 'llm');
+    const byAuth = (auth) => api.requests.filter((r) => r.auth === `Bearer ${auth}`).map((r) => `${r.method} ${r.url}`);
+    // The engine itself uses the user token (planning lists the profiles, then
+    // it fetches the LLM token); the worker only ever has the LLM token.
+    assert.deepEqual(byAuth(TOKEN), ['GET /api/profiles', 'GET /api/tokens/llm']);
+    assert.deepEqual(byAuth(llmTokenFor(TOKEN)), ['GET /api/profiles/attack'], 'the worker installed the profile with the LLM token');
+    assert.match(await runs.log(run.id, 0), /\[engine\] agent token: LLM token \(restricted\)/);
+
+    api.llmTokens.status = 404;
+    api.requests.length = 0;
+    run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+    assert.equal(run.status, 'failed');
+    assert.match(run.stages[0].errors.join(' '), /no LLM token for your account.*agent token to "user"/);
+    assert.deepEqual(api.requests.map((r) => r.url), ['/api/profiles', '/api/tokens/llm'], 'no worker started: nothing ran with the user token instead');
+  } finally {
+    api.llmTokens.status = 200;
+    runs.agentToken = userDefault;
+  }
+  const run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+  assert.equal(run.stages[0].agentToken, 'user', '"user": the full user token, as before');
 });
 
 test('ordered run: every stage in order, each in a FRESH container with global + its own profile', async () => {

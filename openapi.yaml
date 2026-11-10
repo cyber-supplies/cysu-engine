@@ -214,6 +214,7 @@ paths:
                     mode: { $ref: '#/components/schemas/LlmMode' }
                     apiKey: { type: string, description: OpenAI API key (for mode openai-api-key) }
                 globalProfile: { type: string, description: Default global profile ID for new runs ("" for none) }
+                agentToken: { $ref: '#/components/schemas/AgentToken' }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -941,6 +942,7 @@ components:
                       saved: { type: boolean, description: A ChatGPT login is saved }
                       savedAt: { type: string, format: date-time }
               globalProfile: { type: string }
+              agentToken: { $ref: '#/components/schemas/AgentToken' }
               configured: { type: boolean }
               tokenChanged: { type: boolean, description: 'Only after PUT changed the token: use the new one from now on' }
     CodexLogin:
@@ -964,6 +966,17 @@ components:
       enum: [none, openai-api-key, codex]
       description: How Codex logs in. Claude, Kimi and GLM come later.
 
+    AgentToken:
+      type: string
+      enum: [llm, user]
+      default: llm
+      description: |
+        The Cyber Supplies token each worker gives its agent. `llm` (default):
+        the user's restricted llm_ token, fetched from Cyber Supplies
+        (`GET /api/tokens/llm`) with the stored user token when the worker
+        starts and never stored; the agent can read profiles, accounts and
+        emails but not change them. If the lookup fails, the stage fails
+        (it never falls back to the user token). `user`: the full usr_ token.
     Daybreak:
       type: string
       enum: [default, standard, blue, red]
@@ -1139,6 +1152,7 @@ components:
             output_tokens: { type: integer }
         result: { type: string, description: The agent's last message }
         errors: { type: array, items: { type: string }, description: Errors from all attempts (a failure rescued by the fallback model is kept here) }
+        agentToken: { type: [string, 'null'], enum: [llm, user, null], description: 'Which token the stage''s agent got (null until the stage starts)' }
         hints: { type: array, items: { type: string }, description: 'Plain advice for Daybreak access errors in `errors` (OpenAI''s own messages are misleading), once each' }
         attempts:
           type: array

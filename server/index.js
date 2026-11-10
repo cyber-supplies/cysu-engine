@@ -13,7 +13,7 @@ import { dockerAvailable, IMAGE } from './docker.js';
 import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth, keepRefreshedCodexAuth } from './llm.js';
 import { checkDaybreak } from './daybreak.js';
 import { Runs } from './runs.js';
-import { API_URL, STAGE_TAGS, fetchProfiles } from './profiles.js';
+import { API_URL, STAGE_TAGS, fetchProfiles, fetchLlmToken } from './profiles.js';
 import { Workspaces, WorkspaceError } from './workspaces.js';
 import { Schedules } from './schedules.js';
 import { Scheduler } from './scheduler.js';
@@ -23,7 +23,16 @@ const ENGINE_VERSION = JSON.parse(await readFile(new URL('../package.json', impo
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
 
-const defaultSettings = { token: '', passkey: '', llm: { mode: 'none', apiKey: '' }, globalProfile: '' };
+const defaultSettings = { token: '', passkey: '', llm: { mode: 'none', apiKey: '' }, globalProfile: '', agentToken: 'llm' };
+// agentToken: which Cyber Supplies token workers give the agent. "llm" (the
+// default): the user's restricted llm_ token, fetched fresh for each worker
+// and never stored; it can read profiles, accounts and emails but not change
+// them. "user": the full usr_ token.
+const AGENT_TOKENS = ['llm', 'user'];
+async function agentToken(settings) {
+  if ((settings.agentToken || 'llm') === 'user') return { kind: 'user', token: settings.token };
+  return { kind: 'llm', token: await fetchLlmToken(settings.token) };
+}
 
 const runs = new Runs({
   dir: join(DATA_DIR, 'runs'),
@@ -31,6 +40,7 @@ const runs = new Runs({
     const settings = await load('settings', defaultSettings);
     return { settings, codexAuth: settings.llm?.mode === 'codex' ? await loadCodexAuth() : null };
   },
+  agentToken,
   listProfiles: (settings) => fetchProfiles(settings.token),
   onIdle: () => scheduler.tick(),
 });
@@ -120,7 +130,8 @@ async function runDaybreakCheck(input) {
   if (!(await dockerAvailable())) throw Object.assign(new Error('Docker is not available on this machine'), { status: 503 });
   runs.hold = 'A Daybreak access check is running; start the run again in a minute';
   try {
-    const result = await checkDaybreak({ settings, codexAuth, model: input?.model });
+    const agent = await agentToken(settings);
+    const result = await checkDaybreak({ settings: { ...settings, token: agent.token }, codexAuth, model: input?.model });
     await keepRefreshedCodexAuth(codexAuth, result.refreshedCodexAuth);
     await save('daybreak-check', result);
     return result;
@@ -153,6 +164,7 @@ async function publicSettings(s) {
     passkey: s.passkey ? 'set' : '',
     llm: { mode: s.llm?.mode || 'none', apiKey: mask(s.llm?.apiKey), codex: await codexAuthInfo() },
     globalProfile: s.globalProfile || '',
+    agentToken: s.agentToken || 'llm',
     configured: Boolean(s.token && s.passkey),
   };
 }
@@ -268,6 +280,10 @@ async function putSettings(req, res, { setup }) {
     }
     if (input.llm?.apiKey) next.llm.apiKey = String(input.llm.apiKey).trim();
     if (input.globalProfile !== undefined) next.globalProfile = String(input.globalProfile);
+    if (input.agentToken !== undefined) {
+      if (!AGENT_TOKENS.includes(input.agentToken)) return send(res, 400, { error: 'agentToken must be llm or user' });
+      next.agentToken = input.agentToken;
+    }
     await save('settings', next);
     return send(res, 200, { ...(await publicSettings(next)), ...(token && settings.token && token !== settings.token ? { tokenChanged: true } : {}) });
   });
