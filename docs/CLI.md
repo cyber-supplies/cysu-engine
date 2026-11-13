@@ -234,7 +234,7 @@ prefix ≥ 4).
 | `/unload <id> <profile…>` | `… {"remove": [...]}` | the workspace |
 | `/run <id> [objective]` | `POST /api/workspaces/<id>/run {"objective"}` → the run | "started run `<first 8 of id>`", then `/watch` it. See *Starting a run* |
 | `/rerun [run]` | `POST /api/runs/<run>/rerun` → a new run | Same setup **and the same objective** as that run |
-| `/runs` | `GET /api/runs` | first 8 of `id`, `status`, `name`, `workspace.name`, `createdAt`, stage statuses; mark `trigger: "schedule"` runs |
+| `/runs` | `GET /api/runs` | first 8 of `id`, `status`, `name`, `workspace.name`, `startedAt` (`createdAt` while queued), stage statuses and `error`s; mark `trigger.type: "schedule"` runs |
 | `/watch [run]` | feed loop (below) | live progress; Ctrl-C stops watching, not the run |
 | `/cancel [run]` | `POST /api/runs/<run>/cancel` | "cancelling" |
 | `/download [run] [dir]` | `GET /api/runs/<run>/download` | saves `run-<id>.tar.gz` (run.json, per stage events/log/result) |
@@ -325,7 +325,7 @@ hit (seen live):
   login. Red = `/model <id> gpt-5.6-cyber` + an OpenAI API key from a
   Red-approved project. On a ChatGPT login, use `blue`.
 - The engine explains these errors: a failed stage has `hints` next to its
-  `errors` (in `/runs/<run>`), and a `/watch` error item gets a `hint`. Show
+  `error` (in `/runs/<run>`), and a `/watch` error item gets a `hint`. Show
   the hint under the error.
 
 Access check (a few tokens per program, so only when the user asks, e.g.
@@ -453,9 +453,30 @@ func localTZ() string {
 only run while the engine is running. Times that pass while the computer is
 off or asleep are skipped and noted, not run late.
 
-Runs started by a schedule have `"trigger": "schedule"` and `"schedule":
-{"id", "name"}` (user runs: `"trigger": "user"`). Mark them in `/runs`, e.g.
+Runs started by a schedule have `"trigger": {"type": "schedule", "id", "name"}`
+(user runs: `"trigger": {"type": "user"}`). Mark them in `/runs`, e.g.
 `⏱ <schedule name>`.
+
+### Run JSON (after 0.3.2)
+
+`GET /api/runs/<run>` (and create, rerun, cancel) shows each fact once and
+leaves out empty and default values, so check for a field before using it:
+
+```json
+{ "id", "name", "status", "trigger": {"type": "user"}, "workspace": {"id", "name"},
+  "model"?, "reasoningEffort"?, "startedAt", "finishedAt", "objective",
+  "stages": [{ "index", "profile", "status", "error"?, "daybreak"?, "durationSec",
+               "exitCode", "result", "threadId"?, "usage"?, "eventCount" }] }
+```
+
+`GET /api/runs` has the same top fields without `objective`, and each stage
+only as `{index, profile, status, error?}`. A stage's `model` /
+`reasoningEffort` appear only when it used something other than the run's.
+Gone from the API (still kept by the engine): `request`, `prompt` (use
+`objective`), `stageCount` (use `stages.length`), `schedule` (now in
+`trigger`), `source`, `skip`, `modelOverrides`, `daybreakOverrides`, the
+run-level `daybreak`, and per stage `tag`, `prompt`, `errors` (now one
+`error`), `turns`, `container`. The full plan is still `POST /api/runs/plan`.
 
 ### `/watch` feed
 

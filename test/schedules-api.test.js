@@ -128,7 +128,7 @@ test('the engine starts the run by itself; the user checks on it later', async (
   assert.equal(r.body.nextAt, `${at}:00.000Z`);
   // A user run by hand, for the filters below.
   const byHand = (await http(`/api/workspaces/${ws.id}/run`, 'POST', { objective: 'by hand' })).body;
-  assert.equal(byHand.trigger, 'user');
+  assert.deepEqual(byHand.trigger, { type: 'user' });
 
   // Nobody does anything now: wait for the engine to start it.
   let s;
@@ -147,8 +147,8 @@ test('the engine starts the run by itself; the user checks on it later', async (
   assert.equal(s.nextAt, null);
 
   const run = (await http(`/api/runs/${s.lastRun.runId}`)).body;
-  assert.equal(run.trigger, 'schedule');
-  assert.deepEqual(run.schedule, { id, name: 'soon' });
+  assert.deepEqual(run.trigger, { type: 'schedule', id, name: 'soon' });
+  assert.equal(run.schedule, undefined, 'the schedule is in trigger');
   assert.equal(run.workspace.id, ws.id);
   assert.equal(run.objective, 'scheduled hello', "the schedule's objective");
   assert.deepEqual((await http(`/api/runs?schedule=${id}`)).body.map((x) => x.id), [run.id]);

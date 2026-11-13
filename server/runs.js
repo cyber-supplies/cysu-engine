@@ -23,6 +23,7 @@ import { removeOrphanContainers } from './docker.js';
 import { keepRefreshedCodexAuth } from './llm.js';
 import { orderProfiles, STAGE_TAGS, ProfileError } from './profiles.js';
 import { tarGz } from './tar.js';
+import { runDetail } from './run-view.js';
 
 // The request fields a run remembers, so it can be run again.
 const REQUEST_FIELDS = ['name', 'objective', 'prompt', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
@@ -64,12 +65,6 @@ async function writeJson(file, value) {
   const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`; // unique: saves may overlap
   await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, file);
-}
-
-// summary is what a run list shows (no per-stage results).
-function summary(run) {
-  const { stages, prompt, objective, ...rest } = run;
-  return { ...rest, stageCount: stages.length, stages: stages.map(({ index, profile, tag, status }) => ({ index, profile, tag, status })) };
 }
 
 export class Runs {
@@ -189,7 +184,7 @@ export class Runs {
     for (const entry of await readdir(this.dir, { withFileTypes: true })) {
       if (!entry.isDirectory() || !RUN_ID.test(entry.name)) continue;
       const run = await this.read(entry.name).catch(() => null);
-      if (run) runs.push(summary(run));
+      if (run) runs.push(run); // full runs; the API shows them through run-view.js
     }
     return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
@@ -474,7 +469,7 @@ export class Runs {
     const run = await this.read(id);
     if (ACTIVE.includes(run.status)) throw new HttpError(409, 'Wait for the run to finish (or cancel it) before downloading');
     const root = `run-${id}`;
-    const files = [{ name: `${root}/run.json`, data: `${JSON.stringify(run, null, 2)}\n` }];
+    const files = [{ name: `${root}/run.json`, data: `${JSON.stringify(runDetail(run), null, 2)}\n` }];
     for (const stage of run.stages) {
       for (const name of ['events.jsonl', 'log.txt']) {
         try {

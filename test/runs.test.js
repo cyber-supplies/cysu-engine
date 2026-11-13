@@ -565,8 +565,9 @@ test('HTTP: full run lifecycle, then crash + restart marks it interrupted', asyn
     // A long run, then the engine is killed hard (crash).
     r = await json('/api/runs', 'POST', { prompt: 'SLEEP', stages: [{ profile: 'attack' }] });
     const longId = r.body.id;
-    for (let i = 0; i < 100 && !(await json(`/api/runs/${longId}`)).body.stages[0].threadId; i++) await sleep(200);
-    const container = (await json(`/api/runs/${longId}`)).body.stages[0].container;
+    for (let i = 0; i < 100 && !(await json(`/api/runs/${longId}`)).body.stages[0].eventCount; i++) await sleep(200);
+    // The container name is internal (not in the API): read it from the stored run.
+    const container = JSON.parse(await readFile(join(dir, 'runs', longId, 'run.json'), 'utf8')).stages[0].container;
     server.child.kill('SIGKILL');
     await sleep(500);
     assert.notEqual((await sh('docker', ['ps', '-q', '--filter', `name=${container}`])).out, '', 'container should outlive the crashed engine');
@@ -604,7 +605,9 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     const request = { name: 'again', prompt: 'hello', globalProfile: 'global', fromTags: { skip: ['3', '4'] }, reprompts: [{ stage: '1', prompt: 'more' }] };
     const first = await waitDone((await json('/api/runs', 'POST', request)).body.id);
     assert.equal(first.status, 'succeeded');
-    assert.deepEqual(first.request, request, 'the run remembers what was asked');
+    assert.equal(first.request, undefined, 'the API does not show what was sent');
+    const stored = JSON.parse(await readFile(join(dir, 'runs', first.id, 'run.json'), 'utf8'));
+    assert.deepEqual(stored.request, request, 'the run remembers what was asked (for run again)');
 
     // run again → a new run with the same request
     const again = await json(`/api/runs/${first.id}/rerun`, 'POST');
@@ -612,7 +615,9 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     assert.notEqual(again.body.id, first.id);
     assert.equal(again.body.rerunOf, first.id);
     const second = await waitDone(again.body.id);
-    assert.deepEqual(second.stages.map((s) => `${s.profile}:${s.status}:${s.reprompts.length}`), first.stages.map((s) => `${s.profile}:succeeded:${s.reprompts.length}`));
+    const followUps = (s) => (s.followUps || []).length;
+    assert.deepEqual(second.stages.map((s) => `${s.profile}:${s.status}:${followUps(s)}`), first.stages.map((s) => `${s.profile}:succeeded:${followUps(s)}`));
+    assert.equal(followUps(first.stages[0]), 1, 'the follow-up prompt is shown on its stage');
 
     // download → a real tar.gz with run.json, events, logs and results
     const res = await fetch(`${base}/api/runs/${first.id}/download`, { headers: AUTH });
@@ -629,7 +634,9 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     }
     const extracted = await sh('tar', ['-xzf', archive, '-C', dir]);
     assert.equal(extracted.code, 0, extracted.err);
-    assert.equal(JSON.parse(await readFile(join(dir, `run-${first.id}`, 'run.json'), 'utf8')).id, first.id);
+    const downloaded = JSON.parse(await readFile(join(dir, `run-${first.id}`, 'run.json'), 'utf8'));
+    assert.equal(downloaded.id, first.id);
+    assert.equal(downloaded.request, undefined, 'the download has the simple run JSON too');
     const all = (await sh('tar', ['-xzOf', archive])).out;
     assert.ok(!all.includes(TOKEN) && !all.includes(PASSKEY) && !all.includes(API_KEY), 'secret inside the download');
 

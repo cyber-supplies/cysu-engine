@@ -19,6 +19,7 @@ import { Workspaces, WorkspaceError } from './workspaces.js';
 import { Schedules } from './schedules.js';
 import { Scheduler } from './scheduler.js';
 import { bearerToken, sameToken, UNAUTHORIZED, oneAtATime, AuthLimiter, tooManyMessage } from './auth.js';
+import { runListItem, runDetail } from './run-view.js';
 
 const ENGINE_VERSION = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 const PORT = Number(process.env.PORT || 8787);
@@ -392,7 +393,7 @@ async function api(req, res, path) {
     const ws = await workspaces.get(decodeURIComponent(m[1]));
     const objective = (await body(req))?.objective;
     if (typeof objective !== 'string' || !objective.trim()) return send(res, 400, { error: 'Give the run an objective: {"objective": "what this run should do"}' });
-    return send(res, 201, await startWorkspaceRun(ws, objective, null));
+    return send(res, 201, runDetail(await startWorkspaceRun(ws, objective, null)));
   }
 
   // ---- schedules (runs the engine starts by itself) -------------------------
@@ -433,14 +434,14 @@ async function api(req, res, path) {
       const trigger = q.get('trigger');
       if (trigger !== null && !['user', 'schedule'].includes(trigger)) return send(res, 400, { error: 'trigger must be user or schedule' });
       const schedule = q.get('schedule');
-      let list = await runs.list();
-      if (trigger) list = list.filter((r) => (r.trigger || 'user') === trigger);
-      if (schedule) list = list.filter((r) => r.schedule?.id === schedule);
+      let list = (await runs.list()).map(runListItem);
+      if (trigger) list = list.filter((r) => r.trigger.type === trigger);
+      if (schedule) list = list.filter((r) => r.trigger.id === schedule);
       return send(res, 200, list);
     }
     if (req.method === 'POST') {
       if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
-      return send(res, 201, await runs.create(await body(req)));
+      return send(res, 201, runDetail(await runs.create(await body(req))));
     }
   }
   if (path === '/api/runs/plan' && req.method === 'POST') return send(res, 200, await runs.plan(await body(req)));
@@ -449,12 +450,12 @@ async function api(req, res, path) {
   if (m && m[1] !== 'plan') {
     const id = await runs.resolve(m[1]);
     const rest = m[2] || '';
-    if (rest === '' && req.method === 'GET') return send(res, 200, await runs.get(id));
+    if (rest === '' && req.method === 'GET') return send(res, 200, runDetail(await runs.get(id)));
     if (rest === '' && req.method === 'DELETE') { await runs.delete(id); res.writeHead(204); return res.end(); }
-    if (rest === '/cancel' && req.method === 'POST') return send(res, 202, await runs.cancel(id));
+    if (rest === '/cancel' && req.method === 'POST') return send(res, 202, runDetail(await runs.cancel(id)));
     if (rest === '/rerun' && req.method === 'POST') {
       if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
-      return send(res, 201, await runs.rerun(id));
+      return send(res, 201, runDetail(await runs.rerun(id)));
     }
     if (rest === '/download' && req.method === 'GET') {
       const { filename, data } = await runs.download(id);
@@ -588,16 +589,16 @@ async function agentApi(req, res, path, scope) {
     const trigger = q.get('trigger');
     if (trigger !== null && !['user', 'schedule'].includes(trigger)) return send(res, 400, { error: 'trigger must be user or schedule' });
     const schedule = q.get('schedule');
-    let list = (await runs.list()).filter((r) => inScope(scope, r));
-    if (trigger) list = list.filter((r) => (r.trigger || 'user') === trigger);
-    if (schedule) list = list.filter((r) => r.schedule?.id === schedule);
+    let list = (await runs.list()).filter((r) => inScope(scope, r)).map(runListItem);
+    if (trigger) list = list.filter((r) => r.trigger.type === trigger);
+    if (schedule) list = list.filter((r) => r.trigger.id === schedule);
     return send(res, 200, list);
   }
   m = path.match(/^\/api\/runs\/([\w-]+)(\/.*)?$/);
   if (m) {
     const id = await scopedRunId(scope, m[1]);
     const rest = m[2] || '';
-    if (rest === '') return send(res, 200, await runs.get(id));
+    if (rest === '') return send(res, 200, runDetail(await runs.get(id)));
     if (rest === '/feed') return send(res, 200, await runs.feed(id, { cursor: q.get('cursor') || '', wait: q.get('wait') }));
     if (rest === '/download') {
       const { filename, data } = await runs.download(id);

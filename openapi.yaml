@@ -1126,7 +1126,7 @@ components:
 
     RunPlan:
       type: object
-      description: A planned run (from `POST /api/runs/plan`); a created run has these fields plus id, status and times.
+      description: A planned run (from `POST /api/runs/plan`), with every setting worked out. A created run is shown in the shorter `Run` form.
       properties:
         name: { type: string }
         objective: { type: string }
@@ -1193,33 +1193,89 @@ components:
         eventCount: { type: integer }
         container: { type: string, description: Docker container name while it exists }
 
+    Trigger:
+      type: object
+      required: [type]
+      description: Who started the run. `{"type":"user"}`, or a schedule with its id and name.
+      properties:
+        type: { type: string, enum: [user, schedule] }
+        id: { type: string, description: The schedule's id (schedule runs only) }
+        name: { type: string, description: The schedule's name (schedule runs only) }
+
+    RunStage:
+      type: object
+      description: |
+        A stage as a run shows it. Every fact appears once: empty and default
+        values are left out, and model / reasoningEffort / fallbackModel appear
+        only when this stage used something other than the run's setting.
+        The list view (`RunSummary`) has only index, profile, status and error.
+      required: [index, profile, status]
+      properties:
+        index: { type: integer }
+        profile: { type: string }
+        status: { $ref: '#/components/schemas/StageStatus' }
+        error: { type: string, description: 'Why the stage failed, in one line (the agent''s last error, e.g. a model or proxy error). Only on failed / interrupted stages.' }
+        hints: { type: array, items: { type: string }, description: Plain advice for Daybreak access errors (only when there is some) }
+        model: { type: string, description: Only when different from the run's model }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        fallbackModel: { type: string, description: Only when different from the run's }
+        daybreak: { $ref: '#/components/schemas/Daybreak', description: 'Only when not "default"' }
+        followUps: { type: array, items: { type: string }, description: Follow-up prompts sent after the first turn (only when there are some) }
+        engineLinked: { type: boolean, description: 'Present (true) only when the agent could read earlier runs' }
+        agentToken: { type: string, enum: [user], description: 'Present only when the agent got the full user token (the default restricted LLM token is not shown)' }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        durationSec: { type: integer }
+        exitCode: { type: integer, description: 'Container exit code; 5 = a profile could not be installed' }
+        result: { type: string, description: The agent's last message }
+        threadId: { type: string, description: Codex thread ID (only when a turn finished) }
+        usage:
+          type: object
+          description: Token usage of the last Codex turn (only when a turn finished; zero counters left out)
+          properties:
+            input_tokens: { type: integer }
+            cached_input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            reasoning_output_tokens: { type: integer }
+        attempts:
+          type: array
+          description: The Codex runs inside this stage, only when there was more than one (fallback model, follow-ups)
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [initial, fallback, reprompt] }
+              model: { type: string }
+              status: { type: string, enum: [running, succeeded, failed, cancelled] }
+              durationSec: { type: integer }
+        eventCount: { type: integer, description: Events recorded so far (the CLI uses it to bound transcript downloads) }
+
     Run:
       type: object
-      required: [id, status, createdAt, objective, stages]
+      description: |
+        A run as the API shows it (GET, create, rerun, cancel, and run.json in
+        the download). Empty and default values are left out. What was sent to
+        create the run is stored by the engine for "run again" but not shown.
+      required: [id, status, trigger, stages]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         status: { $ref: '#/components/schemas/RunStatus' }
-        createdAt: { type: string, format: date-time }
-        startedAt: { type: [string, 'null'], format: date-time }
-        finishedAt: { type: [string, 'null'], format: date-time }
-        objective: { type: string, description: What this run was asked to do }
-        prompt: { type: string, description: Same as `objective` (older name; runs from before 0.12 have only this) }
-        globalProfile: { type: string }
+        trigger: { $ref: '#/components/schemas/Trigger' }
+        workspace: { type: object, description: 'The workspace it was started from (/run or a schedule)', properties: { id: { type: string }, name: { type: string } } }
         model: { type: string }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
-        source: { type: string, enum: [explicit, tags] }
-        skip: { type: array, items: { type: string } }
-        modelOverrides: { type: array, items: { type: object, properties: { stage: { type: integer }, model: { type: string } } } }
-        continueOnFailure: { type: boolean }
-        engineLinked: { type: boolean, description: 'Whether this run asked for engine linked' }
-        cancelRequested: { type: boolean }
-        request: { $ref: '#/components/schemas/RunRequest', description: What was asked for (used by rerun) }
-        rerunOf: { type: [string, 'null'], description: The run this one repeats }
-        workspace: { type: [object, 'null'], description: 'The workspace it was started from (/run or a schedule)', properties: { id: { type: string }, name: { type: string } } }
-        trigger: { type: string, enum: [user, schedule], description: Who started it (older runs have none = user) }
-        schedule: { type: [object, 'null'], description: The schedule that started it, properties: { id: { type: string }, name: { type: string } } }
-        stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
+        createdAt: { type: string, format: date-time, description: Only while the run is queued (not started yet) }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        error: { type: string, description: Only when the run itself could not go on (stage failures are on the stage) }
+        objective: { type: string, description: What this run was asked to do }
+        globalProfile: { type: string }
+        fallbackModel: { type: string }
+        continueOnFailure: { type: boolean, description: 'Present (false) only when later stages are skipped after a failure; the default is true' }
+        engineLinked: { type: boolean, description: 'Present (true) only when the run asked for engine linked' }
+        cancelRequested: { type: boolean, description: 'Present (true) while a cancel is under way' }
+        rerunOf: { type: string, description: The run this one repeats }
+        stages: { type: array, items: { $ref: '#/components/schemas/RunStage' } }
 
     Workspace:
       type: object
@@ -1246,20 +1302,20 @@ components:
 
     RunSummary:
       type: object
-      required: [id, status, createdAt, stageCount, stages]
+      description: A run in the list (GET /api/runs), newest first. The same top fields as `Run` (empty ones left out) and a short line per stage.
+      required: [id, status, trigger, stages]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         status: { $ref: '#/components/schemas/RunStatus' }
-        createdAt: { type: string, format: date-time }
-        startedAt: { type: [string, 'null'], format: date-time }
-        finishedAt: { type: [string, 'null'], format: date-time }
-        globalProfile: { type: string }
+        trigger: { $ref: '#/components/schemas/Trigger' }
+        workspace: { type: object, properties: { id: { type: string }, name: { type: string } } }
         model: { type: string }
-        workspace: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string } } }
-        trigger: { type: string, enum: [user, schedule], description: Who started it (older runs have none = user) }
-        schedule: { type: [object, 'null'], description: The schedule that started it, properties: { id: { type: string }, name: { type: string } } }
-        stageCount: { type: integer }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        createdAt: { type: string, format: date-time, description: Only while queued }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        error: { type: string }
         stages:
           type: array
           items:
@@ -1267,8 +1323,8 @@ components:
             properties:
               index: { type: integer }
               profile: { type: string }
-              tag: { type: string }
               status: { $ref: '#/components/schemas/StageStatus' }
+              error: { type: string, description: Why it failed (failed / interrupted stages only) }
 
     ScheduleWhen:
       description: |

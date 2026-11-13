@@ -61,7 +61,7 @@ test('a linked stage: the engine joins its network, and the agent reaches the en
   const created = await call('POST', '/api/runs', { objective: 'learn from earlier runs', stages: [{ profile: 'attack' }] });
   assert.equal(created.status, 201, JSON.stringify(created.body));
   const run = await finished(created.body.id);
-  assert.equal(run.status, 'succeeded', JSON.stringify(run.stages[0].errors));
+  assert.equal(run.status, 'succeeded', JSON.stringify(run.stages[0]));
   assert.equal(run.engineLinked, true);
   assert.equal(run.stages[0].engineLinked, true);
   const report = JSON.parse(run.stages[0].result);
@@ -98,7 +98,7 @@ test('a linked stage reads earlier runs of ITS workspace with the real cysu CLI 
   runB = (await finished((await call('POST', `/api/workspaces/${wsB}/run`, { objective: 'B secret objective' })).body.id)).id;
   runA1 = (await finished((await call('POST', `/api/workspaces/${wsA}/run`, { objective: 'A first objective' })).body.id)).id;
   const runA2 = await finished((await call('POST', `/api/workspaces/${wsA}/run`, { objective: `ENGINE-READ OTHER=${runB}` })).body.id);
-  assert.equal(runA2.status, 'succeeded', JSON.stringify(runA2.stages[0].errors));
+  assert.equal(runA2.status, 'succeeded', JSON.stringify(runA2.stages[0]));
   read = JSON.parse(JSON.parse(runA2.stages[0].result).engineRead);
 
   assert.match(read.key, /^usr_engine_[\w-]{43}$/, 'the stage got its key as CYSU_ENGINE_TOKEN');
