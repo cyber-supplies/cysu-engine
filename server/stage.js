@@ -137,7 +137,7 @@ export function secretMasker(userSecrets = {}) {
   };
 }
 
-export function startStage({ stage: input, settings, codexAuth = null, userSecrets = {}, image = IMAGE, extraEnv = {}, link = null, onUpdate = () => {}, onLog = () => {} }) {
+export function startStage({ stage: input, settings, codexAuth = null, userSecrets = {}, cli = null, image = IMAGE, extraEnv = {}, link = null, onUpdate = () => {}, onLog = () => {} }) {
   const stage = validateStage(input);
   const id = randomUUID();
   const container = `cysu-stage-${id.slice(0, 8)}`;
@@ -148,7 +148,8 @@ export function startStage({ stage: input, settings, codexAuth = null, userSecre
     events: [], log: '', cancelled: false,
   };
 
-  const env = { CYSU_SECRETS: 'stdin', CYSU_STAGE_JSON: JSON.stringify(stage), ...extraEnv };
+  // cli (cli-cache.js): the run's CLI from the engine's cache (read-only mount + CYSU_CLI_DIR).
+  const env = { CYSU_SECRETS: 'stdin', CYSU_STAGE_JSON: JSON.stringify(stage), ...(cli?.env || {}), ...extraEnv };
   if (link) {
     env.CYSU_ENGINE_URL = `http://${link.ip}:${link.port}`;
     env.CYSU_ENGINE_ALLOW = `${link.ip}:${link.port}`;
@@ -160,6 +161,7 @@ export function startStage({ stage: input, settings, codexAuth = null, userSecre
   const args = ['run', '-i', '--name', container, '--label', `${LABEL}=stage`, ...hardeningArgs()];
   if (link) args.push('--network', link.network);
   for (const [key, value] of Object.entries(env)) args.push('-e', `${key}=${value}`);
+  if (cli?.mounts?.length) args.push(...cli.mounts);
   args.push(image);
 
   const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });

@@ -39,8 +39,8 @@ COPY --from=gotoolchain /usr/local/go /usr/local/go
 COPY --from=pd /go/bin/ /usr/local/bin/
 ENV PATH="/usr/local/go/bin:${PATH}"
 
-# The entrypoint refreshes the CLI on every start. Keep a baseline copy in the
-# image for test tooling and to make the image useful before a stage starts.
+# Stages normally use the CLI from the engine's cache volume (server/cli-cache.js);
+# this baseline copy is the fallback, and serves test tooling.
 # Codex is pinned only when reproducing an older image.
 ARG CODEX_VERSION=latest
 RUN npm install -g @cyber-supplies/cysu@latest @openai/codex@${CODEX_VERSION} \

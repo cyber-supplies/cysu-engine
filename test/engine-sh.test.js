@@ -118,3 +118,13 @@ test('a local build (cysu-engine:dev) is never pulled; missing, it says to build
   assert.equal(missing.code, 1);
   assert.match(missing.out, /build it first \(npm run engine:build\)/);
 });
+
+test('update with a setting (CYSU_CLI_VERSION) recreates the container even when the image is unchanged', async (t) => {
+  const dir = await fake({ [`image-${key(REF)}`]: 'sha256:same', exists: '', running: '', [`pull-${key(REF)}`]: 'ok:sha256:same' });
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const r = await engineSh(dir, ['update'], { CYSU_CLI_VERSION: '0.6.3' });
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.out, /Already up to date/);
+  const run = (await calls(dir)).find((x) => x.startsWith('run '));
+  assert.match(run, /-e CYSU_CLI_VERSION=0\.6\.3/);
+});

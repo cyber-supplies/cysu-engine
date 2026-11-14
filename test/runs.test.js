@@ -475,7 +475,7 @@ test('Windmill-style run: per-tag model, fallback when it fails, follow-ups on t
 
 async function startServer(dir, port) {
   const child = spawn(process.execPath, ['server/index.js'], {
-    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: TEST_IMAGE, CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
+    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: TEST_IMAGE, CYSU_CLI_VERSION: 'image', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';

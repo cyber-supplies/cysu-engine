@@ -47,6 +47,19 @@ CYSU_ENGINE_IMAGE_REF=cysu-engine:dev sh scripts/engine.sh start   # → Engine 
 
 It also restarts by itself after a reboot (`--restart unless-stopped`).
 
+## The Cyber Supplies CLI inside runs
+
+Each run's agents use the newest `cysu` CLI release. The engine checks npm at
+most once an hour and downloads a new release **once** (a few seconds) into
+the Docker volume `cysu-engine-cli`, with the skill of that same version;
+every stage of a run uses the same version. No new worker image is needed for
+a CLI release. If npm or GitHub cannot be reached, runs use the newest version
+already downloaded, or else the copy inside the worker image. The run log
+says which one (`[engine] Cyber Supplies CLI: …`).
+
+To choose: `CYSU_CLI_VERSION=0.6.3 sh scripts/engine.sh update` (an exact
+version) or `CYSU_CLI_VERSION=image` (only the worker image's copy).
+
 ## Where your data is
 
 Everything stays on this machine, in the Docker volume `cysu-engine-data`:

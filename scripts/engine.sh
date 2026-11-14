@@ -15,6 +15,9 @@
 #   CYSU_ENGINE_PORT        port on 127.0.0.1     (default 8787)
 #   CYSU_ENGINE_IMAGE       worker image the engine starts for stages
 #                           (default: the engine's own default)
+#   CYSU_CLI_VERSION        Cyber Supplies CLI for stages: latest (default; checked
+#                           on npm hourly, downloaded once per release), x.y.z, or
+#                           image (the copy inside the worker image)
 #
 # The engine API needs your Cyber Supplies user token on every request (it is
 # set at the first setup); only "is it up?" (/api/health) answers without it.
@@ -93,6 +96,7 @@ create() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v cysu-engine-data:/data
   [ -z "${CYSU_ENGINE_IMAGE:-}" ] || set -- "$@" -e "CYSU_ENGINE_IMAGE=$CYSU_ENGINE_IMAGE"
+  [ -z "${CYSU_CLI_VERSION:-}" ] || set -- "$@" -e "CYSU_CLI_VERSION=$CYSU_CLI_VERSION"
   docker "$@" "$IMAGE_REF" >/dev/null
 }
 
@@ -120,7 +124,9 @@ case "${1:-}" in
       echo "Downloading the newest engine image $IMAGE_REF…"
       if ! pull_image "$IMAGE_REF" "engine image"; then echo "Nothing was changed."; exit 1; fi
     fi
-    if [ -n "$before" ] && [ "$before" = "$(image_id "$IMAGE_REF")" ] && running; then
+    # Settings given with update (CYSU_ENGINE_IMAGE, CYSU_CLI_VERSION) need a new container.
+    if [ -n "$before" ] && [ "$before" = "$(image_id "$IMAGE_REF")" ] && running \
+      && [ -z "${CYSU_ENGINE_IMAGE:-}" ] && [ -z "${CYSU_CLI_VERSION:-}" ]; then
       echo "Already up to date."; exit 0
     fi
     if exists; then docker stop -t 20 "$NAME" >/dev/null 2>&1 || true; docker rm "$NAME" >/dev/null; fi

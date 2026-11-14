@@ -29,7 +29,7 @@ before(async () => {
   base = `http://127.0.0.1:${port}`;
   // Firewall off for the stage itself: the stand-in Cyber Supplies API runs on
   // this machine (the firewall is checked separately below).
-  const env = { CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1', CYSU_ENGINE_NETWORK: names.network };
+  const env = { CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test', CYSU_CLI_VERSION: 'image', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1', CYSU_ENGINE_NETWORK: names.network };
   execFileSync('docker', ['run', '-d', '--name', names.container, '--init', '-p', `127.0.0.1:${port}:8787`,
     '-v', '/var/run/docker.sock:/var/run/docker.sock', '-v', `${names.data}:/data`,
     ...Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]), 'cysu-engine:dev']);

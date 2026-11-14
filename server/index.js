@@ -21,6 +21,7 @@ import { Scheduler } from './scheduler.js';
 import { bearerToken, sameToken, UNAUTHORIZED, oneAtATime, AuthLimiter, tooManyMessage } from './auth.js';
 import { runListItem, runDetail } from './run-view.js';
 import { listSecrets, setSecret, deleteSecret, secretValues } from './secrets.js';
+import { CliCache } from './cli-cache.js';
 
 const ENGINE_VERSION = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 const PORT = Number(process.env.PORT || 8787);
@@ -46,6 +47,7 @@ const runs = new Runs({
   agentToken,
   listProfiles: (settings) => fetchProfiles(settings.token),
   onIdle: () => scheduler.tick(),
+  cliCache: new CliCache(),
   engineLink: async (run) => {
     const { network, ip } = await connectEngine();
     await listenForAgents(ip);

@@ -79,7 +79,7 @@ export class Runs {
   // an "engine linked" stage: `key` is the stage's read-only engine key and
   // release() revokes it (called when the stage ends). Throws when the engine
   // cannot be linked.
-  constructor({ dir, getSecrets, agentToken = async (settings) => ({ kind: 'user', token: settings.token }), listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {}, engineLink = async () => { throw new Error('engine linked is not available here'); } }) {
+  constructor({ dir, getSecrets, agentToken = async (settings) => ({ kind: 'user', token: settings.token }), listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {}, engineLink = async () => { throw new Error('engine linked is not available here'); }, cliCache = null }) {
     this.engineLink = engineLink;
     this.dir = dir;
     this.onIdle = onIdle;
@@ -87,6 +87,8 @@ export class Runs {
     this.agentToken = agentToken;
     this.listProfiles = listProfiles;
     this.stageOptions = stageOptions;
+    // cli-cache.js: which CLI a run's stages use (null: the worker image's own).
+    this.cliCache = cliCache;
     this.active = null; // { run, stage (live stage record) }
     this.hold = ''; // set while something else uses the LLM login (a Daybreak check): new runs wait
     this.saveTimer = null;
@@ -363,6 +365,9 @@ export class Runs {
     run.status = 'running';
     run.startedAt = new Date().toISOString();
     await this.save(run);
+    // One CLI version for the whole run, decided as it starts (never fails).
+    this.runCli = this.cliCache ? await this.cliCache.prepare().catch(() => null) : null;
+    if (this.runCli) run.cli = { version: this.runCli.version, source: this.runCli.source };
     try {
       let failed = false;
       for (const stage of run.stages) {
@@ -403,6 +408,7 @@ export class Runs {
       const agent = await this.agentToken(settings);
       stage.agentToken = agent.kind;
       write(log, `[engine] agent token: ${agent.kind === 'llm' ? 'LLM token (restricted)' : 'user token (full access)'}\n`);
+      if (this.runCli) write(log, `[engine] Cyber Supplies CLI: ${this.runCli.note}\n`);
       // Engine linked: if the engine cannot be linked, the stage runs without
       // it (it is extra context, not something the stage depends on).
       if (run.engineLinked) {
@@ -417,7 +423,7 @@ export class Runs {
       const live = startStage({
         stage: { profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
           reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts, daybreak: stage.daybreak },
-        settings: { ...settings, token: agent.token }, codexAuth, userSecrets, link, ...this.stageOptions,
+        settings: { ...settings, token: agent.token }, codexAuth, userSecrets, cli: this.runCli, link, ...this.stageOptions,
         onLog: (line) => write(log, `${line}\n`),
         onUpdate: (live, event) => {
           if (event) {

@@ -57,19 +57,27 @@ if [ "$(id -u)" = "0" ]; then
     log "WARNING: egress firewall disabled (CYSU_EGRESS_GUARD=0)" >&2
   fi
 
-  # Resolve the npm latest tag at each worker start. A failed refresh must
-  # never leave the stage running with a stale CLI.
-  if [ "${CYSU_SECRETS:-}" = "stdin" ] && [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
-    log "installing the latest Cyber Supplies CLI"
-    if ! npm install -g --no-audit --no-fund --prefer-online @cyber-supplies/cysu@latest >/dev/null; then
-      log "refusing to run: could not install the latest Cyber Supplies CLI"
-      exit 4
-    fi
+  # The Cyber Supplies CLI: the version the engine chose for this run, from
+  # its cache volume (mounted read-only; CYSU_CLI_DIR=/opt/cysu-cache/<version>,
+  # see server/cli-cache.js), with the skill of that same version. If it is
+  # missing or does not run, the copy baked into this image is used instead.
+  CYSU_SKILL_DIR=/opt/cysu/skill
+  cli_dir=${CYSU_CLI_DIR:-}
+  case "$cli_dir" in /opt/cysu-cache/[0-9]*) ;; *) cli_dir= ;; esac
+  if [ -n "$cli_dir" ] && [ -x "$cli_dir/bin/cysu" ] && "$cli_dir/bin/cysu" help >/dev/null 2>&1; then
+    export PATH="$cli_dir/bin:$PATH"
+    if [ -f "$cli_dir/skill/SKILL.md" ]; then CYSU_SKILL_DIR=$cli_dir/skill; fi
+    log "Cyber Supplies CLI $(cat "$cli_dir/version" 2>/dev/null || echo '?') (the engine's copy)"
+  else
+    if [ -n "${CYSU_CLI_DIR:-}" ]; then log "the engine's CLI copy at ${CYSU_CLI_DIR} is not usable; using the one in this image" >&2; fi
+    log "Cyber Supplies CLI $(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$(npm root -g)/@cyber-supplies/cysu/package.json" 2>/dev/null | head -1) (the copy in this image)"
   fi
+  unset cli_dir CYSU_CLI_DIR
+  export CYSU_SKILL_DIR
 
   # The cysu skill, copied into the home dir at start (see Dockerfile: folders
   # from the image layer cannot be swapped by `cysu profiles install`).
-  as_runner sh -c 'for d in "$HOME/.codex/skills" "$HOME/.agents/skills"; do mkdir -p "$d" && cp -R /opt/cysu/skill "$d/cysu"; done'
+  as_runner sh -c 'for d in "$HOME/.codex/skills" "$HOME/.agents/skills"; do mkdir -p "$d" && cp -R "$CYSU_SKILL_DIR" "$d/cysu"; done'
 
   if [ "${CYSU_SECRETS:-}" = "stdin" ]; then
     secrets=$(head -n 1)
@@ -300,7 +308,7 @@ has_cysu_skill() {
 if has_cysu_skill; then
   log "cysu skill: provided by the installed profiles" >&2
 else
-  mkdir -p "$HOME/.agents/skills" && cp -R /opt/cysu/skill "$HOME/.agents/skills/cysu"
+  mkdir -p "$HOME/.agents/skills" && cp -R "${CYSU_SKILL_DIR:-/opt/cysu/skill}" "$HOME/.agents/skills/cysu"
   log "cysu skill: added the built-in one (the profiles did not include it)" >&2
 fi
 
