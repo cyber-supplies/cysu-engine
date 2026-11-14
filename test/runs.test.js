@@ -11,14 +11,14 @@ import { mkdtemp, rm, readFile, readdir, stat, mkdir, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { startFakeApi } from './fixtures/fake-api.js';
+import { startFakeApi, llmTokenFor } from './fixtures/fake-api.js';
 
 const DATA = await mkdtemp(join(tmpdir(), 'cysu-engine-runs-'));
 process.env.CYSU_ENGINE_DATA = DATA; // before the server modules load
 const { Runs } = await import('../server/runs.js');
 const { save, load } = await import('../server/store.js');
 const { LABEL } = await import('../server/docker.js');
-const { fetchProfiles } = await import('../server/profiles.js');
+const { fetchProfiles, fetchLlmToken } = await import('../server/profiles.js');
 
 const TEST_IMAGE = 'cysu-engine-workspace:test';
 const TOKEN = 'usr_runs-test-token-91c2';
@@ -277,6 +277,106 @@ test('Daybreak reaches each stage\'s Codex and shows in the run and the /watch f
   assert.deepEqual(feed.items.filter((it) => it.kind === 'attempt').map((it) => it.text), ['initial · Daybreak blue', 'initial · Daybreak red', 'initial · Daybreak red']);
 });
 
+test('Daybreak access error: advice saved on the stage and attached to the /watch feed error', async () => {
+  const created = await runs.create({ prompt: 'p', stages: [{ profile: 'attack', model: 'daybreak-denied' }], daybreak: 'red' });
+  const run = await finished(created.id, 180_000);
+  assert.equal(run.status, 'failed');
+  assert.equal(run.stages[0].hints.length, 1);
+  assert.match(run.stages[0].hints[0], /Red only works with the cyber models/);
+  const errors = (await runs.feed(run.id, { cursor: '' })).items.filter((it) => it.kind === 'error');
+  assert.ok(errors.some((it) => /You do not have Daybreak access/.test(it.text) && /use daybreak "blue" instead/.test(it.hint)), JSON.stringify(errors));
+  assert.ok(errors.filter((it) => /exit code/.test(it.text)).every((it) => !('hint' in it)), 'plain errors have no hint field');
+});
+
+test('while a Daybreak check holds the LLM login, new runs are refused with a clear 409', async () => {
+  runs.hold = 'A Daybreak access check is running; start the run again in a minute';
+  try {
+    assert.equal(runs.busy, true, 'the scheduler sees the engine as busy and waits');
+    await rejects(runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] }), 409, /Daybreak access check is running/);
+  } finally { runs.hold = ''; }
+  assert.equal(runs.busy, false);
+});
+
+test('agent token "llm": the worker\'s agent gets the llm_ token (profiles install with it); a failed lookup fails the stage', async () => {
+  const userDefault = runs.agentToken;
+  runs.agentToken = async (settings) => ({ kind: 'llm', token: await fetchLlmToken(settings.token, { apiUrl: api.url }) });
+  try {
+    api.requests.length = 0;
+    let run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+    assert.equal(run.status, 'succeeded', JSON.stringify(run.stages[0].errors));
+    assert.equal(run.stages[0].agentToken, 'llm');
+    const byAuth = (auth) => api.requests.filter((r) => r.auth === `Bearer ${auth}`).map((r) => `${r.method} ${r.url}`);
+    // The engine itself uses the user token (planning lists the profiles, then
+    // it fetches the LLM token); the worker only ever has the LLM token.
+    assert.deepEqual(byAuth(TOKEN), ['GET /api/profiles', 'GET /api/tokens/llm']);
+    assert.deepEqual(byAuth(llmTokenFor(TOKEN)), ['GET /api/profiles/attack'], 'the worker installed the profile with the LLM token');
+    assert.match(await runs.log(run.id, 0), /\[engine\] agent token: LLM token \(restricted\)/);
+
+    api.llmTokens.status = 404;
+    api.requests.length = 0;
+    run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+    assert.equal(run.status, 'failed');
+    assert.match(run.stages[0].errors.join(' '), /no LLM token for your account.*agent token to "user"/);
+    assert.deepEqual(api.requests.map((r) => r.url), ['/api/profiles', '/api/tokens/llm'], 'no worker started: nothing ran with the user token instead');
+  } finally {
+    api.llmTokens.status = 200;
+    runs.agentToken = userDefault;
+  }
+  const run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+  assert.equal(run.stages[0].agentToken, 'user', '"user": the full user token, as before');
+});
+
+test('engine linked: off by default; on (setting or per run) the worker gets CYSU_ENGINE_URL on the link network; unavailable → runs without it', async () => {
+  await rejects(runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: 'yes' }), 400, /engineLinked must be true or false/);
+  const { createServer } = await import('node:http');
+  const fakeEngine = createServer((req, res) => res.end(req.url === '/api/health' ? '{"ok":true}' : 'nope'));
+  await new Promise((resolve) => fakeEngine.listen(0, gateway, resolve));
+  const port = fakeEngine.address().port;
+  const calls = [];
+  let released = 0;
+  runs.engineLink = async (run, stage) => { calls.push([run.id, stage.index]); return { network: 'bridge', ip: gateway, port, release: () => { released += 1; } }; };
+  const report = (run) => JSON.parse(run.stages[0].result);
+  try {
+    let run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+    assert.equal(run.engineLinked, false, 'off by default');
+    assert.equal(run.stages[0].engineLinked, false);
+    assert.equal(report(run).engineUrl, '', 'no engine address without the setting');
+    assert.doesNotMatch(report(run).files, /engine-history/, 'no engine-history skill without the link');
+    assert.equal(calls.length, 0);
+
+    run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: true })).id);
+    assert.equal(run.status, 'succeeded', JSON.stringify(run.stages[0].errors));
+    assert.equal(run.engineLinked, true);
+    assert.equal(run.request.engineLinked, true, 'run again keeps it');
+    assert.equal(run.stages[0].engineLinked, true);
+    assert.equal(report(run).engineUrl, `http://${gateway}:${port}`);
+    assert.equal(report(run).engineProbe, '{"ok":true}', 'the agent reached the engine address');
+    assert.match(await runs.log(run.id, 0), /\[engine\] engine linked: the agent can read earlier runs/);
+    assert.deepEqual(calls, [[run.id, 0]]);
+    assert.equal(released, 1, 'the stage key is released when the stage ends');
+
+    const saved = secrets;
+    secrets = { ...structuredClone(saved), settings: { ...structuredClone(saved.settings), engineLinked: true } };
+    try {
+      run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }] })).id);
+      assert.equal(run.engineLinked, true, 'the engine setting turns it on');
+      run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: false })).id);
+      assert.equal(run.engineLinked, false, 'a run can turn it off');
+      assert.equal(report(run).engineUrl, '');
+    } finally { secrets = saved; }
+
+    runs.engineLink = async () => { throw new Error('engine linked needs the engine to run in its container'); };
+    run = await finished((await runs.create({ prompt: 'p', stages: [{ profile: 'attack' }], engineLinked: true })).id);
+    assert.equal(run.status, 'succeeded', 'the stage still runs');
+    assert.equal(run.stages[0].engineLinked, false);
+    assert.equal(report(run).engineUrl, '');
+    assert.match(await runs.log(run.id, 0), /engine linked: not available, running without it \(engine linked needs the engine to run in its container\)/);
+  } finally {
+    fakeEngine.close();
+    runs.engineLink = async () => { throw new Error('engine linked is not available here'); };
+  }
+});
+
 test('ordered run: every stage in order, each in a FRESH container with global + its own profile', async () => {
   const created = await runs.create({ prompt: 'Objective X', globalProfile: 'global', fromTags: {} });
   const run = await finished(created.id, 180_000);
@@ -376,7 +476,7 @@ test('Windmill-style run: per-tag model, fallback when it fails, follow-ups on t
 
 async function startServer(dir, port) {
   const child = spawn(process.execPath, ['server/index.js'], {
-    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: TEST_IMAGE, CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
+    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: TEST_IMAGE, CYSU_CLI_VERSION: 'image', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -467,8 +567,9 @@ test('HTTP: full run lifecycle, then crash + restart marks it interrupted', asyn
     // A long run, then the engine is killed hard (crash).
     r = await json('/api/runs', 'POST', { prompt: 'SLEEP', stages: [{ profile: 'attack' }] });
     const longId = r.body.id;
-    for (let i = 0; i < 100 && !(await json(`/api/runs/${longId}`)).body.stages[0].threadId; i++) await sleep(200);
-    const container = (await json(`/api/runs/${longId}`)).body.stages[0].container;
+    for (let i = 0; i < 100 && !(await json(`/api/runs/${longId}`)).body.stages[0].eventCount; i++) await sleep(200);
+    // The container name is internal (not in the API): read it from the stored run.
+    const container = JSON.parse(await readFile(join(dir, 'runs', longId, 'run.json'), 'utf8')).stages[0].container;
     server.child.kill('SIGKILL');
     await sleep(500);
     assert.notEqual((await sh('docker', ['ps', '-q', '--filter', `name=${container}`])).out, '', 'container should outlive the crashed engine');
@@ -507,7 +608,9 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     const request = { name: 'again', prompt: 'hello', globalProfile: 'global', fromTags: { skip: ['3', '4'] }, reprompts: [{ stage: '1', prompt: 'more' }] };
     const first = await waitDone((await json('/api/runs', 'POST', request)).body.id);
     assert.equal(first.status, 'succeeded');
-    assert.deepEqual(first.request, request, 'the run remembers what was asked');
+    assert.equal(first.request, undefined, 'the API does not show what was sent');
+    const stored = JSON.parse(await readFile(join(dir, 'runs', first.id, 'run.json'), 'utf8'));
+    assert.deepEqual(stored.request, request, 'the run remembers what was asked (for run again)');
 
     // run again → a new run with the same request
     const again = await json(`/api/runs/${first.id}/rerun`, 'POST');
@@ -515,7 +618,9 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     assert.notEqual(again.body.id, first.id);
     assert.equal(again.body.rerunOf, first.id);
     const second = await waitDone(again.body.id);
-    assert.deepEqual(second.stages.map((s) => `${s.profile}:${s.status}:${s.reprompts.length}`), first.stages.map((s) => `${s.profile}:succeeded:${s.reprompts.length}`));
+    const followUps = (s) => (s.followUps || []).length;
+    assert.deepEqual(second.stages.map((s) => `${s.profile}:${s.status}:${followUps(s)}`), first.stages.map((s) => `${s.profile}:succeeded:${followUps(s)}`));
+    assert.equal(followUps(first.stages[0]), 1, 'the follow-up prompt is shown on its stage');
 
     // download → a real tar.gz with run.json, events, logs and results
     const res = await fetch(`${base}/api/runs/${first.id}/download`, { headers: AUTH });
@@ -532,7 +637,9 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     }
     const extracted = await sh('tar', ['-xzf', archive, '-C', dir]);
     assert.equal(extracted.code, 0, extracted.err);
-    assert.equal(JSON.parse(await readFile(join(dir, `run-${first.id}`, 'run.json'), 'utf8')).id, first.id);
+    const downloaded = JSON.parse(await readFile(join(dir, `run-${first.id}`, 'run.json'), 'utf8'));
+    assert.equal(downloaded.id, first.id);
+    assert.equal(downloaded.request, undefined, 'the download has the simple run JSON too');
     const all = (await sh('tar', ['-xzOf', archive])).out;
     assert.ok(!all.includes(TOKEN) && !all.includes(PASSKEY) && !all.includes(API_KEY), 'secret inside the download');
 

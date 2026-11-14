@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in curl: the engine always answers /api/health.
+exit 0

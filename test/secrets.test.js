@@ -92,3 +92,52 @@ test('bad or missing secrets are refused', async () => {
   const noSecrets = await worker([], { env: {}, input: '' });
   assert.equal(noSecrets.code, 4, noSecrets.stderr);
 });
+
+// ---- the user's own secrets (engine /api/secrets) ------------------------------------
+
+test('user secrets reach the agent as env vars, values exactly as given', async () => {
+  const tricky = `it's "quoted" $HOME \`id\` ; rm -rf / & | \\ é ✓\nsecond line`;
+  const input = secretsLine(settings, null, '', { BROWSERBASE_API_KEY: 'bb_live_test_123', TRICKY: tricky });
+  const r = await worker(['sh', '-c', 'echo "bb=$BROWSERBASE_API_KEY"; printf "%s" "$TRICKY" | base64 -w0; echo; echo "token=$CYSU_TOKEN"; id -un'], { input });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /^bb=bb_live_test_123$/m);
+  assert.ok(r.stdout.includes(Buffer.from(tricky).toString('base64')), 'the tricky value arrives byte for byte');
+  assert.match(r.stdout, new RegExp(`^token=${TOKEN}$`, 'm'));
+  assert.match(r.stdout, /^runner$/m, 'still runs as the agent user');
+  assert.match(r.stderr, /secrets for the agent: BROWSERBASE_API_KEY TRICKY/);
+  assert.ok(!r.stderr.includes('bb_live_test_123'), 'the value is never logged');
+});
+
+test('a secret can never replace the worker\'s own variables', async () => {
+  const input = secretsLine(settings, null, '', {
+    CYSU_TOKEN: 'hijacked', PATH: '/nowhere', OPENAI_API_KEY: 'x', LD_PRELOAD: '/tmp/x.so', lower_case: 'x', 'BAD-NAME': 'x', GOOD_ONE: 'ok',
+  });
+  const r = await worker(['sh', '-c', 'echo "token=$CYSU_TOKEN"; echo "path=$PATH"; echo "openai=${OPENAI_API_KEY:-<unset>}"; echo "ld=${LD_PRELOAD:-<unset>}"; echo "lower=${lower_case:-<unset>}"; echo "good=$GOOD_ONE"'], { input });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`^token=${TOKEN}$`, 'm'));
+  assert.doesNotMatch(r.stdout, /path=\/nowhere/);
+  assert.match(r.stdout, /^openai=<unset>$/m);
+  assert.match(r.stdout, /^ld=<unset>$/m);
+  assert.match(r.stdout, /^lower=<unset>$/m);
+  assert.match(r.stdout, /^good=ok$/m);
+  assert.match(r.stderr, /ignored 6 secret\(s\) with a reserved or invalid name/);
+});
+
+test('user secrets are not in docker inspect, and no secrets still works', async () => {
+  const name = `cysu-secrets-inspect-${randomBytes(4).toString('hex')}`;
+  containers.push(name);
+  const child = spawn('docker', ['run', '-i', '--name', name, ...hardeningArgs(),
+    '-e', 'CYSU_WORKER_TEST_BOOTSTRAP=0', '-e', 'CYSU_SECRETS=stdin', IMAGE, 'sh', '-c', 'echo up; sleep 30'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  child.stdin.end(secretsLine(settings, null, '', { INSPECT_ME: 'value-that-must-not-leak' }));
+  await new Promise((resolve) => child.stdout.once('data', resolve));
+  const inspect = await docker(['inspect', name]);
+  assert.equal(inspect.code, 0, inspect.stderr);
+  assert.ok(!inspect.stdout.includes('value-that-must-not-leak'), 'not in docker inspect');
+  assert.ok(!inspect.stdout.includes('INSPECT_ME'), 'not even the name');
+  child.kill('SIGKILL');
+  await docker(['rm', '-f', name]);
+
+  const none = await worker(['sh', '-c', 'echo "none=${BROWSERBASE_API_KEY:-<unset>}"']);
+  assert.equal(none.code, 0, none.stderr);
+  assert.match(none.stdout, /^none=<unset>$/m);
+});

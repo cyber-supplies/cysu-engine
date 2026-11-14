@@ -173,12 +173,12 @@ test('HTTP login endpoints: auth, code validation, successful persistence, resta
     if (inContainer) {
       const started = await docker(['run', '-d', '--name', container, '--init', '-p', `127.0.0.1:${port}:8787`,
         '-v', '/var/run/docker.sock:/var/run/docker.sock', '-v', `${dataVolume}:/data`,
-        '-e', `CYSU_API_URL=${fakeApi.url}`, '-e', `CYSU_ENGINE_IMAGE=${image}`, '-e', 'CYSU_ENGINE_TEST_NO_FIREWALL=1', 'cysu-engine:dev']);
+        '-e', `CYSU_API_URL=${fakeApi.url}`, '-e', `CYSU_ENGINE_IMAGE=${image}`, '-e', 'CYSU_ENGINE_TEST_NO_FIREWALL=1', '-e', 'CYSU_CLI_VERSION=image', 'cysu-engine:dev']);
       assert.equal(started.ok, true, started.stderr);
       await waitFor(() => fetch(`http://127.0.0.1:${port}/api/health`).then((r) => r.ok, () => false));
       return { container };
     }
-    const server = spawn(process.execPath, ['server/index.js'], { env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_API_URL: fakeApi.url, CYSU_ENGINE_IMAGE: image, CYSU_ENGINE_TEST_NO_FIREWALL: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const server = spawn(process.execPath, ['server/index.js'], { env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_API_URL: fakeApi.url, CYSU_ENGINE_IMAGE: image, CYSU_ENGINE_TEST_NO_FIREWALL: '1', CYSU_CLI_VERSION: 'image' }, stdio: ['ignore', 'pipe', 'pipe'] });
     server.stdout.on('data', (b) => { output += b; }); server.stderr.on('data', (b) => { output += b; });
     await waitFor(() => fetch(`http://127.0.0.1:${port}/api/health`).then((r) => r.ok, () => false));
     return server;

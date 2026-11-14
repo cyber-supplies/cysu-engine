@@ -189,10 +189,23 @@ locked until the installer is run again.
 | `sh scripts/engine.sh stop` | stop it (a run in progress is cancelled) |
 | `sh scripts/engine.sh start` | start it again — your settings, logins and runs are kept |
 | `sh scripts/engine.sh logs` | follow its log |
-| `sh scripts/engine.sh update` | use a newer engine image (data is kept) |
+| `sh scripts/engine.sh update` | download the newest engine image and switch to it (data is kept; if the download fails, the running engine is left as it is) |
 | `sh scripts/engine.sh reset-auth` | remove the token and lock API access until `install.sh --token` is run again (other data is kept) |
 
 It also restarts by itself after a reboot (`--restart unless-stopped`).
+
+## The Cyber Supplies CLI inside runs
+
+Each run's agents use the newest `cysu` CLI release. The engine checks npm at
+most once an hour and downloads a new release **once** (a few seconds) into
+the Docker volume `cysu-engine-cli`, with the skill of that same version;
+every stage of a run uses the same version. No new worker image is needed for
+a CLI release. If npm or GitHub cannot be reached, runs use the newest version
+already downloaded, or else the copy inside the worker image. The run log
+says which one (`[engine] Cyber Supplies CLI: …`).
+
+To choose: `CYSU_CLI_VERSION=0.6.3 sh scripts/engine.sh update` (an exact
+version) or `CYSU_CLI_VERSION=image` (only the worker image's copy).
 
 ## Where your data is
 
@@ -222,6 +235,28 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
 - **Workers are locked down.** Each stage runs in a fresh container as an
   unprivileged user, with a firewall that blocks your machine, your local
   network and cloud metadata addresses (the internet stays reachable).
+- **Agents get a restricted token by default.** Each worker gives its agent
+  your Cyber Supplies **LLM token** (`llm_…`), which the engine fetches with
+  your user token when the worker starts (it is never saved). The agent can
+  read your profiles, accounts and emails but not change them. To give agents
+  your full user token instead: `PUT /api/settings {"agentToken": "user"}`
+  (`"llm"` switches back).
+- **Engine linked (off by default) lets agents learn from earlier runs.**
+  With `PUT /api/settings {"engineLinked": true}` (or `"engineLinked": true`
+  on one run or workspace request), each stage's agent can **read** this
+  engine's earlier runs of the **same workspace**: their results, transcripts
+  and logs. It cannot start, change or delete anything, see other
+  workspaces, or touch settings. How it works: the engine puts itself and
+  the worker on a private Docker network (`cysu-engine-net`) and opens a
+  second, read-only port (8788) there only; the worker's firewall lets
+  through that one address and port. The agent gets `CYSU_ENGINE_URL` and a
+  read-only key `CYSU_ENGINE_TOKEN` (`usr_engine_…`, not a Cyber Supplies
+  token) that stops working when the stage ends:
+  `cysu engine list-runs --token "$CYSU_ENGINE_TOKEN"`. Linked workers also
+  get an `engine-history` skill that tells the agent this. It needs the engine
+  running as its container (`scripts/engine.sh`); otherwise stages run
+  without it and say so in their log. Keep in mind that earlier transcripts
+  hold whatever earlier agents printed.
 - **Worker tools refresh at startup.** Each worker resolves and installs the
   latest published `cysu` CLI before running a stage, then installs the Cyber
   Supplies proxy and its CA using the run token. Worker startup needs access

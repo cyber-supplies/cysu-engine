@@ -63,7 +63,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Worker image (Node, Go, Python, ProjectDiscovery, cysu, Codex)
+      - name: Worker image (Node, Go, Python, ProjectDiscovery, cysu, Codex, Claude Code)
         uses: docker/build-push-action@v7
         with:
           context: image

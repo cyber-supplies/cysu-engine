@@ -10,63 +10,18 @@ The full contract is [`openapi.yaml`](../openapi.yaml). The flow below is
 exercised end to end by [`test/cli-journey.test.js`](../test/cli-journey.test.js):
 if that test passes, the CLI only has to make the same calls.
 
-## What changed for the `engine` branch of cysu-cli
+## Current CLI migration
 
-The `engine` branch (commit `2f03bbb`, 2026-11-03: `cysu engine
-get-workflows`, `create-workflow`, `run`, …) was written before the engine
-got authentication. It already matches the rest of this document (workspaces
-by full UUID only, no chat, PATCH sends back the whole request, short run
-ids). These changes are needed for it to work with the engine now:
+The current CLI main (`c99724f`, audited 2026-11-14) already sends bearer
+headers, accepts HTTPS URLs, keeps objectives on runs, uses `llm.ready` and
+preserves arbitrary workflow request fields. It still attempts obsolete HTTP
+token enrollment, only authenticates Codex, and drops Claude's native events
+when exporting transcripts.
 
-1. **Send the token on every request.** In `engineSend`, add the user token
-   (the one `enginePreflight` already resolves from `--token` / `CYSU_TOKEN`):
-
-   ```go
-   req.Header.Set("Authorization", "Bearer "+token)
-   ```
-
-   Without it every request is `401` once the engine is set up. Keep the
-   token out of `traceRequest` output (it is a header now).
-2. **Never enroll or rotate a token over HTTP (v3 / API 0.13).** Remove
-   automatic `PUT /api/settings {"token": ...}` from `enginePreflight` and
-   any setup/auth command. Instead:
-
-   ```
-   GET /api/status  (with the header)
-     200                          → proceed with this token
-     401 setupRequired: true      → tell the user to run install.sh --token on the engine host
-     401 setupRequired: false     → missing/wrong token; use the installed token or rerun the installer
-     429                          → locked for retryAfter seconds (10 wrong tokens in a minute)
-   ```
-
-   A `token` field in an authenticated settings update is now rejected with
-   `400`, even if unchanged. Send only passkey, LLM and other editable fields.
-3. **Errors to show as they are:** `401` / `429` / `502` bodies have an
-   `error` written for the user (see *Authentication*). A `502` saying
-   Cyber Supplies refused the token means the user needs a new one,
-   provisioned locally with `sudo sh install.sh --token usr_NEW_TOKEN`.
-4. **`create-workflow` / `edit-workflow --profile`** send stages as
-   `{"profile"}` without a tag. That works, but per-tag models and
-   follow-ups (`modelOverrides`, `reprompts`) then skip those stages. To keep
-   tags, either send `{"profile", "tag"}` (the tag from `GET /api/profiles`
-   when the profile has exactly one tag `1`–`4`) or add the profiles with
-   `POST /api/workspaces/<id>/profiles {"add": [...]}`, which fills the tags in.
-5. Small: the `--name` usage says "creates and **selects** the workflow";
-   there is no selection any more. `engine auth` only offers the Codex
-   sign-in, and the preflight requires `llm.mode == "codex"`; the engine also
-   accepts an OpenAI API key (`PUT /api/settings {"llm": {"mode":
-   "openai-api-key", "apiKey": "sk-…"}}`), so `llm.ready` from
-   `GET /api/status` is the better check.
-6. **The objective moved from the workspace to the run (engine API 0.12).**
-   A workspace is now a blank template; the user gives the objective each
-   time they start a run. `create-workflow` / `edit-workflow` must not send
-   `prompt` in the request (a non-empty one → 400 "A workspace has no
-   objective; give it when you start a run"), and `run` must send it:
-   `POST /api/workspaces/<id>/run {"objective": "…"}` (without one → 400
-   "Give the run an objective"). Schedules carry their own `objective`. See
-   *Starting a run* and *Scheduled runs* below.
-7. The branch starts from `main` as of 2026-10-16 (`285392e`) and is 7
-   commits behind it now; expect to rebase or merge before opening the PR.
+See [CLI migration for engine v3](CLI-MIGRATION-v3.md) for the verified gaps,
+provider auth contracts, source links and acceptance tests. The command names
+and slash-command flows below describe the client integration contract; they
+are not all implemented in the current CLI.
 
 ## Basics
 
@@ -169,7 +124,26 @@ rerun the same installer with a new `--token`; HTTP clients then use that token.
    - **OpenAI API key:** hidden input →
      `PUT /api/settings {"llm": {"mode": "openai-api-key", "apiKey": "sk-…"}}`.
    - **Claude subscription:** use the native Claude login flow below.
-3. `GET /api/status` again; `configured` should now be `true`.
+3. **Agent token** (optional, e.g. `/setup agent-token llm|user`):
+   `PUT /api/settings {"agentToken": "llm" | "user"}`. `llm` (the default):
+   agents get the user's restricted `llm_` token, which the engine fetches
+   from Cyber Supplies when each worker starts; they can read profiles,
+   accounts and emails but not change them. `user`: the full user token.
+   Show the current value from `GET /api/settings` (`agentToken`). A stage
+   whose lookup fails ends with an error saying to switch to `user`; each
+   stage records which it got (`stages[].agentToken`).
+4. **Engine linked** (optional, e.g. `/setup engine-linked on|off`):
+   `PUT /api/settings {"engineLinked": true | false}` (default `false`).
+   On: each stage's agent can read this engine's earlier runs of the same
+   workspace (read-only; see INSTALL.md). A run or workspace request can
+   override it with `"engineLinked": true | false`; each run records it
+   (`engineLinked`) and each stage whether it actually got the link
+   (`stages[].engineLinked`; false with a log line when the engine is not
+   running as its container). Inside the worker the agent uses the normal
+   commands with its stage key: `cysu engine list-runs --token
+   "$CYSU_ENGINE_TOKEN"` (`CYSU_ENGINE_URL` is already set); linked workers
+   get an `engine-history` skill (image/engine-history) that says so.
+5. `GET /api/status` again; `configured` should now be `true`.
 
 When configuring a workflow, offer Auto (default), Codex, Claude and OpenRouter.
 Save the explicit choice in `workspace.request.provider` as `codex`, `claude`,
@@ -247,7 +221,7 @@ prefix ≥ 4).
 | `/unload <id> <profile…>` | `… {"remove": [...]}` | the workspace |
 | `/run <id> [objective]` | `POST /api/workspaces/<id>/run {"objective"}` → the run | "started run `<first 8 of id>`", then `/watch` it. See *Starting a run* |
 | `/rerun [run]` | `POST /api/runs/<run>/rerun` → a new run | Same setup **and the same objective** as that run |
-| `/runs` | `GET /api/runs` | first 8 of `id`, `status`, `name`, `workspace.name`, `createdAt`, stage statuses; mark `trigger: "schedule"` runs |
+| `/runs` | `GET /api/runs` | first 8 of `id`, `status`, `name`, `workspace.name`, `startedAt` (`createdAt` while queued), stage statuses and `error`s; mark `trigger.type: "schedule"` runs |
 | `/watch [run]` | feed loop (below) | live progress; Ctrl-C stops watching, not the run |
 | `/cancel [run]` | `POST /api/runs/<run>/cancel` | "cancelling" |
 | `/download [run] [dir]` | `GET /api/runs/<run>/download` | saves `run-<id>.tar.gz` (run.json, per stage events/log/result) |
@@ -305,6 +279,8 @@ lists the request field each command changes.
 | `/stages <id> tags [--skip 3,4]` | sets `fromTags: {"skip": [...]}`, **deletes `stages`** | Stages come from the profile tags 1–4 (the global profile is left out). `/load` and `/unload` then answer 409 |
 | `/stages <id> picked` | sets `stages`, **deletes `fromTags`** | Start from the stages the tags give now (`plan.stages` → `[{"profile", "tag"}]`), so nothing is lost; then `/load` / `/unload` |
 | `/on-failure <id> continue\|stop` | `continueOnFailure` (`true` / `false`) | Default `continue`: a failed stage is recorded and the next stages still run |
+| `/daybreak <id> default\|standard\|blue\|red` | `daybreak` | OpenAI Daybreak program for every stage (see *Daybreak* below). `default` → remove it |
+| `/daybreak <id> --stage <1-4> <program>` | `daybreakOverrides` (`[{"stage": <int>, "daybreak"}]`) | Program for the stages with that tag, like `/model --stage`; `default` removes the entry |
 
 - Never send both `stages` and `fromTags` (the plan says "Send either stages
   or fromTags, not both").
@@ -323,6 +299,36 @@ lists the request field each command changes.
 - Per-stage settings (`model`, `reasoningEffort`, `fallbackModel`,
   `reprompts`) exist in the API (see `WorkspaceRequest` in `openapi.yaml`)
   but have no command yet; add them later if testers ask.
+
+### Daybreak (OpenAI Trusted Access for Cyber)
+
+`daybreak` picks the access program Codex asks OpenAI for: `default` (OpenAI
+decides), `standard` (off), `blue` (fewer refusals) or `red` (the cyber
+models). `blue` and `red` need an approved OpenAI account. What testers will
+hit (seen live):
+
+- **Red needs a cyber model and an API key.** `red` with a regular model is
+  refused with "You do not have Daybreak access", even for approved
+  accounts, and a cyber model (`gpt-5.6-cyber`) is refused on a ChatGPT
+  login. Red = `/model <id> gpt-5.6-cyber` + an OpenAI API key from a
+  Red-approved project. On a ChatGPT login, use `blue`.
+- The engine explains these errors: a failed stage has `hints` next to its
+  `error` (in `/runs/<run>`), and a `/watch` error item gets a `hint`. Show
+  the hint under the error.
+
+Access check (a few tokens per program, so only when the user asks, e.g.
+`/daybreak check [--model <m>]`):
+
+```
+POST /api/daybreak/check {"model": "gpt-5.6-cyber"}      (body optional)
+→ { "checkedAt", "model", "results": [ { "program": "standard"|"blue"|"red", "ok", "error", "hint" } ] }
+```
+
+Takes up to a few minutes (show a spinner). 409 while a run is active, or
+another check is running; runs started during a check also get 409 and
+scheduled runs wait. The last result is in `GET /api/status` →
+`daybreak.lastCheck` (`daybreak.checking` while one runs): show it in
+`/status`, e.g. `Daybreak: standard ✓ blue ✓ red ✗ (checked 10 Nov 14:02)`.
 
 ### Showing a workspace
 
@@ -435,21 +441,73 @@ func localTZ() string {
 only run while the engine is running. Times that pass while the computer is
 off or asleep are skipped and noted, not run late.
 
-Runs started by a schedule have `"trigger": "schedule"` and `"schedule":
-{"id", "name"}` (user runs: `"trigger": "user"`). Mark them in `/runs`, e.g.
+Runs started by a schedule have `"trigger": {"type": "schedule", "id", "name"}`
+(user runs: `"trigger": {"type": "user"}`). Mark them in `/runs`, e.g.
 `⏱ <schedule name>`.
+
+### Run JSON (after 0.3.2)
+
+`GET /api/runs/<run>` (and create, rerun, cancel) shows each fact once and
+leaves out empty and default values, so check for a field before using it:
+
+```json
+{ "id", "name", "status", "trigger": {"type": "user"}, "workspace": {"id", "name"},
+  "model"?, "reasoningEffort"?, "startedAt", "finishedAt", "objective",
+  "stages": [{ "index", "profile", "status", "error"?, "daybreak"?, "durationSec",
+               "exitCode", "result", "threadId"?, "usage"?, "eventCount" }] }
+```
+
+`GET /api/runs` has the same top fields without `objective`, and each stage
+only as `{index, profile, status, error?}`. A stage's `model` /
+`reasoningEffort` appear only when it used something other than the run's.
+Gone from the API (still kept by the engine): `request`, `prompt` (use
+`objective`), `stageCount` (use `stages.length`), `schedule` (now in
+`trigger`), `source`, `skip`, `modelOverrides`, `daybreakOverrides`, the
+run-level `daybreak`, and per stage `tag`, `prompt`, `errors` (now one
+`error`), `turns`, `container`. The full plan is still `POST /api/runs/plan`.
+
+### Secrets (for skills)
+
+New after engine 0.3.2 (not released yet). The user's own secrets, e.g. an
+API key a profile's skill needs. Each one reaches **every stage's agent as an
+environment variable** of that name, so the skill says `$BROWSERBASE_API_KEY`
+instead of carrying the key in its text (where the agent reads it and it ends
+up in run events, downloads and engine-linked reads). The engine keeps the
+values on the user's machine and **never returns them**; anywhere a value
+shows up in a stage's events, log or result, the engine saves
+`[secret:NAME]` instead (values under 6 characters are not masked).
+
+| Command | Request | Show |
+|---|---|---|
+| `/secrets` | `GET /api/secrets` | one line each: `name`, `updatedAt` (there are no values to show) |
+| `/secret set <NAME>` | `PUT /api/secrets/<NAME> {"value": "..."}` | "saved" + `updatedAt`. **Read the value without echo** (like a password prompt), or from `--file <path>` / stdin; never take it as a command-line argument (shell history, `ps`) |
+| `/secret delete <NAME>` | `DELETE /api/secrets/<NAME>` → 200 / 404 | "deleted" |
+
+Names are environment variable names: `A-Z`, `0-9`, `_`, starting with a
+letter, at most 64. Reserved (400): `PATH`, `HOME`, proxy variables and
+anything starting with `CYSU_`, `OPENAI_`, `CODEX_`, `NODE_`, `NPM_`, `LD_`,
+`GIT_`, `PYTHON`, `PERL`, `RUBY`, `BASH_`, `LC_`. At most 50 secrets, 16 KiB
+each. A change applies from the next stage that starts. With the
+non-interactive style: `get-secrets`, `set-secret`, `delete-secret`.
+
+**Moving a key out of a skill** (e.g. the Browserbase skill): set it with
+`/secret set BROWSERBASE_API_KEY`, then change the skill's text from the key
+itself to the variable, e.g. `X-BB-API-Key: $BROWSERBASE_API_KEY` or
+`"apiKey": process.env.BROWSERBASE_API_KEY`, and add a line such as "the key
+is in the environment variable BROWSERBASE_API_KEY; never print it".
 
 ### `/watch` feed
 
 ```
 GET /api/runs/<run>/feed?cursor=<c>&wait=20000      (start with cursor "")
 → { "run": { "status", "stages": [ { "index", "profile", "tag", "status" } ] },
-    "items": [ { "stage", "profile", "kind", "text", "exitCode" } ],
+    "items": [ { "stage", "profile", "kind", "text", "exitCode", "hint" } ],
     "cursor": "<c>", "done": bool }
 ```
 
 Print items as they come (`kind`: `attempt` (first try / fallback / follow-up),
-`command` (`text` + `exitCode`), `message` (the stage agent's words), `error`,
+`command` (`text` + `exitCode`), `message` (the stage agent's words), `error`
+(with `hint` for a Daybreak access error: print it under the error),
 `turn`), print stage status changes from `run.stages`, continue with the new
 `cursor`, stop when `done` and no items.
 
@@ -461,7 +519,7 @@ Print items as they come (`kind`: `attempt` (first try / fallback / follow-up),
 | 401 | Engine token: `setupRequired: true` → run the installer on the host; `false` → missing/wrong token (see *Authentication*) |
 | 403 | Request looked like it came from a web page (wrong Host/Origin/content type) — a CLI bug |
 | 404 | No such workspace / schedule (not that exact id) / run |
-| 409 | Busy or conflicting: a run is already active, a name is taken, a short run id matches several runs, a tag-built workspace can't `/load`, 100 schedules already |
+| 409 | Busy or conflicting: a run or a Daybreak check is already active, a name is taken, a short run id matches several runs, a tag-built workspace can't `/load`, 100 schedules already |
 | 429 | Too many wrong tokens: locked for `retryAfter` seconds, every request refused |
 | 502 | Cyber Supplies refused the stored token (revoked? → `install.sh --token` on the host), was unreachable, or answered badly |
 | 503 | Docker is not available |

@@ -7,6 +7,8 @@
 # With CYSU_SECRETS=stdin the engine writes ONE JSON line to the
 # container's stdin and closes it:
 #   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "openrouterApiKey": "..." | "codexAuth": {...}}
+# engineKey (engine linked only) becomes CYSU_ENGINE_TOKEN: a read-only key for
+# this stage's engine access, revoked by the engine when the stage ends.
 # The passphrase is used once, by `cysu key init` as runner, to create
 # ~/.config/cysu/master.key; no long-lived process ever holds it. The LLM
 # login is installed in ~/.codex/auth.json, or ~/.config/cysu/openrouter.key
@@ -17,6 +19,8 @@
 #
 # Other inputs (env, set by the engine, not secret):
 #   CYSU_STAGE_JSON     {profile, globalProfile, prompt, model, reasoningEffort, fallbackModel, reprompts}
+#   CYSU_ENGINE_URL     engine linked: the engine's agent address (read by `cysu engine`)
+#   CYSU_ENGINE_ALLOW   engine linked: <ip>:<port> the firewall lets through
 #   CYSU_EGRESS_GUARD   0 disables the outbound firewall (local debugging and tests only)
 #   CYSU_WORKER_TEST_BOOTSTRAP=0  skips CLI refresh and proxy install in tests
 #
@@ -37,7 +41,7 @@ as_runner() {
 }
 
 if [ "$(id -u)" = "0" ]; then
-  for name in CYSU_TOKEN CYSU_PASSPHRASE OPENAI_API_KEY OPENROUTER_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do
+  for name in CYSU_TOKEN CYSU_ENGINE_TOKEN CYSU_PASSPHRASE OPENAI_API_KEY OPENROUTER_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do
     if [ -n "$(printenv "$name" || true)" ]; then
       log "refusing to run: $name was passed as an env var (visible in docker inspect); send secrets on stdin with CYSU_SECRETS=stdin" >&2
       exit 4
@@ -53,19 +57,27 @@ if [ "$(id -u)" = "0" ]; then
     log "WARNING: egress firewall disabled (CYSU_EGRESS_GUARD=0)" >&2
   fi
 
-  # Resolve the npm latest tag at each worker start. A failed refresh must
-  # never leave the stage running with a stale CLI.
-  if [ "${CYSU_SECRETS:-}" = "stdin" ] && [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
-    log "installing the latest Cyber Supplies CLI"
-    if ! npm install -g --no-audit --no-fund --prefer-online @cyber-supplies/cysu@latest >/dev/null; then
-      log "refusing to run: could not install the latest Cyber Supplies CLI"
-      exit 4
-    fi
+  # The Cyber Supplies CLI: the version the engine chose for this run, from
+  # its cache volume (mounted read-only; CYSU_CLI_DIR=/opt/cysu-cache/<version>,
+  # see server/cli-cache.js), with the skill of that same version. If it is
+  # missing or does not run, the copy baked into this image is used instead.
+  CYSU_SKILL_DIR=/opt/cysu/skill
+  cli_dir=${CYSU_CLI_DIR:-}
+  case "$cli_dir" in /opt/cysu-cache/[0-9]*) ;; *) cli_dir= ;; esac
+  if [ -n "$cli_dir" ] && [ -x "$cli_dir/bin/cysu" ] && "$cli_dir/bin/cysu" help >/dev/null 2>&1; then
+    export PATH="$cli_dir/bin:$PATH"
+    if [ -f "$cli_dir/skill/SKILL.md" ]; then CYSU_SKILL_DIR=$cli_dir/skill; fi
+    log "Cyber Supplies CLI $(cat "$cli_dir/version" 2>/dev/null || echo '?') (the engine's copy)"
+  else
+    if [ -n "${CYSU_CLI_DIR:-}" ]; then log "the engine's CLI copy at ${CYSU_CLI_DIR} is not usable; using the one in this image" >&2; fi
+    log "Cyber Supplies CLI $(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$(npm root -g)/@cyber-supplies/cysu/package.json" 2>/dev/null | head -1) (the copy in this image)"
   fi
+  unset cli_dir CYSU_CLI_DIR
+  export CYSU_SKILL_DIR
 
   # The cysu skill, copied into the home dir at start (see Dockerfile: folders
   # from the image layer cannot be swapped by `cysu profiles install`).
-  as_runner sh -c 'for d in "$HOME/.codex/skills" "$HOME/.agents/skills"; do mkdir -p "$d" && cp -R /opt/cysu/skill "$d/cysu"; done'
+  as_runner sh -c 'for d in "$HOME/.codex/skills" "$HOME/.agents/skills"; do mkdir -p "$d" && cp -R "$CYSU_SKILL_DIR" "$d/cysu"; done'
 
   if [ "${CYSU_SECRETS:-}" = "stdin" ]; then
     secrets=$(head -n 1)
@@ -74,7 +86,26 @@ if [ "$(id -u)" = "0" ]; then
     passphrase=$(field passphrase)
     openai_key=$(field openaiApiKey)
     openrouter_key=$(field openrouterApiKey)
+    engine_key=$(field engineKey)
     codex_auth=$(printf '%s' "$secrets" | jq -c '.codexAuth // empty | objects' 2>/dev/null || true)
+    # The user's own secrets (engine /api/secrets) -> environment variables
+    # for the agent. jq keeps only env-var names the worker does not use
+    # itself (checked again here, as in server/secrets.js) and quotes each
+    # value for the shell (@sh), so any value is exported exactly as given.
+    user_secret_filter='.env // {} | objects | to_entries[]
+      | select(.value | type == "string")
+      | select(.key | test("^[A-Z][A-Z0-9_]{0,63}$"))
+      | select(.key | IN("PATH","HOME","USER","LOGNAME","SHELL","PWD","OLDPWD","TERM","LANG","TZ","TMPDIR","IFS","ENV","BASH_ENV","PS4","HTTP_PROXY","HTTPS_PROXY","NO_PROXY","ALL_PROXY","SSL_CERT_FILE","SSL_CERT_DIR") | not)
+      | select(.key | test("^(CYSU_|OPENAI_|OPENROUTER_|ANTHROPIC_|CLAUDE_|CODEX_|NODE_|NPM_|LD_|GIT_|PYTHON|PERL|RUBY|BASH_|LC_)") | not)'
+    user_secret_exports=$(printf '%s' "$secrets" | jq -r "$user_secret_filter | \"export \\(.key)=\\(.value | @sh)\"" 2>/dev/null || true)
+    user_secret_names=$(printf '%s' "$secrets" | jq -r "[$user_secret_filter | .key] | join(\" \")" 2>/dev/null || true)
+    user_secret_given=$(printf '%s' "$secrets" | jq -r '.env // {} | objects | keys | length' 2>/dev/null || echo 0)
+    user_secret_kept=$(printf '%s' "$secrets" | jq -r "[$user_secret_filter] | length" 2>/dev/null || echo 0)
+    eval "$user_secret_exports"
+    if [ "${user_secret_given:-0}" -gt "${user_secret_kept:-0}" ]; then
+      log "ignored $((user_secret_given - user_secret_kept)) secret(s) with a reserved or invalid name" >&2
+    fi
+    unset user_secret_filter user_secret_exports user_secret_given user_secret_kept
     unset secrets
     if [ -z "$token" ] || [ -z "$passphrase" ]; then
       log "refusing to run: secrets on stdin must be a JSON line with token and passphrase" >&2
@@ -129,6 +160,15 @@ if [ "$(id -u)" = "0" ]; then
 
     export CYSU_TOKEN="$token"
     unset token
+    # Engine linked: the stage's read-only engine key (for `cysu engine
+    # --token "$CYSU_ENGINE_TOKEN"` against CYSU_ENGINE_URL). Only with a URL.
+    if [ -n "$engine_key" ] && [ -n "${CYSU_ENGINE_URL:-}" ]; then
+      export CYSU_ENGINE_TOKEN="$engine_key"
+      log "engine linked: read-only access to earlier runs at $CYSU_ENGINE_URL"
+    fi
+    unset engine_key
+    if [ -n "$user_secret_names" ]; then log "secrets for the agent: $user_secret_names"; fi
+    unset user_secret_names
 
     if [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
       # cysu installs the proxy CA and the managed /etc/environment block.
@@ -145,7 +185,9 @@ if [ "$(id -u)" = "0" ]; then
         exit 4
       fi
       export http_proxy="$proxy_url" https_proxy="$proxy_url" HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url"
-      export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+      # Engine linked: the engine is on the local Docker network, never via the proxy.
+      no_proxy=localhost,127.0.0.1,::1${CYSU_ENGINE_ALLOW:+,${CYSU_ENGINE_ALLOW%:*}}
+      export no_proxy NO_PROXY="$no_proxy"
       unset proxy_url
       if ! as_runner cysu proxy status | jq -e '.installed == true and .active == true' >/dev/null; then
         log "refusing to run: the Cyber Supplies proxy is not active"
@@ -187,6 +229,41 @@ log "tools: node $(node -v), go $(go version | cut -d' ' -f3), python $(python3 
 # stdout carries ONLY JSONL: Codex's events plus engine.attempt /
 # engine.attempt.finished markers. [engine] lines, cysu output and Codex
 # stderr go to stderr.
+# ---- Daybreak access check ----------------------------------------------------
+# CYSU_DAYBREAK_CHECK_JSON (not secret): {"programs": ["standard","blue","red"], "model": "..."}
+# Asks Codex for a one-word reply once per access program (a few tokens each)
+# and prints one JSON line per program on stdout:
+#   {"type":"engine.daybreak.check","program":"red","ok":false,"exitCode":1,"error":"..."}
+if [ -n "${CYSU_DAYBREAK_CHECK_JSON:-}" ]; then
+  check_model=$(printf '%s' "$CYSU_DAYBREAK_CHECK_JSON" | jq -r '.model // empty | strings')
+  if [ -n "$check_model" ] && ! printf '%s' "$check_model" | grep -Eq '^[A-Za-z0-9._:/-]{1,120}$'; then
+    log "refusing to run: invalid model name" >&2
+    exit 5
+  fi
+  mkdir -p /tmp/daybreak-check
+  for program in $(printf '%s' "$CYSU_DAYBREAK_CHECK_JSON" | jq -r '.programs // [] | .[] | strings'); do
+    case "$program" in
+      standard) flag=standard ;;
+      blue) flag=daybreak_blue ;;
+      red) flag=daybreak_red ;;
+      *) log "refusing to run: unknown Daybreak program" >&2; exit 5 ;;
+    esac
+    set -- codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C /tmp/daybreak-check --cyber-access-program "$flag"
+    [ -z "$check_model" ] || set -- "$@" --model "$check_model"
+    out=/tmp/daybreak-check/$program.jsonl
+    log "checking Daybreak $program${check_model:+ (model $check_model)}" >&2
+    rc=0
+    printf 'Reply with the single word OK and nothing else. Do not run any commands.' | timeout 120 "$@" - > "$out" 2>/dev/null || rc=$?
+    error=$(jq -Rrn '[inputs | fromjson? | select(.type? == "turn.failed" or .type? == "error") | (.error.message? // .message?) | strings] | last // empty' "$out")
+    failed=$(jq -Rn '[inputs | fromjson? | select(.type? == "turn.failed")] | length' "$out")
+    [ "$rc" = 0 ] && [ "$failed" = 0 ] && ok=true || ok=false
+    [ "$rc" != 124 ] || error=${error:-"no answer within 120 seconds"}
+    jq -cn --arg program "$program" --argjson ok "$ok" --argjson exitCode "$rc" --arg error "$error" \
+      '{type: "engine.daybreak.check", program: $program, ok: $ok, exitCode: $exitCode, error: $error}'
+  done
+  exit 0
+fi
+
 if [ -z "${CYSU_STAGE_JSON:-}" ]; then
   log "workspace ready (no stage given)"
   exit 0
@@ -284,8 +361,18 @@ if has_cysu_skill; then
 else
   skill_dir="$HOME/.agents/skills"
   [ "$provider" != claude ] || skill_dir="$HOME/.claude/skills"
-  mkdir -p "$skill_dir" && cp -R /opt/cysu/skill "$skill_dir/cysu"
+  mkdir -p "$skill_dir" && cp -R "${CYSU_SKILL_DIR:-/opt/cysu/skill}" "$skill_dir/cysu"
   log "cysu skill: added the built-in one (the profiles did not include it)" >&2
+fi
+
+# Engine linked: the engine-history skill tells the agent how to read earlier
+# runs. Added after the profiles (a global profile replaces skill folders).
+if [ -n "${CYSU_ENGINE_TOKEN:-}" ] && [ -n "${CYSU_ENGINE_URL:-}" ]; then
+  history_dir="$HOME/.agents/skills"
+  [ "$provider" != claude ] || history_dir="$HOME/.claude/skills"
+  mkdir -p "$history_dir" && rm -rf "$history_dir/engine-history" &&
+    cp -R /opt/cysu/engine-history-skill "$history_dir/engine-history"
+  log "engine-history skill: added (engine linked)" >&2
 fi
 
 # Codex ignores /workspace/.codex/config.toml (the stage profile's MCP

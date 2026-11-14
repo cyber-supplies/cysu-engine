@@ -32,7 +32,7 @@ before(async () => {
   const port = 26000 + Math.floor(Math.random() * 500);
   base = `http://127.0.0.1:${port}`;
   if (IN_CONTAINER) {
-    const testEnv = { CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' };
+    const testEnv = { CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test', CYSU_CLI_VERSION: 'image', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' };
     execFileSync('docker', ['run', '-d', '--name', names.container, '--init', '-p', `127.0.0.1:${port}:8787`,
       '-v', '/var/run/docker.sock:/var/run/docker.sock', '-v', `${names.data}:/data`,
       ...Object.entries(testEnv).flatMap(([k, v]) => ['-e', `${k}=${v}`]), 'cysu-engine:dev']);
@@ -43,7 +43,7 @@ before(async () => {
     throw new Error(`engine container did not start: ${execFileSync('docker', ['logs', names.container]).toString()}`);
   }
   server = spawn(process.execPath, ['server/index.js'], {
-    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test',
+    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test', CYSU_CLI_VERSION: 'image',
       CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
     stdio: 'ignore',
   });

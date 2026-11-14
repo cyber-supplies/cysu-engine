@@ -70,3 +70,31 @@ export function orderProfiles(rows, { globalProfile = '', skip = [] } = {}) {
   stages.sort((a, b) => Number(a.tag) - Number(b.tag) || a.profile.localeCompare(b.profile));
   return stages;
 }
+
+// fetchLlmToken gets the user's own llm_ token (GET /api/tokens/llm, which
+// only a usr_ token may call). Workers get it instead of the usr_ token unless
+// the user chose agentToken "user". Fetched fresh for every worker and never
+// stored by the engine. Failures are 502s that say what to do.
+export async function fetchLlmToken(token, { apiUrl = API_URL, fetchImpl = fetch } = {}) {
+  if (!token) throw new ProfileError(400, 'Add your Cyber Supplies token first');
+  let response;
+  try {
+    response = await fetchImpl(new URL('/api/tokens/llm', apiUrl), {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (error) {
+    throw new ProfileError(502, `Could not reach Cyber Supplies to get your LLM token: ${error.message}`);
+  }
+  const data = await response.json().catch(() => null);
+  if (response.status === 401 || response.status === 403) {
+    throw Object.assign(new ProfileError(502, `Cyber Supplies did not accept your user token (${response.status}); it may have been revoked: set a new one with /setup`), { upstreamStatus: response.status });
+  }
+  if (response.status === 404) {
+    throw Object.assign(new ProfileError(502, 'Cyber Supplies has no LLM token for your account (or this API does not offer it yet). Set the agent token to "user" to run with your user token'), { upstreamStatus: 404 });
+  }
+  if (!response.ok) throw Object.assign(new ProfileError(502, `Cyber Supplies LLM token lookup failed (${response.status})`), { upstreamStatus: response.status });
+  const llm = typeof data?.token === 'string' ? data.token.trim() : '';
+  if (!llm.startsWith('llm_')) throw new ProfileError(502, 'Cyber Supplies returned an invalid LLM token');
+  return llm;
+}

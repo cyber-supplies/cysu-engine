@@ -9,6 +9,11 @@
 #   FAIL-TURN        emit turn.failed, exit 1      REFRESH-LOGIN  rewrite ~/.codex/auth.json
 #   FAIL-THIS-STAGE  (AGENTS.md) fail              HANG-THIS-STAGE (AGENTS.md) hang
 #   --model bad-model  fail (to exercise the fallback model)
+#   Daybreak check prompt ("Reply with the single word OK"): answers OK, except
+#     --cyber-access-program daybreak_red with a non-cyber model → OpenAI's real denial
+#   CYSU_ENGINE_URL set (engine linked): the report has engineUrl and its /api/health answer
+#   ENGINE-READ      (engine linked) read the engine with the stage key; report in engineRead
+#   --model daybreak-denied  fail with OpenAI's real "no Daybreak access" error (2026-11-08)
 [ "${1:-}" = "exec" ] || exec codex-real "$@"
 shift
 mode=new
@@ -16,9 +21,10 @@ if [ "${1:-}" = "resume" ]; then mode=resume; shift; fi
 
 # Parse the flags the engine uses; the thread ID (resume) is the last
 # argument before "-".
-model='' thread='' prev=''
+model='' thread='' prev='' program=''
 for arg in "$@"; do
   [ "$prev" = "--model" ] && model=$arg
+  [ "$prev" = "--cyber-access-program" ] && program=$arg
   [ "$arg" = "-" ] && thread=$prev
   prev=$arg
 done
@@ -29,6 +35,15 @@ emit() { printf '%s\n' "$1"; }
 emit "{\"type\":\"thread.started\",\"thread_id\":\"$thread\"}"
 emit '{"type":"turn.started"}'
 case "$prompt" in *SLEEP*) sleep 300 ;; esac
+# Prints the user secret BROWSERBASE_API_KEY the way an agent might (command
+# output, its own message, stderr), so the engine's masking can be checked.
+case "$prompt" in *ECHO-SECRET*)
+  emit "$(jq -cn --arg v "$BROWSERBASE_API_KEY" '{type: "item.completed", item: {type: "command_execution", command: "cat SKILL.md", aggregated_output: ("key: " + $v + "\n"), exit_code: 0}}')"
+  emit "$(jq -cn --arg v "$BROWSERBASE_API_KEY" '{type: "item.completed", item: {type: "agent_message", text: ("using " + $v)}}')"
+  echo "debug: BROWSERBASE_API_KEY=$BROWSERBASE_API_KEY" >&2
+  emit '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+  exit 0 ;;
+esac
 case "$prompt" in *PAUSE*) sleep 4 ;; esac
 case "$prompt" in *SUBSCRIPTION-QUOTA*)
   emit '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'
@@ -46,9 +61,45 @@ if [ "$model" = "bad-model" ] || [ "$model" = "test/bad-model" ]; then
   emit '{"type":"turn.failed","error":{"message":"model bad-model is not available"}}'
   exit 1
 fi
+case "$prompt" in "Reply with the single word OK"*)
+  case "$program:$model" in daybreak_red:*cyber*) ;; daybreak_red:*) model=daybreak-denied ;; esac
+  if [ "$model" != daybreak-denied ]; then
+    emit "$(jq -cn --arg p "$program" --arg m "$model" '{type: "item.completed", item: {type: "agent_message", text: "OK", program: $p, model: $m}}')"
+    emit '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":1}}'
+    exit 0
+  fi ;;
+esac
+if [ "$model" = "daybreak-denied" ]; then
+  err='{"type":"error","error":{"message":"You do not have Daybreak access. If you’re doing authorized security work, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying.","type":"invalid_request_error","param":"access_programs.cyber","code":"invalid_access_program"},"status":400}'
+  emit "$(jq -cn --arg m "$err" '{type: "error", message: $m}')"
+  emit "$(jq -cn --arg m "$err" '{type: "turn.failed", error: {message: $m}}')"
+  exit 1
+fi
 case "$prompt" in *FAIL-TURN*)
   emit '{"type":"turn.failed","error":{"message":"fake failure requested"}}'
   exit 1 ;;
+esac
+
+# ENGINE-READ (engine linked): read the engine like an agent would, with the
+# real cysu CLI and the stage's key, and try things it must not be able to do.
+engine_read=''
+case "$prompt" in *ENGINE-READ*)
+  other_run=$(printf '%s' "$prompt" | sed -n 's/.*OTHER=\([0-9a-f-]*\).*/\1/p')
+  first_run=$(cysu engine list-runs --token "$CYSU_ENGINE_TOKEN" 2>/dev/null | jq -r '[.[] | select(.status != "running" and .status != "queued")][0].id // empty')
+  engine_read=$(jq -n \
+    --arg key "${CYSU_ENGINE_TOKEN:-}" \
+    --arg status "$(cysu engine status --token "$CYSU_ENGINE_TOKEN" 2>&1)" \
+    --arg runs "$(cysu engine list-runs --token "$CYSU_ENGINE_TOKEN" 2>&1)" \
+    --arg workflows "$(cysu engine list-workflows --token "$CYSU_ENGINE_TOKEN" 2>&1)" \
+    --arg events "$(curl -sS -m 5 -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/runs/$first_run/stages/0/events" 2>&1)" \
+    --arg plain "$(cysu engine list-runs 2>&1)" \
+    --arg delete "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/runs/$first_run")" \
+    --arg settings "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/settings")" \
+    --arg withUserToken "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CYSU_TOKEN" "$CYSU_ENGINE_URL/api/runs")" \
+    --arg otherRun "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CYSU_ENGINE_TOKEN" "$CYSU_ENGINE_URL/api/runs/$other_run")" \
+    --arg skill "$(head -3 ~/.agents/skills/engine-history/SKILL.md 2>&1)" \
+    --arg getRun "$(cysu engine get-run --token "$CYSU_ENGINE_TOKEN" --run "$first_run" 2>&1)" \
+    '{skill:$skill,getRun:$getRun,otherRun:$otherRun,key:$key,status:$status,runs:$runs,workflows:$workflows,events:$events,plain:$plain,delete:$delete,settings:$settings,withUserToken:$withUserToken}')
 esac
 
 if [ "$mode" = resume ]; then
@@ -62,8 +113,11 @@ else
     --arg mcp "$(cd /workspace && codex-real mcp list 2>&1)" \
     --arg earlierAttempts "$(cat /workspace/.attempts 2>/dev/null)" \
     --arg cysuSkill "$(head -10 ~/.agents/skills/cysu/SKILL.md 2>/dev/null)" \
+    --arg engineUrl "${CYSU_ENGINE_URL:-}" \
+    --arg engineRead "$engine_read" \
+    --arg engineProbe "$([ -z "${CYSU_ENGINE_URL:-}" ] || curl -sS -m 5 "$CYSU_ENGINE_URL/api/health" 2>&1)" \
     --arg files "$(cd / && find /workspace ~/.codex ~/.agents -path '*/log' -prune -o -path '*/tmp' -prune -o -path '*/sessions' -prune -o -name .attempts -prune -o -type f -print 2>/dev/null | sort)" \
-    '{prompt:$prompt,args:$args,model:$model,cwd:$cwd,user:$user,workspaceAgents:$workspaceAgents,globalAgents:$globalAgents,mcp:$mcp,earlierAttempts:$earlierAttempts,cysuSkill:$cysuSkill,files:$files}')
+    '{prompt:$prompt,args:$args,model:$model,cwd:$cwd,user:$user,workspaceAgents:$workspaceAgents,globalAgents:$globalAgents,mcp:$mcp,earlierAttempts:$earlierAttempts,cysuSkill:$cysuSkill,engineUrl:$engineUrl,engineProbe:$engineProbe,engineRead:$engineRead,files:$files}')
 fi
 emit '{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"echo hi","exit_code":0}}'
 jq -cn --arg text "$report" '{type:"item.completed",item:{id:"item_1",type:"agent_message",text:$text}}'

@@ -54,3 +54,28 @@ test('fetchProfiles: token required, upstream errors mapped', async () => {
   await assert.rejects(fetchProfiles('t', { fetchImpl: async () => { throw new Error('ECONNREFUSED'); } }), (e) => e.status === 502 && /ECONNREFUSED/.test(e.message));
   assert.deepEqual(await fetchProfiles('t', { fetchImpl: fake(200, rows) }), rows);
 });
+
+// ---- fetchLlmToken (GET /api/tokens/llm) ------------------------------------
+import { fetchLlmToken } from '../server/profiles.js';
+
+const reply = (status, body) => async (url, init) => {
+  reply.last = { url: String(url), auth: init.headers.Authorization };
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+};
+
+test('fetchLlmToken: asks with the user token, returns the llm_ token', async () => {
+  assert.equal(await fetchLlmToken('usr_abc', { apiUrl: 'http://api.test', fetchImpl: reply(200, { token: ' llm_xyz ' }) }), 'llm_xyz');
+  assert.deepEqual(reply.last, { url: 'http://api.test/api/tokens/llm', auth: 'Bearer usr_abc' });
+});
+
+test('fetchLlmToken: every failure is a clear 502, never a token', async () => {
+  const fails = async (fetchImpl, re) => assert.rejects(fetchLlmToken('usr_abc', { fetchImpl }), (e) => e.status === 502 && re.test(e.message));
+  await fails(reply(401, {}), /did not accept your user token \(401\)/);
+  await fails(reply(403, {}), /did not accept your user token \(403\)/);
+  await fails(reply(404, {}), /no LLM token for your account.*agent token to "user"/);
+  await fails(reply(500, {}), /lookup failed \(500\)/);
+  await fails(reply(200, { token: 'usr_not-an-llm-token' }), /invalid LLM token/);
+  await fails(reply(200, {}), /invalid LLM token/);
+  await fails(async () => { throw new Error('ECONNREFUSED'); }, /Could not reach Cyber Supplies to get your LLM token: ECONNREFUSED/);
+  await assert.rejects(fetchLlmToken(''), (e) => e.status === 400);
+});

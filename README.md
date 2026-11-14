@@ -81,3 +81,6 @@ npm run test:image           # everything with Docker (~5 min)
 | `CYSU_API_URL`      | the Cyber Supplies gateway      |
 | `CYSU_ENGINE_DATA`  | `./data`                        |
 | `CYSU_ENGINE_IMAGE` | `cysu-engine-workspace:dev`     |
+| `CYSU_ENGINE_NETWORK` | `cysu-engine-net` (engine linked: the private network shared with workers) |
+| `CYSU_ENGINE_AGENT_PORT` | `8788` (engine linked: the read-only agent port, on that network only) |
+| `CYSU_ENGINE_CONTAINER` | the engine container's own name, when its hostname is not its id (engine linked) |

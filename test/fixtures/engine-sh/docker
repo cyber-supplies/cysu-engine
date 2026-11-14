@@ -1,0 +1,35 @@
+#!/bin/sh
+# Stand-in docker for engine.sh tests. State lives in $FAKE_DIR:
+#   image-<sanitized ref>  file holding the image id (present = image on this machine)
+#   exists / running       the cysu-engine container
+#   pull-<sanitized ref>   how a pull of that ref goes: ok:<new id> | denied | missing | network | other
+# Every call is appended to $FAKE_DIR/calls.
+d=$FAKE_DIR
+echo "$*" >> "$d/calls"
+key() { printf '%s' "$1" | tr '/:' '__'; }
+case "$1" in
+  info) exit 0 ;;
+  ps)
+    case "$*" in *-aq*) [ -f "$d/exists" ] && echo abc123 ;; *) [ -f "$d/running" ] && echo abc123 ;; esac; exit 0 ;;
+  image)
+    # docker image inspect [-f fmt] REF
+    ref=$(eval "echo \${$#}")
+    [ -f "$d/image-$(key "$ref")" ] || { echo "Error: No such image: $ref" >&2; exit 1; }
+    cat "$d/image-$(key "$ref")"; exit 0 ;;
+  pull)
+    ref=$2; how=$(cat "$d/pull-$(key "$ref")" 2>/dev/null || echo denied)
+    case "$how" in
+      ok:*) echo "${how#ok:}" > "$d/image-$(key "$ref")"; echo "Status: Downloaded newer image for $ref"; exit 0 ;;
+      denied) echo "Error response from daemon: Head \"https://ghcr.io/v2/x/manifests/latest\": denied" >&2; exit 1 ;;
+      unauth) echo "Error response from daemon: Head \"https://ghcr.io/v2/x/manifests/latest\": unauthorized" >&2; exit 1 ;;
+      missing) echo "Error response from daemon: manifest unknown" >&2; exit 1 ;;
+      network) echo "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp: lookup ghcr.io: no such host" >&2; exit 1 ;;
+      *) echo "Error response from daemon: something odd happened" >&2; exit 1 ;;
+    esac ;;
+  run) touch "$d/exists" "$d/running"; echo newcontainer; exit 0 ;;
+  start) touch "$d/running"; exit 0 ;;
+  stop) rm -f "$d/running"; exit 0 ;;
+  rm) rm -f "$d/exists" "$d/running"; exit 0 ;;
+  inspect) [ -n "${FAKE_WORKER:-}" ] && echo "CYSU_ENGINE_IMAGE=$FAKE_WORKER"; exit 0 ;;
+esac
+exit 0

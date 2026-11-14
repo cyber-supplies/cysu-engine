@@ -32,8 +32,8 @@ test('automatic order is Codex, Claude, OpenRouter; explicit selection never fal
 
 test('explicit credential isolation and Claude option validation', () => {
   const settings = { token: 'usr_test', passkey: 'pk', llm: { mode: 'codex', openrouter } };
-  assert.deepEqual(JSON.parse(secretsLine(settings, subscription, 'claude')), { token: 'usr_test', passphrase: 'pk' });
-  assert.deepEqual(JSON.parse(secretsLine(settings, subscription, 'openrouter')), { token: 'usr_test', passphrase: 'pk', openrouterApiKey: openrouter.apiKey });
+  assert.deepEqual(JSON.parse(secretsLine(settings, subscription, '', {}, 'claude')), { token: 'usr_test', passphrase: 'pk' });
+  assert.deepEqual(JSON.parse(secretsLine(settings, subscription, '', {}, 'openrouter')), { token: 'usr_test', passphrase: 'pk', openrouterApiKey: openrouter.apiKey });
   const stage = (input) => validateStage({ provider: 'claude', profile: 'attack', prompt: 'x', ...input });
   assert.throws(() => validateProviderStage(stage({}), settings.llm, subscription, false), /claude is not configured/);
   for (const daybreak of ['blue', 'red']) assert.throws(() => validateProviderStage(stage({ daybreak }), settings.llm, subscription, true), /Daybreak/);

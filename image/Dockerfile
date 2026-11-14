@@ -39,14 +39,23 @@ COPY --from=gotoolchain /usr/local/go /usr/local/go
 COPY --from=pd /go/bin/ /usr/local/bin/
 ENV PATH="/usr/local/go/bin:${PATH}"
 
-# The entrypoint refreshes the CLI on every start. Keep a baseline copy in the
-# image for test tooling and to make the image useful before a stage starts.
-# Command-backed provider auth and catalog discovery are tested with this release.
+# Stages use the engine CLI cache, with this baseline as fallback.
+# Provider harness versions are pinned and tested together.
 ARG CODEX_VERSION=0.167.0
 ARG CLAUDE_CODE_VERSION=2.1.325
 RUN npm install -g @cyber-supplies/cysu@latest @openai/codex@${CODEX_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
  && npm cache clean --force \
  && cysu help >/dev/null
+
+# Daybreak (stage setting `daybreak`) needs Codex >= 0.166, which added
+# --cyber-access-program to `codex exec` and `exec resume`. Fail the build
+# rather than ship an image whose stages would reject the flag.
+RUN v=$(codex --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) \
+ && printf '0.166.0\n%s\n' "$v" | sort -C -V \
+ || { echo "Codex ${v:-unknown} is too old: Daybreak needs 0.166.0 or newer" >&2; exit 1; } \
+ && codex exec --help | grep -q -- '--cyber-access-program' \
+ && codex exec resume --help | grep -q -- '--cyber-access-program' \
+ || { echo "This Codex has no --cyber-access-program flag (needed for Daybreak)" >&2; exit 1; }
 
 # Unprivileged user (fixed uid so engine-side files line up); the global
 # profile is installed as this user, workspace profiles go in /workspace.
@@ -56,6 +65,8 @@ RUN useradd -m -u 10001 -s /bin/bash runner \
  && chmod 0700 /home/runner/.claude
 COPY --chmod=755 entrypoint.sh /usr/local/bin/cysu-entrypoint
 COPY --chmod=755 egress-guard.sh /usr/local/bin/cysu-egress-guard
+# Engine linked: a skill added to linked workers only (see entrypoint.sh).
+COPY engine-history /opt/cysu/engine-history-skill
 
 # The cysu skill, from the public cysu-cli repo. It is kept OUTSIDE the home
 # directory and copied into ~/.codex/skills and ~/.agents/skills at container

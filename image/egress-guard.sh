@@ -5,6 +5,7 @@
 #
 # Allowed:  the public internet, loopback, and DNS to the nameservers in
 #           /etc/resolv.conf (home routers like 192.168.1.1 often serve DNS).
+#           With CYSU_ENGINE_ALLOW (engine linked): that one engine address:port.
 # Blocked:  the host and other containers, private LANs, link-local and cloud
 #           metadata (169.254.169.254), carrier-grade NAT, multicast, reserved.
 set -eu
@@ -22,6 +23,18 @@ for ns in $(nameservers | grep -v ':' || true); do
   iptables -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT
   iptables -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT
 done
+# Engine linked: CYSU_ENGINE_ALLOW=<IPv4>:<port> lets through that one
+# address and TCP port (the engine's agent port), before the blocks.
+if [ -n "${CYSU_ENGINE_ALLOW:-}" ]; then
+  engine_ip=${CYSU_ENGINE_ALLOW%:*}
+  engine_port=${CYSU_ENGINE_ALLOW##*:}
+  if ! printf '%s' "$engine_ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' ||
+     ! printf '%s' "$engine_port" | grep -Eq '^[0-9]{1,5}$'; then
+    echo "egress guard: CYSU_ENGINE_ALLOW must be <IPv4>:<port>" >&2
+    exit 1
+  fi
+  iptables -A OUTPUT -d "$engine_ip" -p tcp --dport "$engine_port" -j ACCEPT
+fi
 for cidr in $BLOCK_V4; do
   iptables -A OUTPUT -d "$cidr" -j REJECT
 done

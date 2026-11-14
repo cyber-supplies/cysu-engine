@@ -22,7 +22,7 @@ before(async () => {
   const port = 25000 + Math.floor(Math.random() * 500);
   base = `http://127.0.0.1:${port}`;
   server = spawn(process.execPath, ['server/index.js'], {
-    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
+    env: { ...process.env, PORT: String(port), CYSU_ENGINE_DATA: dir, CYSU_ENGINE_IMAGE: 'cysu-engine-workspace:test', CYSU_CLI_VERSION: 'image', CYSU_API_URL: api.url, CYSU_ENGINE_TEST_NO_FIREWALL: '1' },
     stdio: 'ignore',
   });
   for (let i = 0; i < 50; i++) {
@@ -132,7 +132,7 @@ test('/run: the objective comes with the run; the workspace stays a blank templa
   r = await http(ws(wsId, '/run'), 'POST', { objective: 'Map example.com (authorized).' });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   assert.equal(r.body.objective, 'Map example.com (authorized).');
-  assert.equal(r.body.request.objective, 'Map example.com (authorized).', '"run again" repeats it');
+  assert.equal(r.body.request, undefined, 'what was sent is stored for "run again", not shown');
   assert.deepEqual((await http(ws(wsId))).body.request, view.request, 'the workspace is unchanged');
   runId = r.body.id;
   assert.equal(r.body.name, 'My recon');

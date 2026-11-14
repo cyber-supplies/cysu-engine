@@ -2,7 +2,7 @@
 // Separate storage prevents settings/LLM writes from restoring an old token.
 import { load, save } from './store.js';
 
-const defaults = { passkey: '', llm: { mode: 'none', apiKey: '' }, globalProfile: '' };
+const defaults = { passkey: '', llm: { mode: 'none', apiKey: '' }, globalProfile: '', agentToken: 'llm', engineLinked: false };
 
 export async function loadSettings() {
   const settings = await load('settings', defaults);

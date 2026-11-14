@@ -6,35 +6,61 @@
 // token, provisioned by the installer): see auth.js and the request handler at the bottom.
 
 import { createServer } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { DATA_DIR } from './store.js';
+import { DATA_DIR, load, save } from './store.js';
 import { loadSettings, saveSettings } from './settings.js';
-import { dockerAvailable, IMAGE } from './docker.js';
-import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth, saveOpenRouterAuth, forgetOpenRouterAuth } from './llm.js';
+import { dockerAvailable, IMAGE, connectEngine, AGENT_PORT } from './docker.js';
+import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth, saveOpenRouterAuth, forgetOpenRouterAuth, keepRefreshedCodexAuth } from './llm.js';
 import { ClaudeLogin } from './claude-login.js';
 import { llmProvider, openRouterReady } from './llm-policy.js';
+import { checkDaybreak } from './daybreak.js';
 import { Runs } from './runs.js';
-import { API_URL, STAGE_TAGS, fetchProfiles } from './profiles.js';
+import { API_URL, STAGE_TAGS, fetchProfiles, fetchLlmToken } from './profiles.js';
 import { Workspaces, WorkspaceError } from './workspaces.js';
 import { Schedules } from './schedules.js';
 import { Scheduler } from './scheduler.js';
 import { bearerToken, sameToken, UNAUTHORIZED, oneAtATime, AuthLimiter, tooManyMessage } from './auth.js';
+import { runListItem, runDetail } from './run-view.js';
+import { listSecrets, setSecret, deleteSecret, secretValues } from './secrets.js';
+import { CliCache } from './cli-cache.js';
 
 const ENGINE_VERSION = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
 const claudeLogin = new ClaudeLogin();
+// agentToken: which Cyber Supplies token workers give the agent. "llm" (the
+// default): the user's restricted llm_ token, fetched fresh for each worker
+// and never stored; it can read profiles, accounts and emails but not change
+// them. "user": the full usr_ token.
+const AGENT_TOKENS = ['llm', 'user'];
+async function agentToken(settings) {
+  if ((settings.agentToken || 'llm') === 'user') return { kind: 'user', token: settings.token };
+  return { kind: 'llm', token: await fetchLlmToken(settings.token) };
+}
 
 const runs = new Runs({
   dir: join(DATA_DIR, 'runs'),
   getSecrets: async () => {
     const settings = await loadSettings();
-    return { settings, codexAuth: await loadCodexAuth(), claudeAuth: (await claudeLogin.authInfo()).saved };
+    return { settings, codexAuth: await loadCodexAuth(), claudeAuth: (await claudeLogin.authInfo()).saved, userSecrets: await secretValues() };
   },
   acquireClaude: () => claudeLogin.acquireVolume(),
+  agentToken,
   listProfiles: (settings) => fetchProfiles(settings.token),
   onIdle: () => scheduler.tick(),
+  cliCache: new CliCache(),
+  engineLink: async (run) => {
+    const { network, ip } = await connectEngine();
+    await listenForAgents(ip);
+    // One read-only key per stage, only in memory, revoked when the stage ends.
+    // It starts with usr_ only because the cysu CLI insists on that prefix for
+    // engine commands; it is NOT a Cyber Supplies token.
+    const key = `usr_engine_${randomBytes(32).toString('base64url')}`;
+    agentKeys.set(key, { runId: run.id, workspace: run.workspace ? { id: run.workspace.id, name: run.workspace.name } : null });
+    return { network, ip, port: AGENT_PORT, key, release: () => agentKeys.delete(key) };
+  },
 });
 
 const workspaces = new Workspaces();
@@ -101,6 +127,39 @@ async function scheduleView(s) {
   };
 }
 
+// The last Daybreak access check (POST /api/daybreak/check), for /status.
+async function daybreakStatus() {
+  const last = await load('daybreak-check', null);
+  return { checking: Boolean(runs.hold), lastCheck: last };
+}
+
+// runDaybreakCheck asks Codex for a one-word reply under each access program
+// (standard, blue, red) with the saved LLM login. It costs a few tokens, so it
+// only runs when asked. Runs wait meanwhile (one LLM login, one user of it).
+async function runDaybreakCheck(input) {
+  const { settings, codexAuth } = await runs.getSecrets();
+  const llmMode = settings.llm?.mode || 'none';
+  if (!settings.token || !settings.passkey) throw Object.assign(new Error('Set your Cyber Supplies token and passkey first'), { status: 400 });
+  if (!((llmMode === 'openai-api-key' && settings.llm?.apiKey) || (llmMode === 'codex' && codexAuth))) {
+    throw Object.assign(new Error('Set an LLM login first (OpenAI API key or Sign in with ChatGPT)'), { status: 400 });
+  }
+  if (runs.active || runs.creating) throw Object.assign(new Error('A run is active; check Daybreak access when it has finished'), { status: 409 });
+  if (runs.hold) throw Object.assign(new Error('A Daybreak check is already running'), { status: 409 });
+  if (!(await dockerAvailable())) throw Object.assign(new Error('Docker is not available on this machine'), { status: 503 });
+  if (runs.busy) throw Object.assign(new Error('The engine is busy; retry after the current operation'), { status: 409 });
+  runs.hold = 'A Daybreak access check is running; start the run again in a minute';
+  try {
+    const agent = await agentToken(settings);
+    const result = await checkDaybreak({ settings: { ...settings, token: agent.token }, codexAuth, model: input?.model });
+    await keepRefreshedCodexAuth(codexAuth, result.refreshedCodexAuth);
+    await save('daybreak-check', result);
+    return result;
+  } finally {
+    runs.hold = '';
+    scheduler.tick();
+  }
+}
+
 async function engineStatus() {
   const settings = await loadSettings();
   const llmMode = settings.llm?.mode || 'none';
@@ -111,6 +170,7 @@ async function engineStatus() {
     version: ENGINE_VERSION, docker: await dockerAvailable(), image: IMAGE, apiUrl: API_URL,
     cysu: cysuReady, llm: { mode: llmMode, ready: llmReady, provider },
     configured: cysuReady && llmReady, // everything a run needs is set up
+    daybreak: await daybreakStatus(),
   };
 }
 
@@ -125,6 +185,8 @@ async function publicSettings(s) {
     passkey: s.passkey ? 'set' : '',
     llm: { mode: s.llm?.mode || 'none', apiKey: mask(s.llm?.apiKey), codex: await codexAuthInfo(), openrouter: publicOpenRouter(s.llm), claude: await claudeLogin.authInfo() },
     globalProfile: s.globalProfile || '',
+    agentToken: s.agentToken || 'llm',
+    engineLinked: Boolean(s.engineLinked),
     configured: Boolean(s.token && s.passkey),
   };
 }
@@ -214,6 +276,14 @@ async function putSettings(req, res) {
     }
     if (input.llm?.apiKey) next.llm.apiKey = String(input.llm.apiKey).trim();
     if (input.globalProfile !== undefined) next.globalProfile = String(input.globalProfile);
+    if (input.agentToken !== undefined) {
+      if (!AGENT_TOKENS.includes(input.agentToken)) return send(res, 400, { error: 'agentToken must be llm or user' });
+      next.agentToken = input.agentToken;
+    }
+    if (input.engineLinked !== undefined) {
+      if (typeof input.engineLinked !== 'boolean') return send(res, 400, { error: 'engineLinked must be true or false' });
+      next.engineLinked = input.engineLinked;
+    }
     await saveSettings(next);
     return send(res, 200, await publicSettings(next));
   });
@@ -281,6 +351,28 @@ async function api(req, res, path) {
     if (req.method === 'DELETE') return send(res, 200, await claudeLogin.forget());
   }
 
+  // Daybreak access check: which access programs this LLM login can use.
+  if (path === '/api/daybreak/check') {
+    if (req.method === 'GET') return send(res, 200, await daybreakStatus());
+    if (req.method === 'POST') return send(res, 200, await runDaybreakCheck(hasBody(req) ? await body(req) : {}));
+  }
+
+  // The user's own secrets for their skills (names only out; see secrets.js).
+  if (path === '/api/secrets' && req.method === 'GET') return send(res, 200, await listSecrets());
+  const secretPath = path.match(/^\/api\/secrets\/([^/]+)$/);
+  if (secretPath) {
+    let name;
+    try { name = decodeURIComponent(secretPath[1]); } catch { return send(res, 400, { error: "Invalid secret name encoding" }); }
+    if (req.method === 'PUT') {
+      const input = hasBody(req) ? await body(req) : {};
+      return send(res, 200, await setSecret(name, input?.value));
+    }
+    if (req.method === 'DELETE') {
+      if (!(await deleteSecret(name))) return send(res, 404, { error: `No secret named ${name}` });
+      return send(res, 200, { deleted: name });
+    }
+  }
+
   // Profiles come from the user's Cyber Supplies account via the gateway.
   if (path === '/api/profiles' && req.method === 'GET') return send(res, 200, await fetchProfiles(settings.token));
 
@@ -336,7 +428,7 @@ async function api(req, res, path) {
     const ws = await workspaces.get(decodeURIComponent(m[1]));
     const objective = (await body(req))?.objective;
     if (typeof objective !== 'string' || !objective.trim()) return send(res, 400, { error: 'Give the run an objective: {"objective": "what this run should do"}' });
-    return send(res, 201, await startWorkspaceRun(ws, objective, null));
+    return send(res, 201, runDetail(await startWorkspaceRun(ws, objective, null)));
   }
 
   // ---- schedules (runs the engine starts by itself) -------------------------
@@ -377,14 +469,14 @@ async function api(req, res, path) {
       const trigger = q.get('trigger');
       if (trigger !== null && !['user', 'schedule'].includes(trigger)) return send(res, 400, { error: 'trigger must be user or schedule' });
       const schedule = q.get('schedule');
-      let list = await runs.list();
-      if (trigger) list = list.filter((r) => (r.trigger || 'user') === trigger);
-      if (schedule) list = list.filter((r) => r.schedule?.id === schedule);
+      let list = (await runs.list()).map(runListItem);
+      if (trigger) list = list.filter((r) => r.trigger.type === trigger);
+      if (schedule) list = list.filter((r) => r.trigger.id === schedule);
       return send(res, 200, list);
     }
     if (req.method === 'POST') {
       if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
-      return send(res, 201, await runs.create(await body(req)));
+      return send(res, 201, runDetail(await runs.create(await body(req))));
     }
   }
   if (path === '/api/runs/plan' && req.method === 'POST') return send(res, 200, await runs.plan(await body(req)));
@@ -393,12 +485,12 @@ async function api(req, res, path) {
   if (m && m[1] !== 'plan') {
     const id = await runs.resolve(m[1]);
     const rest = m[2] || '';
-    if (rest === '' && req.method === 'GET') return send(res, 200, await runs.get(id));
+    if (rest === '' && req.method === 'GET') return send(res, 200, runDetail(await runs.get(id)));
     if (rest === '' && req.method === 'DELETE') { await runs.delete(id); res.writeHead(204); return res.end(); }
-    if (rest === '/cancel' && req.method === 'POST') return send(res, 202, await runs.cancel(id));
+    if (rest === '/cancel' && req.method === 'POST') return send(res, 202, runDetail(await runs.cancel(id)));
     if (rest === '/rerun' && req.method === 'POST') {
       if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
-      return send(res, 201, await runs.rerun(id));
+      return send(res, 201, runDetail(await runs.rerun(id)));
     }
     if (rest === '/download' && req.method === 'GET') {
       const { filename, data } = await runs.download(id);
@@ -484,6 +576,113 @@ const moved = await workspaces.takeObjectives((found) => schedules.adoptObjectiv
 if (moved.size) console.log(`workspaces: moved ${moved.size} objective(s) out of workspaces (objectives are now given per run; schedules keep their own)`);
 await scheduler.start();
 
+// ---- agent listener (engine linked) -----------------------------------------
+// A second, separate listener for the agents inside "engine linked" workers.
+// It only listens on the engine's address on the private engine network (see
+// docker.js connectEngine), never on the published port, and never accepts the
+// engine token. Started the first time a stage is linked.
+let agentServer = null;
+let agentAddress = '';
+// agentKeys: read-only key → its scope { runId, workspace } (see engineLink).
+const agentKeys = new Map();
+
+// What an agent may see: runs of the same workspace as the run it is part of
+// (runs started without a workspace see the other runs without one).
+const inScope = (scope, run) => (run.workspace?.id || null) === (scope.workspace?.id || null);
+
+// scopedRunId resolves a full id or a short prefix among the runs in scope
+// only, so other workspaces' runs are never found (or counted).
+async function scopedRunId(scope, ref) {
+  const key = String(ref ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f-]{4,36}$/.test(key)) throw Object.assign(new Error('Run not found'), { status: 404 });
+  const hits = (await runs.list()).filter((r) => inScope(scope, r) && (r.id === key || r.id.startsWith(key)));
+  if (hits.length === 1) return hits[0].id;
+  if (hits.length > 1) throw Object.assign(new Error(`Several runs start with ${key}; give more characters`), { status: 409 });
+  throw Object.assign(new Error('Run not found'), { status: 404 });
+}
+
+// agentApi: the read-only API on the agent port (GET only). The same answers
+// as the engine API, narrowed to the key's workspace.
+async function agentApi(req, res, path, scope) {
+  if (req.method !== 'GET') return send(res, 403, { error: 'Read-only: an agent can look at earlier runs but not change anything' });
+  const q = new URL(req.url, 'http://localhost').searchParams;
+  if (path === '/api/status') {
+    return send(res, 200, { ...(await engineStatus()), agent: { readOnly: true, workspace: scope.workspace, runId: scope.runId } });
+  }
+  if (path === '/api/workspaces') {
+    return send(res, 200, (await workspaces.list()).filter((w) => w.id === scope.workspace?.id));
+  }
+  let m = path.match(/^\/api\/workspaces\/([^/]+)$/);
+  if (m) {
+    const id = decodeURIComponent(m[1]);
+    if (id !== scope.workspace?.id) return send(res, 404, { error: 'Workspace not found' });
+    return send(res, 200, await workspaceView(await workspaces.get(id)));
+  }
+  if (path === '/api/runs') {
+    const trigger = q.get('trigger');
+    if (trigger !== null && !['user', 'schedule'].includes(trigger)) return send(res, 400, { error: 'trigger must be user or schedule' });
+    const schedule = q.get('schedule');
+    let list = (await runs.list()).filter((r) => inScope(scope, r)).map(runListItem);
+    if (trigger) list = list.filter((r) => r.trigger.type === trigger);
+    if (schedule) list = list.filter((r) => r.trigger.id === schedule);
+    return send(res, 200, list);
+  }
+  m = path.match(/^\/api\/runs\/([\w-]+)(\/.*)?$/);
+  if (m) {
+    const id = await scopedRunId(scope, m[1]);
+    const rest = m[2] || '';
+    if (rest === '') return send(res, 200, runDetail(await runs.get(id)));
+    if (rest === '/feed') return send(res, 200, await runs.feed(id, { cursor: q.get('cursor') || '', wait: q.get('wait') }));
+    if (rest === '/download') {
+      const { filename, data } = await runs.download(id);
+      res.writeHead(200, { 'Content-Type': 'application/gzip', 'Content-Disposition': `attachment; filename="${filename}"`, 'Cache-Control': 'no-store' });
+      return res.end(data);
+    }
+    let s2 = rest.match(/^\/stages\/(\d+)\/events$/);
+    if (s2) return send(res, 200, await runs.events(id, s2[1], { after: q.get('after'), limit: q.get('limit') }));
+    s2 = rest.match(/^\/stages\/(\d+)\/log$/);
+    if (s2) {
+      const text = await runs.log(id, s2[1]);
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end(text);
+    }
+  }
+  return send(res, 404, { error: 'Not found (an agent can read: /api/status, /api/workspaces, /api/runs and a run\'s stages, events, log, feed, download)' });
+}
+
+const agentServerFor = (ip) => createServer(async (req, res) => {
+  const path = new URL(req.url, 'http://localhost').pathname;
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
+  if (req.headers.origin !== undefined) return send(res, 403, { error: 'Requests from web pages are not allowed' });
+  const host = String(req.headers.host || '');
+  if (host !== ip && host !== `${ip}:${AGENT_PORT}`) return send(res, 403, { error: `Unexpected Host header; use http://${ip}:${AGENT_PORT}` });
+  try {
+    if (path === '/api/health' && req.method === 'GET') return send(res, 200, { ok: true });
+    // Only a live stage key works here; the engine token never does.
+    const scope = agentKeys.get(bearerToken(req.headers.authorization) || '');
+    if (!scope) {
+      if (hasBody(req)) res.setHeader('Connection', 'close');
+      res.setHeader('WWW-Authenticate', 'Bearer realm="cysu-engine-agent"');
+      return send(res, 401, { error: 'This engine address needs the stage\'s engine key: cysu engine --token "$CYSU_ENGINE_TOKEN" …' });
+    }
+    if (hasBody(req)) res.setHeader('Connection', 'close'); // never read: every route is GET
+    if (path.startsWith('/api/')) return await agentApi(req, res, path, scope);
+    return send(res, 404, { error: 'Not found' });
+  } catch (error) {
+    if (!error.status) console.error(error);
+    if (res.headersSent) return res.end();
+    send(res, error.status || 500, { error: error.status ? error.message : 'Internal error' });
+  }
+});
+async function listenForAgents(ip) {
+  if (agentServer && agentAddress === ip) return;
+  if (agentServer) { await new Promise((resolve) => agentServer.close(resolve)); agentServer = null; }
+  const next = agentServerFor(ip);
+  await new Promise((resolve, reject) => { next.once('error', reject); next.listen(AGENT_PORT, ip, resolve); });
+  agentServer = next; agentAddress = ip;
+  console.log(`engine linked: agents can reach the engine at http://${ip}:${AGENT_PORT}`);
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`cysu-engine listening on http://${HOST}:${PORT}`);
 });
@@ -492,6 +691,7 @@ server.listen(PORT, HOST, () => {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, async () => {
     server.close();
+    agentServer?.close();
     scheduler.stop();
     await claudeLogin.cancel().catch(() => console.error('Could not clean up Claude login; it will be retried at startup'));
     await runs.close();

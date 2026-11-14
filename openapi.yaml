@@ -119,6 +119,19 @@ tags:
   - name: Engine
   - name: Settings
   - name: LLM login
+  - name: Secrets
+    description: |
+      The user's own secrets for their profiles' skills, e.g. an API key a
+      skill needs (`BROWSERBASE_API_KEY`). Each one reaches every stage's
+      agent as an environment variable of that name, so a skill says
+      `$BROWSERBASE_API_KEY` instead of carrying the key in its text. Values
+      are kept on this machine (DATA_DIR/secrets.json, 0600), are never
+      returned by the API, and are masked as `[secret:NAME]` in saved run
+      events and logs. Names are environment variable names (A-Z, 0-9, _;
+      starting with a letter; at most 64). Names the worker uses are
+      reserved: PATH, HOME, proxy variables, and anything starting with
+      CYSU_, OPENAI_, CODEX_, NODE_, NPM_, LD_, GIT_, PYTHON, PERL, RUBY,
+      BASH_ or LC_. At most 50 secrets, 16 KiB each.
   - name: Profiles
   - name: Runs
   - name: Workspaces
@@ -196,6 +209,7 @@ paths:
                       ready: { type: boolean, description: 'Credentials for the selected provider are saved; this does not verify remote account access' }
                       provider: { type: [string, 'null'], enum: [codex, claude, openrouter, openai, null], description: 'Default credential selection; an explicit workflow provider overrides this' }
                   configured: { type: boolean, description: Everything a run needs is set up (cysu and llm.ready) }
+                  daybreak: { $ref: '#/components/schemas/DaybreakStatus' }
 
   /api/settings:
     get:
@@ -234,6 +248,8 @@ paths:
                     mode: { $ref: '#/components/schemas/LlmMode' }
                     apiKey: { type: string, description: OpenAI API key (for mode openai-api-key) }
                 globalProfile: { type: string, description: Default global profile ID for new runs ("" for none) }
+                agentToken: { $ref: '#/components/schemas/AgentToken' }
+                engineLinked: { type: boolean, description: 'Default for new runs: stages may read earlier runs of their workspace (see EngineLinked)' }
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -325,6 +341,87 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/Settings' }
+
+  /api/daybreak/check:
+    get:
+      tags: [Engine]
+      summary: The last Daybreak access check
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/DaybreakStatus' } } } }
+    post:
+      tags: [Engine]
+      summary: Check which Daybreak programs the saved LLM login can use
+      description: |
+        Starts one worker that asks Codex for a one-word reply under each
+        program (standard, blue, red) with the saved LLM login: **a few tokens
+        per program**, so only when asked. Takes up to a few minutes. Runs
+        cannot start meanwhile (409), and scheduled runs wait. The result is
+        saved and shown in `GET /api/status` (`daybreak.lastCheck`).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: 'Model to check with (e.g. gpt-5.6-cyber for Red); default: Codex''s default' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/DaybreakCheck' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/secrets:
+    get:
+      tags: [Secrets]
+      summary: The secrets' names and when each was set (never their values)
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200':
+          description: OK, sorted by name
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SecretInfo' } }
+  /api/secrets/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$' }, example: BROWSERBASE_API_KEY }
+    put:
+      tags: [Secrets]
+      summary: Set a secret (creates it or replaces its value); used from the next stage on
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value: { type: string, minLength: 1, description: 'At most 16 KiB; no NUL' }
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '400': { description: 'Bad name (not an env var name, or reserved), bad value, or 50 secrets already', $ref: '#/components/responses/Error' }
+        '200':
+          description: Saved (the value is not echoed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SecretInfo' }
+    delete:
+      tags: [Secrets]
+      summary: Remove a secret; stages started afterwards no longer get it
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '404': { description: No secret by that name, $ref: '#/components/responses/Error' }
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema: { type: object, properties: { deleted: { type: string } } }
 
   /api/llm/claude-login:
     get:
@@ -916,6 +1013,8 @@ paths:
                         kind: { type: string, enum: [attempt, message, command, error, turn] }
                         text: { type: string }
                         exitCode: { type: [integer, 'null'], description: 'command only' }
+                        daybreak: { $ref: '#/components/schemas/Daybreak' }
+                        hint: { type: string, description: 'error only, when it is a Daybreak access error: what to change' }
                   cursor: { type: string }
                   done: { type: boolean }
         '404': { $ref: '#/components/responses/Error' }
@@ -1059,6 +1158,8 @@ components:
                       saved: { type: boolean, description: A ChatGPT login is saved }
                       savedAt: { type: string, format: date-time }
               globalProfile: { type: string }
+              agentToken: { $ref: '#/components/schemas/AgentToken' }
+              engineLinked: { type: boolean }
               configured: { type: boolean }
     OpenRouterAuth:
       description: OpenRouter configuration with the key masked
@@ -1117,6 +1218,12 @@ components:
         model: { type: string, description: Default OpenRouter model ID }
         configured: { type: boolean, description: A key and model are saved (not remote verification) }
 
+    SecretInfo:
+      type: object
+      required: [name, updatedAt]
+      properties:
+        name: { type: string, example: BROWSERBASE_API_KEY }
+        updatedAt: { type: string, format: date-time }
     LlmMode:
       type: string
       enum: [none, openai-api-key, codex]
@@ -1127,6 +1234,68 @@ components:
       enum: [codex, claude, openrouter]
       description: 'Workflow provider. Omit for automatic selection: Codex, Claude, OpenRouter. An explicit choice requires saved credentials; errors never change providers.'
 
+    AgentToken:
+      type: string
+      enum: [llm, user]
+      default: llm
+      description: |
+        The Cyber Supplies token each worker gives its agent. `llm` (default):
+        the user's restricted llm_ token, fetched from Cyber Supplies
+        (`GET /api/tokens/llm`) with the stored user token when the worker
+        starts and never stored; the agent can read profiles, accounts and
+        emails but not change them. If the lookup fails, the stage fails
+        (it never falls back to the user token). `user`: the full usr_ token.
+    EngineLinked:
+      type: boolean
+      default: false
+      description: |
+        Engine linked: each stage's agent may READ this engine's earlier runs
+        of the same workspace (runs without a workspace see each other), to
+        learn from them. The worker joins a private Docker network with the
+        engine and gets CYSU_ENGINE_URL (http://<engine>:8788, a separate,
+        read-only listener on that network only) and CYSU_ENGINE_TOKEN, a
+        per-stage key (usr_engine_…, not a Cyber Supplies token) revoked when
+        the stage ends. On that port, with that key, only GET works:
+        /api/status (plus `agent: {readOnly, workspace, runId}`),
+        /api/workspaces[/{id}] (its own), /api/runs, /api/runs/{id} and its
+        /stages/{n}/events, /stages/{n}/log, /feed, /download. Other
+        workspaces' runs are 404, changes 403; the engine token is refused.
+        Linked workers also get an `engine-history` skill describing this.
+        The worker firewall allows only that address:port. Needs the engine
+        running as its container (scripts/engine.sh).
+    Daybreak:
+      type: string
+      enum: [default, standard, blue, red]
+      default: default
+      description: |
+        OpenAI Daybreak (Trusted Access for Cyber) access program Codex asks for.
+        `default` leaves it to OpenAI; `standard` turns it off; `blue` / `red`
+        need an approved account. Red only works with the cyber models (such as
+        gpt-5.6-cyber), which need an OpenAI API key from a Red-approved project;
+        on a ChatGPT login use `blue`. `POST /api/daybreak/check` shows which
+        programs the saved LLM login can use.
+    DaybreakStatus:
+      type: object
+      required: [checking, lastCheck]
+      properties:
+        checking: { type: boolean, description: A check is running (new runs get 409 until it ends) }
+        lastCheck: { oneOf: [{ $ref: '#/components/schemas/DaybreakCheck' }, { type: 'null' }] }
+    DaybreakCheck:
+      type: object
+      required: [checkedAt, model, results]
+      properties:
+        checkedAt: { type: string, format: date-time }
+        model: { type: string, description: 'Model the check used ("default" = Codex''s default)' }
+        results:
+          type: array
+          items:
+            type: object
+            required: [program, ok, error, hint]
+            properties:
+              program: { type: string, enum: [standard, blue, red] }
+              ok: { type: boolean }
+              error: { type: string, description: 'OpenAI''s error ("" when ok)' }
+              hint: { type: [string, 'null'], description: Plain advice for a Daybreak access error }
     ReasoningEffort:
       type: string
       enum: ['', none, minimal, low, medium, high, xhigh, max, ultra]
@@ -1154,7 +1323,18 @@ components:
         model: { type: string, pattern: '^~?[A-Za-z0-9._:/-]{1,120}$', description: Default model for every stage }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
         continueOnFailure: { type: boolean, default: true, description: 'false: stop after the first failed stage (the rest become skipped)' }
+        engineLinked: { type: boolean, description: 'Stages may read earlier runs of the same workspace (see EngineLinked). Default: the saved setting.' }
         fallbackModel: { type: string, pattern: '^~?[A-Za-z0-9._:/-]{1,120}$', description: 'If a stage''s first attempt fails, retry it once with this model (same objective, same workspace)' }
+        daybreak: { $ref: '#/components/schemas/Daybreak' }
+        daybreakOverrides:
+          type: array
+          description: Daybreak program per stage tag (e.g. recon on blue, exploitation on red); stages without one use `daybreak`.
+          items:
+            type: object
+            required: [stage, daybreak]
+            properties:
+              stage: { type: integer, enum: [1, 2, 3, 4] }
+              daybreak: { $ref: '#/components/schemas/Daybreak' }
         reprompts:
           type: array
           description: Follow-up prompts per stage tag. After a stage's first attempt succeeds, each matching prompt is sent to the same agent session, in this order.
@@ -1179,6 +1359,7 @@ components:
               model: { type: string }
               reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
               fallbackModel: { type: string }
+              daybreak: { $ref: '#/components/schemas/Daybreak' }
               reprompts: { type: array, maxItems: 20, items: { type: string, minLength: 1 }, description: This stage's follow-up prompts (instead of the run-level ones) }
         fromTags:
           type: object
@@ -1212,7 +1393,7 @@ components:
 
     RunPlan:
       type: object
-      description: A planned run (from `POST /api/runs/plan`); a created run has these fields plus id, status and times.
+      description: A planned run (from `POST /api/runs/plan`), with every setting worked out. A created run is shown in the shorter `Run` form.
       properties:
         name: { type: string }
         provider: { $ref: '#/components/schemas/Provider' }
@@ -1226,6 +1407,8 @@ components:
         modelOverrides: { type: array, items: { type: object, properties: { stage: { type: integer }, model: { type: string } } } }
         continueOnFailure: { type: boolean }
         fallbackModel: { type: string }
+        daybreak: { $ref: '#/components/schemas/Daybreak' }
+        daybreakOverrides: { type: array, items: { type: object, properties: { stage: { type: integer }, daybreak: { $ref: '#/components/schemas/Daybreak' } } } }
         reprompts: { type: array, items: { type: object, properties: { stage: { type: string }, prompt: { type: string } } } }
         stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
 
@@ -1242,6 +1425,7 @@ components:
         model: { type: string }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
         fallbackModel: { type: string }
+        daybreak: { $ref: '#/components/schemas/Daybreak' }
         reprompts: { type: array, items: { type: string } }
         status: { $ref: '#/components/schemas/StageStatus' }
         startedAt: { type: [string, 'null'], format: date-time }
@@ -1258,6 +1442,9 @@ components:
             output_tokens: { type: integer }
         result: { type: string, description: The agent's last message }
         errors: { type: array, items: { type: string }, description: Errors from all attempts (a failure rescued by the fallback model is kept here) }
+        agentToken: { type: [string, 'null'], enum: [llm, user, null], description: 'Which token the stage''s agent got (null until the stage starts)' }
+        engineLinked: { type: boolean, description: 'The stage''s agent could read earlier runs (false when the run did not ask, or the link was unavailable; the stage log says why)' }
+        hints: { type: array, items: { type: string }, description: 'Plain advice for Daybreak access errors in `errors` (OpenAI''s own messages are misleading), once each' }
         attempts:
           type: array
           description: The agent attempts inside this stage, in order
@@ -1267,6 +1454,7 @@ components:
               kind: { type: string, enum: [initial, fallback, reprompt] }
               provider: { type: string, enum: [codex, claude, openrouter, openai], description: Credential used for this attempt }
               model: { type: string, description: '"" = default model' }
+              daybreak: { $ref: '#/components/schemas/Daybreak' }
               status: { type: string, enum: [running, succeeded, failed, cancelled] }
               exitCode: { type: [integer, 'null'] }
               turns: { type: integer }
@@ -1275,32 +1463,91 @@ components:
         eventCount: { type: integer }
         container: { type: string, description: Docker container name while it exists }
 
+    Trigger:
+      type: object
+      required: [type]
+      description: Who started the run. `{"type":"user"}`, or a schedule with its id and name.
+      properties:
+        type: { type: string, enum: [user, schedule] }
+        id: { type: string, description: The schedule's id (schedule runs only) }
+        name: { type: string, description: The schedule's name (schedule runs only) }
+
+    RunStage:
+      type: object
+      description: |
+        A stage as a run shows it. Every fact appears once: empty and default
+        values are left out, and model / reasoningEffort / fallbackModel appear
+        only when this stage used something other than the run's setting.
+        The list view (`RunSummary`) has only index, profile, status and error.
+      required: [index, profile, status]
+      properties:
+        index: { type: integer }
+        profile: { type: string }
+        status: { $ref: '#/components/schemas/StageStatus' }
+        error: { type: string, description: 'Why the stage failed, in one line (the agent''s last error, e.g. a model or proxy error). Only on failed / interrupted stages.' }
+        hints: { type: array, items: { type: string }, description: Plain advice for Daybreak access errors (only when there is some) }
+        model: { type: string, description: Only when different from the run's model }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        fallbackModel: { type: string, description: Only when different from the run's }
+        daybreak: { $ref: '#/components/schemas/Daybreak', description: 'Only when not "default"' }
+        followUps: { type: array, items: { type: string }, description: Follow-up prompts sent after the first turn (only when there are some) }
+        engineLinked: { type: boolean, description: 'Present (true) only when the agent could read earlier runs' }
+        agentToken: { type: string, enum: [user], description: 'Present only when the agent got the full user token (the default restricted LLM token is not shown)' }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        durationSec: { type: integer }
+        exitCode: { type: integer, description: 'Container exit code; 5 = a profile could not be installed' }
+        result: { type: string, description: The agent's last message }
+        threadId: { type: string, description: Codex thread or Claude session ID (only when a turn finished) }
+        usage:
+          type: object
+          description: Token usage of the last agent turn (only when a turn finished; zero counters left out)
+          properties:
+            input_tokens: { type: integer }
+            cached_input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            reasoning_output_tokens: { type: integer }
+        attempts:
+          type: array
+          description: The agent attempts inside this stage, only when there was more than one (fallback model, follow-ups)
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [initial, fallback, reprompt] }
+              provider: { type: string, enum: [codex, claude, openrouter, openai] }
+              model: { type: string }
+              status: { type: string, enum: [running, succeeded, failed, cancelled] }
+              durationSec: { type: integer }
+        eventCount: { type: integer, description: Events recorded so far (the CLI uses it to bound transcript downloads) }
+
     Run:
       type: object
-      required: [id, status, createdAt, objective, stages]
+      description: |
+        A run as the API shows it (GET, create, rerun, cancel, and run.json in
+        the download). Empty and default values are left out. What was sent to
+        create the run is stored by the engine for "run again" but not shown.
+      required: [id, status, trigger, stages]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        provider: { $ref: '#/components/schemas/Provider' }
         status: { $ref: '#/components/schemas/RunStatus' }
-        createdAt: { type: string, format: date-time }
-        startedAt: { type: [string, 'null'], format: date-time }
-        finishedAt: { type: [string, 'null'], format: date-time }
-        objective: { type: string, description: What this run was asked to do }
-        prompt: { type: string, description: Same as `objective` (older name; runs from before 0.12 have only this) }
-        globalProfile: { type: string }
+        trigger: { $ref: '#/components/schemas/Trigger' }
+        workspace: { type: object, description: 'The workspace it was started from (/run or a schedule)', properties: { id: { type: string }, name: { type: string } } }
         model: { type: string }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
-        source: { type: string, enum: [explicit, tags] }
-        skip: { type: array, items: { type: string } }
-        modelOverrides: { type: array, items: { type: object, properties: { stage: { type: integer }, model: { type: string } } } }
-        continueOnFailure: { type: boolean }
-        cancelRequested: { type: boolean }
-        request: { $ref: '#/components/schemas/RunRequest', description: What was asked for (used by rerun) }
-        rerunOf: { type: [string, 'null'], description: The run this one repeats }
-        workspace: { type: [object, 'null'], description: 'The workspace it was started from (/run or a schedule)', properties: { id: { type: string }, name: { type: string } } }
-        trigger: { type: string, enum: [user, schedule], description: Who started it (older runs have none = user) }
-        schedule: { type: [object, 'null'], description: The schedule that started it, properties: { id: { type: string }, name: { type: string } } }
-        stages: { type: array, items: { $ref: '#/components/schemas/Stage' } }
+        createdAt: { type: string, format: date-time, description: Only while the run is queued (not started yet) }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        error: { type: string, description: Only when the run itself could not go on (stage failures are on the stage) }
+        objective: { type: string, description: What this run was asked to do }
+        globalProfile: { type: string }
+        fallbackModel: { type: string }
+        continueOnFailure: { type: boolean, description: 'Present (false) only when later stages are skipped after a failure; the default is true' }
+        engineLinked: { type: boolean, description: 'Present (true) only when the run asked for engine linked' }
+        cancelRequested: { type: boolean, description: 'Present (true) while a cancel is under way' }
+        rerunOf: { type: string, description: The run this one repeats }
+        stages: { type: array, items: { $ref: '#/components/schemas/RunStage' } }
 
     Workspace:
       type: object
@@ -1321,26 +1568,28 @@ components:
               type: [object, 'null']
               description: The stages it would run now (null when it cannot run yet)
               properties:
+                provider: { $ref: '#/components/schemas/Provider' }
                 globalProfile: { type: string }
                 stages: { type: array, items: { type: object, properties: { order: { type: integer }, tag: { type: string }, profile: { type: string }, model: { type: string } } } }
             planError: { type: [string, 'null'], description: 'Why it cannot run yet (e.g. no stages, unknown profile). The objective is not needed here.' }
 
     RunSummary:
       type: object
-      required: [id, status, createdAt, stageCount, stages]
+      description: A run in the list (GET /api/runs), newest first. The same top fields as `Run` (empty ones left out) and a short line per stage.
+      required: [id, status, trigger, stages]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        provider: { $ref: '#/components/schemas/Provider' }
         status: { $ref: '#/components/schemas/RunStatus' }
-        createdAt: { type: string, format: date-time }
-        startedAt: { type: [string, 'null'], format: date-time }
-        finishedAt: { type: [string, 'null'], format: date-time }
-        globalProfile: { type: string }
+        trigger: { $ref: '#/components/schemas/Trigger' }
+        workspace: { type: object, properties: { id: { type: string }, name: { type: string } } }
         model: { type: string }
-        workspace: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string } } }
-        trigger: { type: string, enum: [user, schedule], description: Who started it (older runs have none = user) }
-        schedule: { type: [object, 'null'], description: The schedule that started it, properties: { id: { type: string }, name: { type: string } } }
-        stageCount: { type: integer }
+        reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
+        createdAt: { type: string, format: date-time, description: Only while queued }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        error: { type: string }
         stages:
           type: array
           items:
@@ -1348,8 +1597,8 @@ components:
             properties:
               index: { type: integer }
               profile: { type: string }
-              tag: { type: string }
               status: { $ref: '#/components/schemas/StageStatus' }
+              error: { type: string, description: Why it failed (failed / interrupted stages only) }
 
     ScheduleWhen:
       description: |

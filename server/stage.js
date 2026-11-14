@@ -13,6 +13,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
+import { daybreakHint } from './daybreak.js';
 import { hardeningArgs, secretsLine, IMAGE, LABEL, removeContainer, copyFileFromContainer } from './docker.js';
 import { MODEL_NAME, isOpenRouterModel, llmProvider, validateProvider } from './llm-policy.js';
 import { CLAUDE_CONFIG_DIR } from './claude-login.js';
@@ -91,6 +92,11 @@ export function validateProviderStage(stage, llm, codexAuth, claudeAuth = false)
 // not fail the stage (the container's exit code is the final word).
 function applyEvent(run, event) {
   const current = run.attempts.at(-1);
+  // A Daybreak access error also gets plain advice in run.hints (once each).
+  const advise = (message) => {
+    const hint = daybreakHint(message, { daybreak: current?.daybreak || run.stage.daybreak, model: current ? current.model : run.stage.model });
+    if (hint && !run.hints.includes(hint)) run.hints.push(hint);
+  };
   switch (event.type) {
     case 'engine.attempt':
       run.attempts.push({ kind: String(event.kind || ''), model: String(event.model || ''), provider: String(event.provider || 'openai'), daybreak: String(event.daybreak || 'default'), startedAt: event.time, finishedAt: null, exitCode: null, turns: 0, status: 'running' });
@@ -113,10 +119,10 @@ function applyEvent(run, event) {
       break;
     case 'turn.failed':
       run.agentError = true;
-      if (event.error?.message) run.errors.push(String(event.error.message));
+      if (event.error?.message) { run.errors.push(String(event.error.message)); advise(event.error.message); }
       break;
     case 'error':
-      if (event.message) run.errors.push(String(event.message));
+      if (event.message) { run.errors.push(String(event.message)); advise(event.message); }
       break;
     case 'item.completed':
       if (event.item?.type === 'agent_message' && typeof event.item.text === 'string') run.result = event.item.text;
@@ -150,7 +156,33 @@ function applyEvent(run, event) {
 // run is final. With a Codex (ChatGPT) login, the container's possibly
 // refreshed ~/.codex/auth.json is copied out first and exposed as the
 // non-enumerable `run.refreshedCodexAuth` (never serialized with the run).
-export function startStage({ stage: input, settings, codexAuth = null, claudeVolume = null, image = IMAGE, extraEnv = {}, onUpdate = () => {}, onLog = () => {} }) {
+// `link` ({ network, ip, port, key }, engine linked): the worker joins that
+// network and gets CYSU_ENGINE_URL; its firewall lets through that one
+// address:port; the read-only key goes in with the other secrets (stdin).
+// Shortest secret value that is masked: masking a very short value would
+// garble ordinary text wherever those few characters happen to appear.
+export const MIN_MASKED_SECRET = 6;
+
+// secretMasker returns a function that replaces every user secret value in a
+// line with [secret:NAME], before the engine saves or shows it (events, log,
+// result, downloads, engine linked reads). The JSON-escaped form is masked
+// too, since events arrive as JSON. The replacement has no quotes or
+// backslashes, so a JSON line stays valid JSON.
+export function secretMasker(userSecrets = {}) {
+  const forms = [];
+  for (const [name, value] of Object.entries(userSecrets || {})) {
+    if (typeof value !== 'string' || value.length < MIN_MASKED_SECRET) continue;
+    for (const form of new Set([value, JSON.stringify(value).slice(1, -1)])) forms.push([form, `[secret:${name}]`]);
+  }
+  forms.sort((a, b) => b[0].length - a[0].length); // a longer value first, if one contains another
+  if (forms.length === 0) return (text) => text;
+  return (text) => {
+    for (const [form, mask] of forms) if (text.includes(form)) text = text.split(form).join(mask);
+    return text;
+  };
+}
+
+export function startStage({ stage: input, settings, codexAuth = null, claudeVolume = null, userSecrets = {}, cli = null, link = null, image = IMAGE, extraEnv = {}, onUpdate = () => {}, onLog = () => {} }) {
   const stage = validateProviderStage(validateStage(input), settings.llm, codexAuth, Boolean(claudeVolume));
   const provider = llmProvider(settings.llm, codexAuth, Boolean(claudeVolume), stage.provider);
   if (provider === 'claude' && !/^cysu-claude-[0-9a-f-]{36}$/.test(claudeVolume)) throw new StageError('Invalid Claude authentication volume');
@@ -159,11 +191,16 @@ export function startStage({ stage: input, settings, codexAuth = null, claudeVol
   const run = {
     id, container, stage: { ...stage }, status: 'running',
     startedAt: new Date().toISOString(), finishedAt: null, exitCode: null,
-    threadId: null, turns: 0, usage: null, result: '', agentError: false, errors: [], attempts: [],
+    threadId: null, turns: 0, usage: null, result: '', agentError: false, errors: [], hints: [], attempts: [],
     events: [], log: '', cancelled: false,
   };
 
-  const env = { CYSU_SECRETS: 'stdin', CYSU_STAGE_JSON: JSON.stringify(stage), ...extraEnv };
+  // cli (cli-cache.js): the run's CLI from the engine's cache (read-only mount + CYSU_CLI_DIR).
+  const env = { CYSU_SECRETS: 'stdin', CYSU_STAGE_JSON: JSON.stringify(stage), ...(cli?.env || {}), ...extraEnv };
+  if (link) {
+    env.CYSU_ENGINE_URL = `http://${link.ip}:${link.port}`;
+    env.CYSU_ENGINE_ALLOW = `${link.ip}:${link.port}`;
+  }
   // Tests only: lets workers reach a stand-in API on this machine.
   if (process.env.CYSU_ENGINE_TEST_NO_FIREWALL === '1') env.CYSU_EGRESS_GUARD = '0';
   if (process.env.CYSU_API_URL && !env.CYSU_API_URL) env.CYSU_API_URL = process.env.CYSU_API_URL;
@@ -173,22 +210,27 @@ export function startStage({ stage: input, settings, codexAuth = null, claudeVol
     args.push('--mount', `type=volume,source=${claudeVolume},target=${CLAUDE_CONFIG_DIR}`);
     Object.assign(env, { CLAUDE_CONFIG_DIR, CYSU_LLM_PROVIDER: 'claude', DISABLE_AUTOUPDATER: '1' });
   }
+  if (link) args.push('--network', link.network);
   for (const [key, value] of Object.entries(env)) args.push('-e', `${key}=${value}`);
+  if (cli?.mounts?.length) args.push(...cli.mounts);
   args.push(image);
 
   const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdin.on('error', () => {});
-  child.stdin.end(secretsLine(settings, codexAuth, provider));
+  child.stdin.end(secretsLine(settings, codexAuth, link?.key || '', userSecrets, provider));
 
-  const appendLog = (line) => {
+  const mask = secretMasker(userSecrets);
+  const appendLog = (raw) => {
+    const line = mask(raw);
     onLog(line);
     run.log += `${line}\n`;
     if (run.log.length > MAX_LOG) run.log = run.log.slice(-MAX_LOG);
   };
 
   const stdout = (async () => {
-    for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
-      if (!line.trim()) continue;
+    for await (const raw of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
+      if (!raw.trim()) continue;
+      const line = mask(raw);
       let event;
       try { event = JSON.parse(line); } catch { event = null; }
       if (!event || typeof event !== 'object' || Array.isArray(event)) { appendLog(line); continue; }

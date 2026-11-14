@@ -19,14 +19,16 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { startStage, cancelStage, validateStage, validateProviderStage, StageError, DAYBREAK, DAYBREAK_ERROR } from './stage.js';
 import { llmProvider, MODEL_NAME } from './llm-policy.js';
+import { daybreakHint } from './daybreak.js';
 import { removeOrphanContainers } from './docker.js';
 import { keepRefreshedCodexAuth } from './llm.js';
 import { orderProfiles, STAGE_TAGS, ProfileError } from './profiles.js';
 import { tarGz } from './tar.js';
+import { runDetail } from './run-view.js';
 
 // The request fields a run remembers, so it can be run again.
 const REQUEST_FIELDS = ['name', 'objective', 'prompt', 'provider', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
-  'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts', 'daybreak', 'daybreakOverrides'];
+  'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts', 'daybreak', 'daybreakOverrides', 'engineLinked'];
 const requestOf = (input) => structuredClone(Object.fromEntries(REQUEST_FIELDS.filter((k) => input[k] !== undefined).map((k) => [k, input[k]])));
 
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -51,7 +53,11 @@ function feedItem(e) {
   if (e.type === 'engine.attempt.finished' && e.exitCode !== 0) return { kind: 'error', text: `attempt ended with exit code ${e.exitCode}` };
   if (e.type === 'item.completed' && it.type === 'agent_message') return { kind: 'message', text: cleanText(it.text) };
   if (e.type === 'item.completed' && it.type === 'command_execution') return { kind: 'command', text: cleanText(it.command), exitCode: it.exit_code ?? null };
-  if (e.type === 'turn.failed' || e.type === 'error') return { kind: 'error', text: cleanText(e.error?.message || e.message) };
+  if (e.type === 'turn.failed' || e.type === 'error') {
+    const message = e.error?.message || e.message;
+    const hint = daybreakHint(message);
+    return hint ? { kind: 'error', text: cleanText(message), hint } : { kind: 'error', text: cleanText(message) };
+  }
   if (e.type === 'turn.completed') return { kind: 'turn', text: `turn finished · ${e.usage?.input_tokens ?? '?'} in / ${e.usage?.output_tokens ?? '?'} out` };
   if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
     const text = e.message.content.map((b) => b.type === 'text' ? b.text : b.type === 'tool_use' ? `${b.name}: ${JSON.stringify(b.input)}` : '').filter(Boolean).join('\n');
@@ -69,30 +75,35 @@ async function writeJson(file, value) {
   await rename(tmp, file);
 }
 
-// summary is what a run list shows (no per-stage results).
-function summary(run) {
-  const { stages, prompt, objective, ...rest } = run;
-  return { ...rest, stageCount: stages.length, stages: stages.map(({ index, profile, tag, status }) => ({ index, profile, tag, status })) };
-}
-
 export class Runs {
   // getSecrets: async () => ({ settings, codexAuth }) — read fresh for every stage.
+  // agentToken: async (settings) => ({ kind: 'llm' | 'user', token }) — the
+  // Cyber Supplies token the stage's agent gets (default: the user token).
   // listProfiles: async (settings) => the user's profiles [{ id, tag }] (for fromTags).
   // stageOptions: passed through to startStage (tests use a stand-in image/API).
   // onIdle: called after a run ends and the engine is free again (the scheduler
   // starts a waiting scheduled run then).
-  constructor({ dir, getSecrets, acquireClaude = async () => { throw new HttpError(400, 'Claude login is not configured'); }, listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {} }) {
+  // engineLink: async (run, stage) => ({ network, ip, port, key, release }) for
+  // an "engine linked" stage: `key` is the stage's read-only engine key and
+  // release() revokes it (called when the stage ends). Throws when the engine
+  // cannot be linked.
+  constructor({ dir, getSecrets, acquireClaude = async () => { throw new HttpError(400, 'Claude login is not configured'); }, agentToken = async (settings) => ({ kind: 'user', token: settings.token }), listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {}, engineLink = async () => { throw new Error('engine linked is not available here'); }, cliCache = null }) {
+    this.engineLink = engineLink;
     this.dir = dir;
     this.onIdle = onIdle;
     this.getSecrets = getSecrets;
     this.acquireClaude = acquireClaude;
+    this.agentToken = agentToken;
     this.listProfiles = listProfiles;
     this.stageOptions = stageOptions;
+    // cli-cache.js: which CLI a run's stages use (null: the worker image's own).
+    this.cliCache = cliCache;
     this.active = null; // { run, stage (live stage record) }
+    this.hold = ''; // set while something else uses the LLM login (a Daybreak check): new runs wait
     this.saveTimer = null;
   }
 
-  get busy() { return Boolean(this.active || this.creating); }
+  get busy() { return Boolean(this.active || this.creating || this.hold); }
 
   folder(id) {
     if (!RUN_ID.test(id)) throw new HttpError(404, 'Run not found');
@@ -184,7 +195,7 @@ export class Runs {
     for (const entry of await readdir(this.dir, { withFileTypes: true })) {
       if (!entry.isDirectory() || !RUN_ID.test(entry.name)) continue;
       const run = await this.read(entry.name).catch(() => null);
-      if (run) runs.push(summary(run));
+      if (run) runs.push(run); // full runs; the API shows them through run-view.js
     }
     return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
@@ -214,6 +225,10 @@ export class Runs {
       daybreak: String(input.daybreak || 'default').trim(),
     };
     if (!DAYBREAK.includes(defaults.daybreak)) throw new HttpError(400, DAYBREAK_ERROR);
+    // Engine linked: stages may read this engine's earlier runs (of the same
+    // workspace). The run's own choice, else the engine setting (default off).
+    const engineLinked = input.engineLinked === undefined ? Boolean(settings.engineLinked) : input.engineLinked;
+    if (typeof engineLinked !== 'boolean') throw new HttpError(400, 'engineLinked must be true or false');
     const continueOnFailure = input.continueOnFailure === undefined ? true : input.continueOnFailure;
     if (typeof continueOnFailure !== 'boolean') throw new HttpError(400, 'continueOnFailure must be true or false');
 
@@ -289,7 +304,7 @@ export class Runs {
         const daybreak = own.daybreak ?? daybreakForTag.get(tag) ?? defaults.daybreak;
         const stage = validateProviderStage(validateStage({ ...defaults, ...own, model, reprompts, daybreak }), llm, codexAuth, claudeAuth);
         return { index, tag, ...stage, status: 'pending', startedAt: null, finishedAt: null, exitCode: null,
-          threadId: null, turns: 0, usage: null, result: '', errors: [], attempts: [], eventCount: 0 };
+          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], eventCount: 0, agentToken: null, engineLinked: false };
       });
     } catch (error) {
       if (error instanceof StageError) throw new HttpError(400, error.message);
@@ -316,6 +331,7 @@ export class Runs {
       daybreakOverrides: [...daybreakForTag].map(([stage, daybreak]) => ({ stage: Number(stage), daybreak })),
       reprompts: repromptList.map((r) => ({ stage: String(r.stage), prompt: r.prompt })),
       continueOnFailure,
+      engineLinked,
       stages,
     };
   }
@@ -324,6 +340,7 @@ export class Runs {
   // `schedule` ({ id, name }) marks a run started by a schedule; it is not part
   // of the request, so "run again" makes an ordinary run.
   async create(input = {}, { schedule = null } = {}) {
+    if (this.hold) throw new HttpError(409, this.hold);
     if (this.busy) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
     this.creating = true;
     try {
@@ -367,6 +384,8 @@ export class Runs {
     try {
       await this.save(run);
       if (run.provider === 'claude') claudeLease = await this.acquireClaude();
+      this.runCli = this.cliCache ? await this.cliCache.prepare().catch(() => null) : null;
+      if (this.runCli) run.cli = { version: this.runCli.version, source: this.runCli.source };
       let failed = false;
       for (const stage of run.stages) {
         if (run.cancelRequested) { stage.status = 'cancelled'; continue; }
@@ -402,21 +421,39 @@ export class Runs {
     let writes = Promise.resolve();
     const write = (handle, text) => { writes = writes.then(() => handle.appendFile(text)).catch(() => {}); };
 
-    const { settings, codexAuth } = await this.getSecrets();
+    const { settings, codexAuth, userSecrets = {} } = await this.getSecrets();
+    let link = null; // engine linked: released (its key revoked) when the stage ends
     stage.status = 'running';
     stage.startedAt = new Date().toISOString();
     try {
+      // The agent's token: the user's llm_ token unless they chose "user".
+      // A failed lookup fails the stage; it never falls back to the user token.
+      const agent = await this.agentToken(settings);
+      stage.agentToken = agent.kind;
+      write(log, `[engine] agent token: ${agent.kind === 'llm' ? 'LLM token (restricted)' : 'user token (full access)'}\n`);
+      if (this.runCli) write(log, `[engine] Cyber Supplies CLI: ${this.runCli.note}\n`);
+      // Engine linked: if the engine cannot be linked, the stage runs without
+      // it (it is extra context, not something the stage depends on).
+      if (run.engineLinked) {
+        try {
+          link = await this.engineLink(run, stage);
+          write(log, `[engine] engine linked: the agent can read earlier runs at http://${link.ip}:${link.port}\n`);
+        } catch (error) {
+          write(log, `[engine] engine linked: not available, running without it (${error.message})\n`);
+        }
+      }
+      stage.engineLinked = Boolean(link);
       const live = startStage({
         stage: { provider: stage.provider, profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
           reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts, daybreak: stage.daybreak },
-        settings, codexAuth, claudeVolume, ...this.stageOptions,
+        settings: { ...settings, token: agent.token }, codexAuth, claudeVolume, userSecrets, cli: this.runCli, link, ...this.stageOptions,
         onLog: (line) => write(log, `${line}\n`),
         onUpdate: (live, event) => {
           if (event) {
             stage.eventCount += 1;
             write(events, `${JSON.stringify({ seq: stage.eventCount, ...event })}\n`);
           }
-          Object.assign(stage, { threadId: live.threadId, turns: live.turns, usage: live.usage, result: live.result, errors: [...live.errors], attempts: structuredClone(live.attempts) });
+          Object.assign(stage, { threadId: live.threadId, turns: live.turns, usage: live.usage, result: live.result, errors: [...live.errors], hints: [...live.hints], attempts: structuredClone(live.attempts) });
           this.saveSoon(run);
         },
       });
@@ -428,7 +465,7 @@ export class Runs {
       const done = await live.done;
       Object.assign(stage, {
         status: done.status, exitCode: done.exitCode, finishedAt: done.finishedAt,
-        threadId: done.threadId, turns: done.turns, usage: done.usage, result: done.result, errors: [...done.errors],
+        threadId: done.threadId, turns: done.turns, usage: done.usage, result: done.result, errors: [...done.errors], hints: [...done.hints],
         attempts: structuredClone(done.attempts),
       });
       if (await keepRefreshedCodexAuth(codexAuth, done.refreshedCodexAuth)) {
@@ -440,6 +477,7 @@ export class Runs {
       stage.errors.push(error.message);
       write(log, `[engine] stage could not run: ${error.message}\n`);
     } finally {
+      try { link?.release?.(); } catch (error) { console.error('engine link release:', error); }
       if (this.active) this.active.stage = null;
       await writes;
       await events.close();
@@ -460,7 +498,7 @@ export class Runs {
     const run = await this.read(id);
     if (ACTIVE.includes(run.status)) throw new HttpError(409, 'Wait for the run to finish (or cancel it) before downloading');
     const root = `run-${id}`;
-    const files = [{ name: `${root}/run.json`, data: `${JSON.stringify(run, null, 2)}\n` }];
+    const files = [{ name: `${root}/run.json`, data: `${JSON.stringify(runDetail(run), null, 2)}\n` }];
     for (const stage of run.stages) {
       for (const name of ['events.jsonl', 'log.txt']) {
         try {
