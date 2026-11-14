@@ -1,3 +1,4 @@
+import { provisionToken } from './fixtures/provision-auth.js';
 // Runs: storage on disk, cancel, delete, restart recovery, ChatGPT login
 // copy-back, and the HTTP API the CLI builds on (incl. same-machine checks).
 // Real cysu + stand-in Cyber Supplies API + stand-in `codex exec` (no LLM).
@@ -77,7 +78,7 @@ test('create validates the request', async () => {
   await rejects(runs.create({ prompt: 'x', stages: [{ profile: 'attack' }] }), 400, /token and passkey/);
   for (const [llm, codexAuth] of [[{ mode: 'none' }, null], [{ mode: 'openai-api-key', apiKey: '' }, null], [{ mode: 'codex' }, null]]) {
     secrets = { settings: { token: TOKEN, passkey: PASSKEY, llm }, codexAuth };
-    await rejects(runs.create({ prompt: 'x', stages: [{ profile: 'attack' }] }), 400, /Log in to your LLM first: sign in with ChatGPT \(Codex\) or add an OpenAI API key/);
+    await rejects(runs.create({ prompt: 'x', stages: [{ profile: 'attack' }] }), 400, /Log in to your LLM first: add a Codex or Claude subscription login, or OpenRouter credentials/);
   }
   secrets = saved;
   assert.deepEqual(await runs.list(), [], 'a rejected request must not leave a run behind');
@@ -430,7 +431,8 @@ test('HTTP: full run lifecycle, then crash + restart marks it interrupted', asyn
   }).then(async (r) => ({ status: r.status, body: r.status === 204 ? null : await r.json() }));
   let server = await startServer(dir, port);
   try {
-    assert.equal((await json('/api/settings', 'PUT', { token: TOKEN, passkey: PASSKEY, llm: { mode: 'openai-api-key', apiKey: API_KEY } })).status, 200);
+    assert.equal((await provisionToken({ dir, apiUrl: api.url }, TOKEN)).code, 0);
+    assert.equal((await json('/api/settings', 'PUT', { passkey: PASSKEY, llm: { mode: 'openai-api-key', apiKey: API_KEY } })).status, 200);
 
     let p = await json('/api/runs/plan', 'POST', { prompt: 'p', globalProfile: 'global', fromTags: { skip: ['4'] } });
     assert.equal(p.status, 200, JSON.stringify(p.body));
@@ -500,7 +502,8 @@ test('HTTP: run again, download (.tar.gz), saved setups, no web UI + security he
     throw new Error('run did not finish');
   };
   try {
-    await json('/api/settings', 'PUT', { token: TOKEN, passkey: PASSKEY, llm: { mode: 'openai-api-key', apiKey: API_KEY } });
+    assert.equal((await provisionToken({ dir, apiUrl: api.url }, TOKEN)).code, 0);
+    await json('/api/settings', 'PUT', { passkey: PASSKEY, llm: { mode: 'openai-api-key', apiKey: API_KEY } });
     const request = { name: 'again', prompt: 'hello', globalProfile: 'global', fromTags: { skip: ['3', '4'] }, reprompts: [{ stage: '1', prompt: 'more' }] };
     const first = await waitDone((await json('/api/runs', 'POST', request)).body.id);
     assert.equal(first.status, 'succeeded');

@@ -4,10 +4,12 @@
 #
 #   git fetch && git switch daybreak
 #   npm run image:build                 # worker image with the new entrypoint (~10 min, once)
-#   npm start                           # engine on 127.0.0.1:8787 (keep it running)
+#   npm run engine:build
+#   sudo env CYSU_ENGINE_IMAGE_REF=cysu-engine:dev sh install.sh --token usr_YOUR_TOKEN
+#   export CYSU_TOKEN=usr_YOUR_TOKEN      # authenticate requests to the installed engine
 #
 # then, in another terminal (from the repo folder):
-#   bash scripts/try-daybreak.sh setup                    # usr_ token, passkey, OpenAI API key (hidden)
+#   bash scripts/try-daybreak.sh setup                    # passkey and OpenAI API key (hidden)
 #   bash scripts/try-daybreak.sh red gpt-5.6-cyber        # Daybreak Red + the cyber model
 #   bash scripts/try-daybreak.sh red                      # Daybreak Red, Codex's default model
 #   bash scripts/try-daybreak.sh blue                     # Daybreak Blue, Codex's default model
@@ -21,20 +23,18 @@ E=${CYSU_ENGINE_URL:-http://127.0.0.1:8787}/api
 PROFILE=${PROFILE:-recon}
 json() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const r=JSON.parse(d||"{}");const f=new Function("r",`return (${process.argv[1]})`);console.log(f(r))})' "$1"; }
 
+T=${CYSU_TOKEN:-}
+[ -n "$T" ] || { echo 'Set CYSU_TOKEN to the token already provisioned with install.sh --token.'; exit 1; }
+
 if [ "${1:-}" = setup ]; then
-  read -rsp 'Cyber Supplies user token (usr_…): ' T; echo
-  # First setup (the engine is not set up yet); answers 401 if it already is.
-  printf '{"token":"%s","passkey":"daybreak-test"}' "$T" | curl -sS -X PUT "$E/settings" -H 'Content-Type: application/json' -d @- -o /dev/null -w 'token setup: HTTP %{http_code}\n'
   read -rsp 'OpenAI API key from the Daybreak-enabled project (sk-…): ' K; echo
   printf 'Authorization: Bearer %s\n' "$T" | curl -sS -H @- -X PUT "$E/settings" -H 'Content-Type: application/json' \
-    --data-binary @<(printf '{"llm":{"mode":"openai-api-key","apiKey":"%s"}}' "$K") | json 'r.error || ("LLM login: " + r.llm.mode)'
+    --data-binary @<(printf '{"passkey":"daybreak-test","llm":{"mode":"openai-api-key","apiKey":"%s"}}' "$K") | json 'r.error || ("LLM login: " + r.llm.mode)'
   unset K
   printf 'Authorization: Bearer %s\n' "$T" | curl -sS -H @- "$E/status" | json 'r.error || ("ready: " + r.configured + ", llm ready: " + r.llm.ready + ", docker: " + r.docker)'
   exit
 fi
 
-T=$(node -pe 'require("./data/settings.json").token||""' 2>/dev/null || true)
-[ -n "$T" ] || { echo "Run: bash scripts/try-daybreak.sh setup  (first)"; exit 1; }
 api() { printf 'Authorization: Bearer %s\n' "$T" | curl -sS -H @- -H 'Content-Type: application/json' "$@"; }
 
 if [ "${1:-}" = check ]; then

@@ -1,3 +1,4 @@
+import { provisionToken } from './fixtures/provision-auth.js';
 // The schedules API end to end: a real engine process creates a schedule,
 // starts the run BY ITSELF when the time comes, and the user checks on it
 // afterwards (schedule view, run list filters). Stand-in Cyber Supplies API +
@@ -31,7 +32,8 @@ before(async () => {
     if (await fetch(`${base}/api/health`).then((r) => r.ok, () => false)) break;
     await sleep(200);
   }
-  await http('/api/settings', 'PUT', { token: TOKEN, passkey: 'pk', llm: { mode: 'openai-api-key', apiKey: 'sk-schedapi' } });
+  assert.equal((await provisionToken({ dir, apiUrl: api.url }, TOKEN)).code, 0);
+  await http('/api/settings', 'PUT', { passkey: 'pk', llm: { mode: 'openai-api-key', apiKey: 'sk-schedapi' } });
   ws = (await http('/api/workspaces', 'POST', { name: 'nightly recon', request: { stages: [{ profile: 'recon', tag: '1' }] } })).body;
 });
 after(async () => {

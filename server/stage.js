@@ -1,6 +1,6 @@
 // stage.js runs ONE stage: a fresh hardened worker container that installs
-// the global profile and one stage profile, then runs Codex on the prompt.
-// It turns Codex's JSONL event stream into a live run record.
+// the global profile and one stage profile, then runs the selected agent on the prompt.
+// It turns the agent's JSONL event stream into a live run record.
 //
 // Container protocol (see image/entrypoint.sh):
 //   stdin   one JSON line of secrets (token, passphrase, LLM login)
@@ -14,6 +14,8 @@ import { spawn, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { hardeningArgs, secretsLine, IMAGE, LABEL, removeContainer, copyFileFromContainer } from './docker.js';
+import { MODEL_NAME, isOpenRouterModel, llmProvider, validateProvider } from './llm-policy.js';
+import { CLAUDE_CONFIG_DIR } from './claude-login.js';
 
 export const REASONING_EFFORTS = ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 // OpenAI Daybreak (Trusted Access for Cyber): which access program Codex asks
@@ -22,7 +24,6 @@ export const REASONING_EFFORTS = ['', 'none', 'minimal', 'low', 'medium', 'high'
 export const DAYBREAK = ['default', 'standard', 'blue', 'red'];
 export const DAYBREAK_ERROR = 'daybreak must be one of default, standard, blue, red';
 const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const MODEL = /^[A-Za-z0-9._:/-]{1,120}$/;
 const MAX_EVENTS = 20_000;
 const MAX_REPROMPTS = 20;
 const MAX_LOG = 1_000_000;
@@ -33,7 +34,9 @@ export class StageError extends Error {
 
 // validateStage checks a stage definition before anything starts.
 export function validateStage(input = {}) {
+  validateProvider(input.provider);
   const stage = {
+    ...(input.provider !== undefined && { provider: input.provider }),
     profile: String(input.profile ?? '').trim(),
     globalProfile: String(input.globalProfile ?? '').trim(),
     prompt: String(input.prompt ?? ''),
@@ -48,9 +51,9 @@ export function validateStage(input = {}) {
   if (stage.globalProfile && stage.globalProfile === stage.profile) throw new StageError('The stage profile cannot be the global profile');
   if (!stage.prompt.trim()) throw new StageError('An objective is required');
   if (stage.prompt.length > 100_000) throw new StageError('Objective is too long (100,000 characters max)');
-  if (stage.model && !MODEL.test(stage.model)) throw new StageError('Invalid model name');
+  if (stage.model && !MODEL_NAME.test(stage.model)) throw new StageError('Invalid model name');
   if (!REASONING_EFFORTS.includes(stage.reasoningEffort)) throw new StageError('Unknown reasoning effort');
-  if (stage.fallbackModel && !MODEL.test(stage.fallbackModel)) throw new StageError('Invalid fallback model name');
+  if (stage.fallbackModel && !MODEL_NAME.test(stage.fallbackModel)) throw new StageError('Invalid fallback model name');
   if (!DAYBREAK.includes(stage.daybreak)) throw new StageError(DAYBREAK_ERROR);
   if (!Array.isArray(stage.reprompts) || !stage.reprompts.every((p) => typeof p === 'string' && p.trim())) {
     throw new StageError('Follow-up prompts must be a list of non-empty texts');
@@ -61,7 +64,28 @@ export function validateStage(input = {}) {
   return stage;
 }
 
-// applyEvent folds one event into the run summary. Each Codex run inside the
+export function validateProviderStage(stage, llm, codexAuth, claudeAuth = false) {
+  const provider = llmProvider(llm, codexAuth, claudeAuth, stage.provider);
+  if (stage.provider && !provider) throw new StageError(`Provider ${stage.provider} is not configured or LLM execution is disabled; add its credentials first`);
+  if (provider === 'claude' && !['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(stage.reasoningEffort)) {
+    throw new StageError('Claude reasoningEffort must be low, medium, high, xhigh, max, or omitted');
+  }
+  if (provider === 'claude' && ['blue', 'red'].includes(stage.daybreak)) {
+    throw new StageError('Daybreak blue/red requires a Codex subscription login; Claude cannot provide that access program');
+  }
+  if (provider === 'openrouter' && ['blue', 'red'].includes(stage.daybreak)) {
+    throw new StageError('Daybreak blue/red requires a Codex subscription login; OpenRouter cannot provide that access program');
+  }
+  if (provider === 'openrouter' && stage.model && !isOpenRouterModel(stage.model)) {
+    throw new StageError('With OpenRouter, model must include its provider (provider/model), or be omitted to use the configured default');
+  }
+  if (provider === 'openrouter' && stage.fallbackModel && !isOpenRouterModel(stage.fallbackModel)) {
+    throw new StageError('With OpenRouter, fallbackModel must include its provider (provider/model), or be omitted');
+  }
+  return provider === 'openrouter' ? { ...stage, model: stage.model || llm.openrouter.model } : stage;
+}
+
+// applyEvent folds one event into the run summary. Each agent invocation inside the
 // container (initial, fallback, reprompt) is an "attempt"; agentError tracks
 // only the current attempt, so a failure rescued by the fallback model does
 // not fail the stage (the container's exit code is the final word).
@@ -69,7 +93,7 @@ function applyEvent(run, event) {
   const current = run.attempts.at(-1);
   switch (event.type) {
     case 'engine.attempt':
-      run.attempts.push({ kind: String(event.kind || ''), model: String(event.model || ''), daybreak: String(event.daybreak || 'default'), startedAt: event.time, finishedAt: null, exitCode: null, turns: 0, status: 'running' });
+      run.attempts.push({ kind: String(event.kind || ''), model: String(event.model || ''), provider: String(event.provider || 'openai'), daybreak: String(event.daybreak || 'default'), startedAt: event.time, finishedAt: null, exitCode: null, turns: 0, status: 'running' });
       run.agentError = false;
       break;
     case 'engine.attempt.finished':
@@ -97,6 +121,27 @@ function applyEvent(run, event) {
     case 'item.completed':
       if (event.item?.type === 'agent_message' && typeof event.item.text === 'string') run.result = event.item.text;
       break;
+    case 'system':
+      if (event.subtype === 'init' && typeof event.session_id === 'string') run.threadId = event.session_id;
+      break;
+    case 'assistant':
+      if (!event.parent_tool_use_id && Array.isArray(event.message?.content)) {
+        const text = event.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+        if (text) run.result = text;
+      }
+      break;
+    case 'result':
+      if (typeof event.session_id === 'string') run.threadId = event.session_id;
+      if (event.is_error || event.subtype !== 'success') {
+        run.agentError = true;
+        run.errors.push(...(Array.isArray(event.errors) && event.errors.length ? event.errors.map(String) : [String(event.result || 'Claude attempt failed')]));
+      } else {
+        run.turns += 1;
+        if (current) current.turns += 1;
+        if (event.usage) run.usage = event.usage;
+        if (typeof event.result === 'string') run.result = event.result;
+      }
+      break;
   }
 }
 
@@ -105,8 +150,10 @@ function applyEvent(run, event) {
 // run is final. With a Codex (ChatGPT) login, the container's possibly
 // refreshed ~/.codex/auth.json is copied out first and exposed as the
 // non-enumerable `run.refreshedCodexAuth` (never serialized with the run).
-export function startStage({ stage: input, settings, codexAuth = null, image = IMAGE, extraEnv = {}, onUpdate = () => {}, onLog = () => {} }) {
-  const stage = validateStage(input);
+export function startStage({ stage: input, settings, codexAuth = null, claudeVolume = null, image = IMAGE, extraEnv = {}, onUpdate = () => {}, onLog = () => {} }) {
+  const stage = validateProviderStage(validateStage(input), settings.llm, codexAuth, Boolean(claudeVolume));
+  const provider = llmProvider(settings.llm, codexAuth, Boolean(claudeVolume), stage.provider);
+  if (provider === 'claude' && !/^cysu-claude-[0-9a-f-]{36}$/.test(claudeVolume)) throw new StageError('Invalid Claude authentication volume');
   const id = randomUUID();
   const container = `cysu-stage-${id.slice(0, 8)}`;
   const run = {
@@ -122,12 +169,16 @@ export function startStage({ stage: input, settings, codexAuth = null, image = I
   if (process.env.CYSU_API_URL && !env.CYSU_API_URL) env.CYSU_API_URL = process.env.CYSU_API_URL;
   // No --rm: the engine copies the refreshed login out after exit, then removes it.
   const args = ['run', '-i', '--name', container, '--label', `${LABEL}=stage`, ...hardeningArgs()];
+  if (provider === 'claude') {
+    args.push('--mount', `type=volume,source=${claudeVolume},target=${CLAUDE_CONFIG_DIR}`);
+    Object.assign(env, { CLAUDE_CONFIG_DIR, CYSU_LLM_PROVIDER: 'claude', DISABLE_AUTOUPDATER: '1' });
+  }
   for (const [key, value] of Object.entries(env)) args.push('-e', `${key}=${value}`);
   args.push(image);
 
   const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdin.on('error', () => {});
-  child.stdin.end(secretsLine(settings, codexAuth));
+  child.stdin.end(secretsLine(settings, codexAuth, provider));
 
   const appendLog = (line) => {
     onLog(line);
@@ -158,7 +209,7 @@ export function startStage({ stage: input, settings, codexAuth = null, image = I
     child.on('close', async (code) => {
       await Promise.allSettled([stdout, stderr]);
       if (spawnError) appendLog(`[engine] could not start docker: ${spawnError.message}`);
-      if (settings.llm?.mode === 'codex' && codexAuth) {
+      if (provider === 'codex') {
         const raw = await copyFileFromContainer(container, '/home/runner/.codex/auth.json');
         let refreshed = null;
         try { refreshed = raw && JSON.parse(raw.toString('utf8')); } catch { refreshed = null; }

@@ -17,14 +17,15 @@ import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { startStage, cancelStage, validateStage, StageError, DAYBREAK, DAYBREAK_ERROR } from './stage.js';
+import { startStage, cancelStage, validateStage, validateProviderStage, StageError, DAYBREAK, DAYBREAK_ERROR } from './stage.js';
+import { llmProvider, MODEL_NAME } from './llm-policy.js';
 import { removeOrphanContainers } from './docker.js';
 import { keepRefreshedCodexAuth } from './llm.js';
 import { orderProfiles, STAGE_TAGS, ProfileError } from './profiles.js';
 import { tarGz } from './tar.js';
 
 // The request fields a run remembers, so it can be run again.
-const REQUEST_FIELDS = ['name', 'objective', 'prompt', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
+const REQUEST_FIELDS = ['name', 'objective', 'prompt', 'provider', 'globalProfile', 'model', 'reasoningEffort', 'fallbackModel',
   'continueOnFailure', 'stages', 'fromTags', 'modelOverrides', 'reprompts', 'daybreak', 'daybreakOverrides'];
 const requestOf = (input) => structuredClone(Object.fromEntries(REQUEST_FIELDS.filter((k) => input[k] !== undefined).map((k) => [k, input[k]])));
 
@@ -52,6 +53,13 @@ function feedItem(e) {
   if (e.type === 'item.completed' && it.type === 'command_execution') return { kind: 'command', text: cleanText(it.command), exitCode: it.exit_code ?? null };
   if (e.type === 'turn.failed' || e.type === 'error') return { kind: 'error', text: cleanText(e.error?.message || e.message) };
   if (e.type === 'turn.completed') return { kind: 'turn', text: `turn finished · ${e.usage?.input_tokens ?? '?'} in / ${e.usage?.output_tokens ?? '?'} out` };
+  if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
+    const text = e.message.content.map((b) => b.type === 'text' ? b.text : b.type === 'tool_use' ? `${b.name}: ${JSON.stringify(b.input)}` : '').filter(Boolean).join('\n');
+    if (text) return { kind: 'message', text: cleanText(text) };
+  }
+  if (e.type === 'result') return e.is_error || e.subtype !== 'success'
+    ? { kind: 'error', text: cleanText(e.result || e.errors?.join('\n') || 'Claude attempt failed') }
+    : { kind: 'turn', text: `turn finished · ${e.usage?.input_tokens ?? '?'} in / ${e.usage?.output_tokens ?? '?'} out` };
   return null;
 }
 
@@ -73,17 +81,18 @@ export class Runs {
   // stageOptions: passed through to startStage (tests use a stand-in image/API).
   // onIdle: called after a run ends and the engine is free again (the scheduler
   // starts a waiting scheduled run then).
-  constructor({ dir, getSecrets, listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {} }) {
+  constructor({ dir, getSecrets, acquireClaude = async () => { throw new HttpError(400, 'Claude login is not configured'); }, listProfiles = async () => { throw new HttpError(501, 'Profile lookup is not configured'); }, stageOptions = {}, onIdle = () => {} }) {
     this.dir = dir;
     this.onIdle = onIdle;
     this.getSecrets = getSecrets;
+    this.acquireClaude = acquireClaude;
     this.listProfiles = listProfiles;
     this.stageOptions = stageOptions;
     this.active = null; // { run, stage (live stage record) }
     this.saveTimer = null;
   }
 
-  get busy() { return Boolean(this.active); }
+  get busy() { return Boolean(this.active || this.creating); }
 
   folder(id) {
     if (!RUN_ID.test(id)) throw new HttpError(404, 'Run not found');
@@ -183,14 +192,18 @@ export class Runs {
   // plan validates a run request and works out its stages, without saving or
   // starting anything. Used by create and by POST /api/runs/plan (preview).
   async plan(input = {}) {
-    const { settings, codexAuth } = await this.getSecrets();
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new HttpError(400, 'A run request must be a JSON object');
+    const { settings, codexAuth, claudeAuth } = await this.getSecrets();
     if (!settings?.token || !settings?.passkey) throw new HttpError(400, 'Add your Cyber Supplies token and passkey first');
     // Every stage's agent works with the user's own LLM login.
     const llm = settings.llm || {};
-    const llmReady = (llm.mode === 'openai-api-key' && llm.apiKey) || (llm.mode === 'codex' && codexAuth);
-    if (!llmReady) throw new HttpError(400, 'Log in to your LLM first: sign in with ChatGPT (Codex) or add an OpenAI API key');
+    const selected = llmProvider(llm, codexAuth, claudeAuth, input.provider);
+    if (!selected) throw new HttpError(400, input.provider
+      ? `Provider ${input.provider} is not configured or LLM execution is disabled; add its credentials first`
+      : 'Log in to your LLM first: add a Codex or Claude subscription login, or OpenRouter credentials (legacy OpenAI API keys are also supported)');
 
     const defaults = {
+      provider: selected === 'openai' ? 'codex' : selected,
       // The objective: `objective`, or `prompt` (its older name).
       prompt: String(input.objective ?? input.prompt ?? ''),
       globalProfile: String(input.globalProfile ?? settings.globalProfile ?? '').trim(),
@@ -210,7 +223,7 @@ export class Runs {
     const modelForTag = new Map();
     for (const o of overrides) {
       const tag = String(o?.stage ?? '');
-      if (!STAGE_TAGS.includes(tag) || typeof o?.model !== 'string' || !/^[A-Za-z0-9._:/-]{1,120}$/.test(o.model)) {
+      if (!STAGE_TAGS.includes(tag) || typeof o?.model !== 'string' || !MODEL_NAME.test(o.model)) {
         throw new HttpError(400, 'Each model override needs a stage 1 to 4 and a model name');
       }
       if (modelForTag.has(tag)) throw new HttpError(400, `Duplicate model override for stage ${tag}`);
@@ -268,12 +281,13 @@ export class Runs {
     try {
       stages = requested.map((s, index) => {
         const own = Object.fromEntries(Object.entries(s || {}).filter(([, v]) => v !== undefined && v !== ''));
+        if (s?.provider !== undefined) throw new StageError('Set provider on the workflow request, not on individual stages');
         const tag = own.tag === undefined ? '' : String(own.tag);
         if (tag && !STAGE_TAGS.includes(tag)) throw new StageError('Stage tag must be 1 to 4');
         const model = own.model ?? modelForTag.get(tag) ?? defaults.model;
         const reprompts = own.reprompts ?? repromptsForTag.get(tag) ?? [];
         const daybreak = own.daybreak ?? daybreakForTag.get(tag) ?? defaults.daybreak;
-        const stage = validateStage({ ...defaults, ...own, model, reprompts, daybreak });
+        const stage = validateProviderStage(validateStage({ ...defaults, ...own, model, reprompts, daybreak }), llm, codexAuth, claudeAuth);
         return { index, tag, ...stage, status: 'pending', startedAt: null, finishedAt: null, exitCode: null,
           threadId: null, turns: 0, usage: null, result: '', errors: [], attempts: [], eventCount: 0 };
       });
@@ -310,28 +324,31 @@ export class Runs {
   // `schedule` ({ id, name }) marks a run started by a schedule; it is not part
   // of the request, so "run again" makes an ordinary run.
   async create(input = {}, { schedule = null } = {}) {
-    if (this.active) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
-    const plan = await this.plan(input);
-    if (this.active) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
-    const run = {
-      id: randomUUID(), status: 'queued', createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
-      cancelRequested: false, ...plan,
-      // What was asked for: "run again" repeats it (fromTags runs re-read the
-      // profile tags, so they pick up profile changes).
-      request: requestOf(input), rerunOf: input.rerunOf ?? null,
-      // The workspace it was started from (/run <workspace> in the CLI).
-      workspace: input.workspace && typeof input.workspace === 'object'
-        ? { id: String(input.workspace.id || ''), name: String(input.workspace.name || '') } : null,
-      // Who started it: the user, or a schedule (the engine, by itself).
-      trigger: schedule ? 'schedule' : 'user',
-      schedule: schedule ? { id: String(schedule.id), name: String(schedule.name || '') } : null,
-    };
-    await mkdir(this.folder(run.id), { recursive: true, mode: 0o700 });
-    await writeJson(join(this.folder(run.id), 'run.json'), run);
-    const created = structuredClone(run); // as saved: "queued"
-    this.active = { run, stage: null };
-    this.active.finished = this.execute(run).catch((error) => console.error(`run ${run.id}:`, error));
-    return created;
+    if (this.busy) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
+    this.creating = true;
+    try {
+      const plan = await this.plan(input);
+      if (this.active) throw new HttpError(409, 'A run is already active; cancel it or wait for it to finish');
+      const run = {
+        id: randomUUID(), status: 'queued', createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+        cancelRequested: false, ...plan,
+        // What was asked for: "run again" repeats it (fromTags runs re-read the
+        // profile tags, so they pick up profile changes).
+        request: requestOf(input), rerunOf: input.rerunOf ?? null,
+        // The workspace it was started from (/run <workspace> in the CLI).
+        workspace: input.workspace && typeof input.workspace === 'object'
+          ? { id: String(input.workspace.id || ''), name: String(input.workspace.name || '') } : null,
+        // Who started it: the user, or a schedule (the engine, by itself).
+        trigger: schedule ? 'schedule' : 'user',
+        schedule: schedule ? { id: String(schedule.id), name: String(schedule.name || '') } : null,
+      };
+      await mkdir(this.folder(run.id), { recursive: true, mode: 0o700 });
+      await writeJson(join(this.folder(run.id), 'run.json'), run);
+      const created = structuredClone(run); // as saved: "queued"
+      this.active = { run, stage: null };
+      this.active.finished = this.execute(run).catch((error) => console.error(`run ${run.id}:`, error));
+      return created;
+    } finally { this.creating = false; }
   }
 
   async save(run) {
@@ -346,13 +363,15 @@ export class Runs {
   async execute(run) {
     run.status = 'running';
     run.startedAt = new Date().toISOString();
-    await this.save(run);
+    let claudeLease;
     try {
+      await this.save(run);
+      if (run.provider === 'claude') claudeLease = await this.acquireClaude();
       let failed = false;
       for (const stage of run.stages) {
         if (run.cancelRequested) { stage.status = 'cancelled'; continue; }
         if (failed && run.continueOnFailure === false) { stage.status = 'skipped'; continue; }
-        await this.executeStage(run, stage);
+        await this.executeStage(run, stage, claudeLease?.volume);
         if (stage.status !== 'succeeded') failed = true;
       }
       run.status = run.cancelRequested ? 'cancelled'
@@ -360,15 +379,21 @@ export class Runs {
     } catch (error) {
       run.status = 'failed';
       run.error = error.message;
+      for (const stage of run.stages) if (stage.status === 'pending') stage.status = 'skipped';
     } finally {
       run.finishedAt = new Date().toISOString();
-      await this.save(run);
-      this.active = null;
-      try { this.onIdle(); } catch (error) { console.error('onIdle:', error); }
+      try { await this.save(run); }
+      finally {
+        try { await claudeLease?.release(); }
+        finally {
+          this.active = null;
+          try { this.onIdle(); } catch (error) { console.error('onIdle:', error); }
+        }
+      }
     }
   }
 
-  async executeStage(run, stage) {
+  async executeStage(run, stage, claudeVolume = null) {
     const folder = this.stageFolder(run.id, stage.index);
     await mkdir(folder, { recursive: true, mode: 0o700 });
     const events = await open(join(folder, 'events.jsonl'), 'a', 0o600);
@@ -382,9 +407,9 @@ export class Runs {
     stage.startedAt = new Date().toISOString();
     try {
       const live = startStage({
-        stage: { profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
+        stage: { provider: stage.provider, profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
           reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts, daybreak: stage.daybreak },
-        settings, codexAuth, ...this.stageOptions,
+        settings, codexAuth, claudeVolume, ...this.stageOptions,
         onLog: (line) => write(log, `${line}\n`),
         onUpdate: (live, event) => {
           if (event) {

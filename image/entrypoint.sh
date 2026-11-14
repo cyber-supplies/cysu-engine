@@ -6,11 +6,11 @@
 # Secrets arrive over stdin, so they do not appear in `docker inspect`.
 # With CYSU_SECRETS=stdin the engine writes ONE JSON line to the
 # container's stdin and closes it:
-#   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "codexAuth": {...}}
+#   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "openrouterApiKey": "..." | "codexAuth": {...}}
 # The passphrase is used once, by `cysu key init` as runner, to create
 # ~/.config/cysu/master.key; no long-lived process ever holds it. The LLM
-# login (an OpenAI API key, or a saved Codex/ChatGPT auth.json) is written to
-# ~/.codex/auth.json and is NOT left in the agent's environment. The agent
+# login is installed in ~/.codex/auth.json, or ~/.config/cysu/openrouter.key
+# for OpenRouter, and is NOT left in the agent's environment. The agent
 # gets CYSU_TOKEN (the CLI only reads it from env), the key file and auth.json.
 # The proxy installer also writes the token to /etc/environment inside this
 # ephemeral container; the entrypoint limits that file to root and runner.
@@ -37,7 +37,7 @@ as_runner() {
 }
 
 if [ "$(id -u)" = "0" ]; then
-  for name in CYSU_TOKEN CYSU_PASSPHRASE OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do
+  for name in CYSU_TOKEN CYSU_PASSPHRASE OPENAI_API_KEY OPENROUTER_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do
     if [ -n "$(printenv "$name" || true)" ]; then
       log "refusing to run: $name was passed as an env var (visible in docker inspect); send secrets on stdin with CYSU_SECRETS=stdin" >&2
       exit 4
@@ -73,6 +73,7 @@ if [ "$(id -u)" = "0" ]; then
     token=$(field token)
     passphrase=$(field passphrase)
     openai_key=$(field openaiApiKey)
+    openrouter_key=$(field openrouterApiKey)
     codex_auth=$(printf '%s' "$secrets" | jq -c '.codexAuth // empty | objects' 2>/dev/null || true)
     unset secrets
     if [ -z "$token" ] || [ -z "$passphrase" ]; then
@@ -87,22 +88,44 @@ if [ "$(id -u)" = "0" ]; then
 
     # LLM login -> ~/.codex/auth.json (0600, owned by runner). Fed through
     # stdin so the key/tokens never appear in argv or env.
+    if [ -n "$openrouter_key" ]; then
+      if ! printf '%s' "$openrouter_key" | as_runner sh -c 'umask 077; mkdir -p ~/.config/cysu && cat > ~/.config/cysu/openrouter.key'; then
+        log "refusing to run: could not install the OpenRouter API key" >&2
+        exit 4
+      fi
+      # The command reads the private file, keeping the API key out of argv,
+      # config and the agent environment. Profile installation preserves this
+      # provider definition while merging its MCP configuration.
+      router_url=${CYSU_ENGINE_TEST_OPENROUTER_URL:-https://openrouter.ai/api/v1}
+      router_url_json=$(printf '%s' "$router_url" | jq -Rs .)
+      printf '\n[model_providers.openrouter]\nname = "OpenRouter"\nbase_url = %s\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n[model_providers.openrouter.auth]\ncommand = "/bin/cat"\nargs = ["/home/runner/.config/cysu/openrouter.key"]\n' "$router_url_json" |
+        as_runner sh -c 'umask 077; mkdir -p ~/.codex; cat >> ~/.codex/config.toml'
+      unset router_url router_url_json
+      log "LLM provider configured: OpenRouter"
+    fi
     if [ -n "$codex_auth" ]; then
       if ! printf '%s\n' "$codex_auth" | as_runner sh -c 'umask 077; mkdir -p ~/.codex && cat > ~/.codex/auth.json'; then
         log "refusing to run: could not install the Codex login" >&2
         exit 4
       fi
       log "LLM login: Codex (ChatGPT)"
+      export CYSU_LLM_PROVIDER=codex
     elif [ -n "$openai_key" ]; then
       if ! printf '%s' "$openai_key" | as_runner codex login --with-api-key >/dev/null 2>&1; then
         log "refusing to run: could not install the OpenAI API key" >&2
         exit 4
       fi
       log "LLM login: OpenAI API key"
+      export CYSU_LLM_PROVIDER=openai
+    elif [ -n "$openrouter_key" ]; then
+      log "LLM login: OpenRouter API key (no Codex subscription login)"
+      export CYSU_LLM_PROVIDER=openrouter
+    elif [ "${CYSU_LLM_PROVIDER:-}" = claude ]; then
+      log "LLM login: Claude Code (saved native login volume)"
     else
       log "LLM login: none"
     fi
-    unset openai_key codex_auth
+    unset openai_key openrouter_key codex_auth
 
     export CYSU_TOKEN="$token"
     unset token
@@ -196,22 +219,45 @@ case "${daybreak:-default}" in
   *) log "refusing to run: unknown daybreak setting" >&2; exit 5 ;;
 esac
 for m in "$model" "$fallback_model"; do
-  if [ -n "$m" ] && ! printf '%s' "$m" | grep -Eq '^[A-Za-z0-9._:/-]{1,120}$'; then
+  if [ -n "$m" ] && ! printf '%s' "$m" | grep -Eq '^~?[A-Za-z0-9._:/-]{1,120}$'; then
     log "refusing to run: invalid model name" >&2
     exit 5
   fi
 done
 
+provider=${CYSU_LLM_PROVIDER:-openai}
+profile_provider=codex
+if [ "$provider" = claude ]; then
+  profile_provider=claude
+  case "${daybreak:-default}" in blue|red) log 'Daybreak blue/red requires a Codex subscription login' >&2; exit 5 ;; esac
+  case "$effort" in ''|low|medium|high|xhigh|max) ;; *) log 'Unsupported Claude reasoning effort' >&2; exit 5 ;; esac
+  # Only profile-managed files are reset. Native login/refresh state stays in
+  # the volume; each stage gets its own profiles and conversation.
+  rm -rf "$HOME/.claude/skills" "$HOME/.claude/agents"
+  rm -f "$HOME/.claude/CLAUDE.md"
+  if [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then
+    (umask 077; jq 'del(.mcpServers, .projects["/workspace"].mcpServers)' "$CLAUDE_CONFIG_DIR/.claude.json" > "$CLAUDE_CONFIG_DIR/.cysu-config.tmp")
+    mv "$CLAUDE_CONFIG_DIR/.cysu-config.tmp" "$CLAUDE_CONFIG_DIR/.claude.json"
+  fi
+fi
+if [ "$provider" = openrouter ]; then
+  case "${daybreak:-default}" in blue|red) log 'Daybreak blue/red requires a Codex subscription login' >&2; exit 5 ;; esac
+  if ! printf '%s' "$model" | grep -Eq '^~?[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:/-]*$'; then
+    log 'refusing to run: OpenRouter requires a provider/model' >&2
+    exit 5
+  fi
+fi
+
 if [ -n "$global_profile" ]; then
   log "installing global profile: $global_profile" >&2
-  if ! (cd "$HOME" && cysu profiles install --profile "$global_profile" --provider codex --scope global) >&2; then
+  if ! (cd "$HOME" && cysu profiles install --profile "$global_profile" --provider "$profile_provider" --scope global) >&2; then
     log "stage failed: could not install global profile $global_profile" >&2
     exit 5
   fi
 fi
 
 log "installing stage profile: $profile" >&2
-if ! (cd /workspace && cysu profiles install --profile "$profile" --provider codex --scope project) >&2; then
+if ! (cd /workspace && cysu profiles install --profile "$profile" --provider "$profile_provider" --scope project) >&2; then
   log "stage failed: could not install stage profile $profile" >&2
   exit 5
 fi
@@ -220,7 +266,12 @@ fi
 # the built-in cysu skill (it teaches the agent the cysu CLI, e.g. storage for
 # handing work to the next stage). Put it back unless a profile brought its own.
 has_cysu_skill() {
-  for d in "$HOME/.agents/skills" "$HOME/.codex/skills" /workspace/.agents/skills /workspace/.codex/skills; do
+  if [ "$provider" = claude ]; then
+    skill_dirs="$HOME/.claude/skills /workspace/.claude/skills"
+  else
+    skill_dirs="$HOME/.agents/skills $HOME/.codex/skills /workspace/.agents/skills /workspace/.codex/skills"
+  fi
+  for d in $skill_dirs; do
     [ -d "$d/cysu" ] && return 0
     for f in "$d"/*/SKILL.md; do
       [ -f "$f" ] && grep -Eq '^name:[[:space:]]*cysu[[:space:]]*$' "$f" && return 0
@@ -231,13 +282,17 @@ has_cysu_skill() {
 if has_cysu_skill; then
   log "cysu skill: provided by the installed profiles" >&2
 else
-  mkdir -p "$HOME/.agents/skills" && cp -R /opt/cysu/skill "$HOME/.agents/skills/cysu"
+  skill_dir="$HOME/.agents/skills"
+  [ "$provider" != claude ] || skill_dir="$HOME/.claude/skills"
+  mkdir -p "$skill_dir" && cp -R /opt/cysu/skill "$skill_dir/cysu"
   log "cysu skill: added the built-in one (the profiles did not include it)" >&2
 fi
 
 # Codex ignores /workspace/.codex/config.toml (the stage profile's MCP
 # servers etc.) unless the project is trusted.
-printf '\n[projects."/workspace"]\ntrust_level = "trusted"\n' >> "$HOME/.codex/config.toml"
+if [ "$provider" != claude ]; then
+  printf '\n[projects."/workspace"]\ntrust_level = "trusted"\n' >> "$HOME/.codex/config.toml"
+fi
 
 # The container is the sandbox (firewall, no capabilities), so Codex's own
 # sandbox and approval prompts are off, as in the dojo harness.
@@ -250,7 +305,22 @@ rc=0
 # limit, not visible in ps). With THREAD it resumes that conversation.
 attempt() {
   a_kind=$1 a_model=$2 a_prompt=$3 a_thread=${4:-}
-  jq -cn --arg kind "$a_kind" --arg model "$a_model" --arg daybreak "${daybreak:-default}" '{type: "engine.attempt", kind: $kind, model: $model, daybreak: $daybreak}'
+  jq -cn --arg kind "$a_kind" --arg model "$a_model" --arg provider "$provider" --arg daybreak "${daybreak:-default}" '{type: "engine.attempt", kind: $kind, model: $model, provider: $provider, daybreak: $daybreak}'
+  if [ "$provider" = claude ]; then
+    set -- claude -p --output-format stream-json --verbose --dangerously-skip-permissions --permission-prompts none
+    [ -z "$a_model" ] || set -- "$@" --model "$a_model"
+    [ -z "$effort" ] || set -- "$@" --effort "$effort"
+    [ -z "$a_thread" ] || set -- "$@" --resume "$a_thread"
+    : > "$ATTEMPT_EVENTS"
+    { printf '%s' "$a_prompt" | "$@"; echo $? > /tmp/cysu-rc; } | tee "$ATTEMPT_EVENTS"
+    rc=$(cat /tmp/cysu-rc)
+    if [ "$rc" = 0 ] && ! jq -Rne '[inputs | fromjson? | select(.type? == "result")] | last | .subtype == "success" and .is_error == false' "$ATTEMPT_EVENTS" >/dev/null; then
+      rc=1
+    fi
+    jq -cn --arg kind "$a_kind" --argjson exitCode "$rc" '{type: "engine.attempt.finished", kind: $kind, exitCode: $exitCode}'
+    [ "$rc" = 0 ]
+    return
+  fi
   if [ -n "$a_thread" ]; then
     set -- codex exec resume --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check
   else
@@ -258,7 +328,11 @@ attempt() {
   fi
   [ -z "$a_model" ] || set -- "$@" --model "$a_model"
   [ -z "$effort" ] || set -- "$@" -c "model_reasoning_effort=\"$effort\""
-  [ -z "$cyber_program" ] || set -- "$@" --cyber-access-program "$cyber_program"
+  if [ "$provider" = openrouter ]; then
+    set -- "$@" -c 'model_provider="openrouter"'
+  else
+    [ -z "$cyber_program" ] || set -- "$@" --cyber-access-program "$cyber_program"
+  fi
   [ -z "$a_thread" ] || set -- "$@" "$a_thread"
   : > "$ATTEMPT_EVENTS"
   { printf '%s' "$a_prompt" | "$@" -; echo $? > /tmp/cysu-rc; } | tee "$ATTEMPT_EVENTS"
@@ -270,8 +344,13 @@ attempt() {
   [ "$rc" = 0 ]
 }
 
+
 cd /workspace
-log "running Codex${model:+ (model $model)}${effort:+ (effort $effort)}${cyber_program:+ (Daybreak: $cyber_program)}" >&2
+if [ "$provider" = claude ]; then
+  log "running Claude${model:+ (model $model)}${effort:+ (effort $effort)}" >&2
+else
+  log "running Codex${model:+ (model $model)}${effort:+ (effort $effort)}${cyber_program:+ (Daybreak: $cyber_program)}" >&2
+fi
 if attempt initial "$model" "$prompt"; then
   :
 elif [ -n "$fallback_model" ] && [ "$rc" -lt 128 ]; then
@@ -288,9 +367,9 @@ else
 fi
 
 if [ "$reprompt_count" -gt 0 ]; then
-  thread=$(jq -Rrn '[inputs | fromjson? | select(.type? == "thread.started") | .thread_id | strings] | last // empty' "$ATTEMPT_EVENTS")
+  thread=$(jq -Rrn '[inputs | fromjson? | if .type? == "thread.started" then .thread_id elif .type? == "result" then .session_id else empty end | strings] | last // empty' "$ATTEMPT_EVENTS")
   if [ -z "$thread" ]; then
-    log "stage failed: Codex reported no thread ID, so the follow-up prompts cannot resume it" >&2
+    log "stage failed: the agent reported no thread ID, so the follow-up prompts cannot resume it" >&2
     exit 6
   fi
   i=0

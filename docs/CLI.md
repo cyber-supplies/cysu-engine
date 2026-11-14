@@ -2,7 +2,9 @@
 
 This is for whoever builds `cysu engine` in `cysu-cli`. The engine is a
 background server on the user's machine; `cysu engine` is its only user
-interface: first-run setup, then slash commands. Everything below is plain HTTP + JSON against the engine.
+interface for passkey/LLM configuration and slash commands. The token must
+first be provisioned on the engine host using `install.sh --token usr_...`.
+After that, the CLI uses HTTP + JSON against the engine.
 
 The full contract is [`openapi.yaml`](../openapi.yaml). The flow below is
 exercised end to end by [`test/cli-journey.test.js`](../test/cli-journey.test.js):
@@ -25,31 +27,24 @@ ids). These changes are needed for it to work with the engine now:
 
    Without it every request is `401` once the engine is set up. Keep the
    token out of `traceRequest` output (it is a header now).
-2. **Set the engine up through the 401, not through `GET /api/settings`.**
-   `GET /api/settings` needs the token too, and its `token` field is
-   masked (`"••••a1b2"`), so "is the token empty?" can no longer be read from
-   it. Instead:
+2. **Never enroll or rotate a token over HTTP (v3 / API 0.13).** Remove
+   automatic `PUT /api/settings {"token": ...}` from `enginePreflight` and
+   any setup/auth command. Instead:
 
    ```
    GET /api/status  (with the header)
-     200                          → set up with this token; go on
-     401 setupRequired: true      → PUT /api/settings {"token": "<token>"}   (first setup)
-                                       200 → go on;  400 → token refused by Cyber Supplies;
-                                       503 → Cyber Supplies unreachable;  401 → another setup won
-     401 setupRequired: false     → the engine was set up with a DIFFERENT token:
-                                       "use the token this engine was set up with, or reset it:
-                                        sh scripts/engine.sh reset-auth"
+     200                          → proceed with this token
+     401 setupRequired: true      → tell the user to run install.sh --token on the engine host
+     401 setupRequired: false     → missing/wrong token; use the installed token or rerun the installer
      429                          → locked for retryAfter seconds (10 wrong tokens in a minute)
    ```
 
-   The header may be sent on the first setup too (it is ignored then), so
-   `engineSend` can always add it.
+   A `token` field in an authenticated settings update is now rejected with
+   `400`, even if unchanged. Send only passkey, LLM and other editable fields.
 3. **Errors to show as they are:** `401` / `429` / `502` bodies have an
-   `error` written for the user (see *Authentication*). In particular a
-   `502` "Cyber Supplies did not accept your user token" means the token was
-   revoked: the user needs a new one, set with `PUT /api/settings
-   {"token": "<new>"}` sent with the OLD one in the header (`tokenChanged:
-   true` comes back; use the new one from then on).
+   `error` written for the user (see *Authentication*). A `502` saying
+   Cyber Supplies refused the token means the user needs a new one,
+   provisioned locally with `sudo sh install.sh --token usr_NEW_TOKEN`.
 4. **`create-workflow` / `edit-workflow --profile`** send stages as
    `{"profile"}` without a tag. That works, but per-tag models and
    follow-ups (`modelOverrides`, `reprompts`) then skip those stages. To keep
@@ -75,28 +70,18 @@ ids). These changes are needed for it to work with the engine now:
 
 ## Basics
 
-- **Where:** `http://127.0.0.1:8787` (the engine's `PORT`). Let
-  `CYSU_ENGINE_URL` override it.
-- **Not running?** A refused connection means the engine is not started.
-  `cysu engine` should start it as a container — exactly what
-  [`scripts/engine.sh`](../scripts/engine.sh) `start` does (see
-  [INSTALL.md](INSTALL.md)): if the `cysu-engine` container exists, `docker
-  start cysu-engine`; otherwise
-
-  ```
-  docker run -d --name cysu-engine --restart unless-stopped --init \
-    -p 127.0.0.1:8787:8787 \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v cysu-engine-data:/data \
-    <engine image>
-  ```
-
-  then wait until `GET /api/health` answers `{"ok": true}` (the one route
-  that needs no token). Publish on `127.0.0.1` only.
-  (The images still need a public home, e.g. ghcr.io/cyber-supplies.)
-- **Same machine only.** The engine refuses requests that look like they
+- **Where:** `http://127.0.0.1:8787` for a local install, or
+  `https://<public-ip>` after the v3 VPS installer. Set `CYSU_ENGINE_URL` or
+  pass `--engine` for every CLI command.
+- **Not running?** On the engine host, start an existing installation with
+  `docker start cysu-engine`. For a new installation run
+  `sudo sh install.sh --token usr_...` (add `--ip PUBLIC_IPV4` for HTTPS).
+  See [INSTALL.md](INSTALL.md). Wait for `GET /api/health` to answer
+  `{"ok": true}`; that route needs no token. Starting a bare container
+  without provisioning leaves all protected routes locked.
+- **CLI access only.** The engine refuses requests that look like they
   come from a web page (403), so:
-  - use a loopback host (`127.0.0.1` / `localhost`),
+  - use a loopback host for local installs, or the v3 installer’s HTTPS IP,
   - send **no `Origin` header** (Go's `net/http` sends none by default),
   - send `Content-Type: application/json` with every request body.
 - **Every request needs the engine token** (see *Authentication* below):
@@ -104,7 +89,7 @@ ids). These changes are needed for it to work with the engine now:
 - **Errors** are `{"error": "<message for the user>"}` with a 4xx/5xx status.
   The messages are written to be shown to the user as they are.
 - **Tokens:** the engine only works with a **user token** (`usr_…`). An LLM
-  token (`llm_…`) is refused with a clear 400.
+  token (`llm_…`) is refused by the installer.
 - **Text from agents is untrusted.** The engine already strips terminal
   control characters (escape sequences) from the run feed;
   print the text as plain text, never interpret it.
@@ -112,23 +97,23 @@ ids). These changes are needed for it to work with the engine now:
 ## Authentication
 
 The engine token **is** the user's Cyber Supplies user token (`usr_…`), the
-same one the CLI already uses for Cyber Supplies. It is set once at setup;
-from then on every request sends it:
+same one the CLI already uses for Cyber Supplies. The installer provisions
+it locally from the mandatory `--token` flag; every protected request sends it:
 
 ```
 Authorization: Bearer usr_…
 ```
 
-- Only this header counts: never put the token in a URL, a cookie or a
-  flag (shell history, `ps`). Never print or log it.
+- Only this header counts in the API: never put the token in a URL or cookie.
+  The v3 installer accepts `--token` for a one-command setup; that flag is
+  visible in shell history and process listings. Never print or log it.
 - `GET /api/health` is the only request that works without it.
 - **`401`** always means the engine token is the problem. Look at
   `setupRequired` in the body:
-  - `true`: the engine is not set up yet → run **setup** (section 2);
-  - `false`: the header is missing or the token is not the engine's (e.g.
-    the CLI's stored token changed since setup) → tell the user. Changing
-    the engine token needs the current one, so a user who no longer has it
-    runs `sh scripts/engine.sh reset-auth` (below) and then setup.
+  - `true`: authentication is not provisioned → run
+    `sudo sh install.sh --token usr_...` on the engine host;
+  - `false`: the header is missing or the token differs from the installed
+    one → use the installed token, or rerun the installer with a new one.
 - **`429`** (`Retry-After`, `retryAfter` seconds): 10 wrong tokens within a
   minute locked the engine for a minute; **every** request is refused, the
   right token too. Show "Too many wrong tokens, try again in N s"; do not
@@ -136,20 +121,18 @@ Authorization: Bearer usr_…
   does not extend it, but it is pointless).
 - **`502`** on routes that talk to Cyber Supplies (`/api/profiles`, `/load`,
   plans, runs): if `error` says Cyber Supplies "did not accept your user
-  token", the token was revoked or rotated there. The engine still accepts
-  the old token for itself, so `/setup` with a new token works (send the old
-  one in the header, the new one in the body).
-- **Lost token:** `sh scripts/engine.sh reset-auth` (asks for `yes`; needs
-  Docker on the machine) forgets the engine token and nothing else
-  (passkey, LLM login, workspaces and runs are kept). Then set up again. A
-  `cysu engine reset-auth` can do the same: `docker exec cysu-engine node
-  server/reset-auth.js`.
+  token", the token was revoked or rotated there. Rerun the installer
+  with `--token` on the host; the old token is not required for this.
+- **Lost token:** rerun the installer with `--token usr_NEW_TOKEN`.
+  Passkey, LLM login, workspaces and runs are kept. `sh scripts/engine.sh
+  reset-auth` removes the token and locks the API until local provisioning;
+  it never re-enables HTTP enrollment.
 
 ## 1. Start: `cysu engine`
 
 ```
 GET /api/health   → 200 {"ok": true}                    (it is up)
-GET /api/status   → 401 {"setupRequired": true, …}      → run setup (section 2)
+GET /api/status   → 401 {"setupRequired": true, …}      → run the installer on the engine host
                   → 401 {"setupRequired": false, …}     → wrong/missing token (see Authentication)
                   → 200 { "docker": "29.9.2" | null, "cysu": bool,
                           "llm": { "mode", "ready" }, "configured": bool }
@@ -160,36 +143,85 @@ GET /api/status   → 401 {"setupRequired": true, …}      → run setup (secti
 
 ## 2. Setup (first run, and `/setup`)
 
-Ask for secrets with **hidden input** (`golang.org/x/term` ReadPassword), never
-as flags (shell history, `ps`). `CYSU_TOKEN` / `CYSU_PASSPHRASE` may be offered
-as defaults since the CLI already uses them.
+Provision the user token first with `sudo sh install.sh --token usr_...`
+on the engine host. `--token` is mandatory; there is no environment fallback
+or API enrollment. Adding `--ip PUBLIC_IPV4` enables HTTPS. For rotation,
+rerun the same installer with a new `--token`; HTTP clients then use that token.
 
-1. **Cyber Supplies:** token + passkey →
-   `PUT /api/settings {"token": "usr_…", "passkey": "…"}`.
-   - **First setup** (`setupRequired: true`): send it **without** the
-     header; this is the only request the engine takes without one. The
-     token becomes the engine token: send it on every request from now on.
-   - The engine checks the token with Cyber Supplies first. `400` = refused
-     (typo, revoked, or an `llm_…` token); `503` = Cyber Supplies could not
-     be reached. Nothing is saved then; let the user try again.
-   - If another setup won a race, the answer is `401` (`setupRequired:
-     false`): the engine is set up with a token the CLI does not have.
-   - **`/setup` later:** send the current token in the header. Empty fields
-     mean "keep what is stored". A new `token` in the body replaces the
-     engine token at once: the answer has `"tokenChanged": true`, and only
-     the new one works from then on, so switch to it (and store it where
-     the CLI keeps its user token).
-   - `GET /api/settings` shows what is set (masked: `"token": "••••a1b2"`,
-     `"passkey": "set"`).
-2. **LLM login**, the user's own (Kimi / Claude come later):
+1. **Passkey:** ask with hidden input, then send
+   `PUT /api/settings {"passkey": "…"}` with the installed token in the
+   Authorization header. Do not send a `token` property, even if masked,
+   empty or unchanged: it produces `400` and nothing in the request is saved.
+   `GET /api/settings` returns masked secrets (`"token": "••••a1b2"`,
+   `"passkey": "set"`). Empty editable secret fields keep existing values.
+2. **LLM login**, saved independently of the workflow's provider choice:
    - **Codex (ChatGPT) sign-in:** `POST /api/llm/codex-login`, then poll
      `GET /api/llm/codex-login` every ~2 s.
      `status: "waiting"` → print `url` and `code` ("open … and enter …");
      `succeeded` → done (the engine switches `llm.mode` to `codex`);
      `failed` / `cancelled` → show `error`. Ctrl-C → `DELETE /api/llm/codex-login`.
+   - **OpenRouter API key:** hidden input plus a default model ID →
+     `PUT /api/llm/openrouter-auth {"apiKey": "sk-or-...", "model": "provider/model"}`.
+     `GET` on the same endpoint shows the masked key, model and `configured`;
+     `DELETE` removes only OpenRouter credentials. Later `PUT` requests may
+     omit either field to keep it. Empty, masked or invalid keys produce 400.
+     Saving credentials does not make a live model request.
    - **OpenAI API key:** hidden input →
      `PUT /api/settings {"llm": {"mode": "openai-api-key", "apiKey": "sk-…"}}`.
+   - **Claude subscription:** use the native Claude login flow below.
 3. `GET /api/status` again; `configured` should now be `true`.
+
+When configuring a workflow, offer Auto (default), Codex, Claude and OpenRouter.
+Save the explicit choice in `workspace.request.provider` as `codex`, `claude`,
+or `openrouter`; omit the field for Auto. Example request:
+`{"name":"Review","request":{"provider":"claude","stages":[{"profile":"recon"}]}}`.
+The field also works on `POST /api/runs` and `/api/runs/plan`. It applies to
+the whole workflow, including scheduled runs and reruns, not individual stages.
+Replacing a workspace request through PATCH must retain its other settings.
+
+Auto selects saved credentials in order **Codex → Claude → OpenRouter**.
+Status reports this default as `llm.provider`; plans and runs report the actual
+selection in `provider`. An explicit choice with missing credentials fails
+with 400. Provider selection stays fixed through every stage and attempt;
+expired logins, quota limits and other failures never change it. Reruns with
+Auto resolve the order again. Use an explicit choice to keep saved credentials
+while selecting a lower-priority provider.
+
+The legacy direct OpenAI key remains usable with the Codex harness when
+`llm.mode` is `openai-api-key`; Auto selects it only after the three providers
+above. `llm.mode: none` disables LLM use, including explicit choices.
+
+With OpenRouter selected, omitted run/stage models use the configured model.
+Explicit models, model overrides and fallback models must include the provider
+prefix; the engine does not translate bare OpenAI model names. Fallback models
+and follow-ups keep the same provider. Daybreak blue/red requires a subscription
+login or the direct OpenAI provider and is rejected for OpenRouter and Claude. Each attempt
+reports its actual `provider` and `model`.
+
+Claude uses native model IDs/aliases (for example `sonnet`), and accepts omitted
+effort or `low`, `medium`, `high`, `xhigh`, `max` (model availability still applies).
+It runs the official Claude Code CLI; follow-ups resume its session. Its native
+JSONL events (`system`, `assistant`, `user`, `result`) appear in the events API;
+the watch API and saved result/usage summaries work for both harnesses.
+
+`POST /api/llm/claude-login` with an empty body,
+then poll `GET` until `waiting` and open `url`. Ask for the one-time code from
+Anthropic's browser page with hidden input and send
+`POST /api/llm/claude-login/code {"id":"...","code":"..."}`. Include any
+`#state` suffix as displayed. The engine relays the code to native Claude Code;
+it does not perform the OAuth exchange itself. Poll through `exchanging` until
+`succeeded`, `failed`, `cancelled`, or `expired`. Start a fresh login after a
+failure or the 15-minute deadline. Ctrl-C should send
+`DELETE /api/llm/claude-login`. All these routes require the engine bearer token.
+
+`GET /api/llm/claude-auth` and `GET /api/settings` → `llm.claude` expose only
+`saved` and `savedAt`. Never request or print Claude access/refresh tokens.
+`DELETE /api/llm/claude-auth` cancels login and removes the persistent Claude
+volume (credentials, settings and history). Cancelling only the login attempt
+preserves the previous saved volume.
+Saving a Claude login enables automatic selection. Forgetting it returns 409
+while a Claude run owns the volume; cancel or finish the run first. A new login
+can complete during a run: the old volume is retired after the run releases it.
 
 ## 3. Slash commands
 
@@ -262,11 +294,12 @@ lists the request field each command changes.
 | Command | Changes | Notes |
 |---|---|---|
 | `/rename <id> <name>` | the name: `PATCH {"name": "<name>"}` | 409 if another workspace has that name |
-| `/model <id> <model>` | `model` | Every stage's model. `""` → remove it (Codex's default) |
+| `/provider <id> codex\|claude\|openrouter\|auto` | `provider` | `auto` removes the field; defaults to Codex → Claude → OpenRouter. Never send the literal value `auto` to the API. |
+| `/model <id> <model>` | `model` | Every stage's model. `""` → remove it (selected provider's default) |
 | `/model <id> --stage <1-4> <model>` | `modelOverrides` (`[{"stage": <int>, "model"}]`) | Model for the stages with that tag. Replace an existing entry for the same stage; `""` removes it |
 | `/fallback <id> <model>` | `fallbackModel` | Retried once with this model if a stage's first attempt fails. `""` → remove it |
 | `/effort <id> <level>` | `reasoningEffort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`; `""` → the model's default |
-| `/followup <id> add --stage <1-4> <text>` | `reprompts` (`[{"stage": "<tag>", "prompt"}]`) | Appended. After a stage succeeds, its follow-ups are sent in order, on the same Codex thread |
+| `/followup <id> add --stage <1-4> <text>` | `reprompts` (`[{"stage": "<tag>", "prompt"}]`) | Appended. After a stage succeeds, its follow-ups are sent in order, on the same agent session |
 | `/followup <id>` | — | List them, numbered, with their stage |
 | `/followup <id> remove <n>` / `clear` | `reprompts` | Remove one (by its number in the list) / all |
 | `/stages <id> tags [--skip 3,4]` | sets `fromTags: {"skip": [...]}`, **deletes `stages`** | Stages come from the profile tags 1–4 (the global profile is left out). `/load` and `/unload` then answer 409 |
@@ -424,23 +457,24 @@ Print items as they come (`kind`: `attempt` (first try / fallback / follow-up),
 
 | Code | Meaning |
 |---|---|
-| 400 | Bad input or setup missing (e.g. no LLM login), or a token Cyber Supplies refused at setup — show `error` |
-| 401 | Engine token: `setupRequired: true` → run setup; `false` → missing/wrong token (see *Authentication*) |
+| 400 | Bad input or setup missing (e.g. no LLM login), or a forbidden token field in a settings update — show `error` |
+| 401 | Engine token: `setupRequired: true` → run the installer on the host; `false` → missing/wrong token (see *Authentication*) |
 | 403 | Request looked like it came from a web page (wrong Host/Origin/content type) — a CLI bug |
 | 404 | No such workspace / schedule (not that exact id) / run |
 | 409 | Busy or conflicting: a run is already active, a name is taken, a short run id matches several runs, a tag-built workspace can't `/load`, 100 schedules already |
 | 429 | Too many wrong tokens: locked for `retryAfter` seconds, every request refused |
-| 502 | Cyber Supplies refused the stored token (revoked? → `/setup` with a new one), was unreachable, or answered badly |
-| 503 | Docker is not available, or (at setup) Cyber Supplies could not be reached to check the token |
+| 502 | Cyber Supplies refused the stored token (revoked? → `install.sh --token` on the host), was unreachable, or answered badly |
+| 503 | Docker is not available |
 
 ## 5. Trying it without the CLI
 
 ```sh
-npm start                      # engine on 127.0.0.1:8787
+sudo sh install.sh --token usr_YOUR_TOKEN  # engine on 127.0.0.1:8787
 E=127.0.0.1:8787/api
 read -rs T                     # paste your usr_ token (not echoed, not in history)
-printf '{"token":"%s","passkey":"pick-one"}' "$T" | curl -s -X PUT $E/settings -H 'Content-Type: application/json' -d @-   # setup
-H="Authorization: Bearer $T"   # then send it on every request; -H @- keeps it out of `ps`:
+H="Authorization: Bearer $T"   # send it on every request; -H @- keeps it out of ps:
+printf '%s\n' "$H" | curl -s -H @- -X PUT $E/settings -H 'Content-Type: application/json' -d '{"passkey":"pick-one"}'
+# Complete an LLM login before starting runs (section 2).
 printf '%s\n' "$H" | curl -s -H @- $E/status
 ID=$(printf '%s\n' "$H" | curl -s -H @- -X POST $E/workspaces -H 'Content-Type: application/json' -d '{"name":"Try"}' | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')
 printf '%s\n' "$H" | curl -s -H @- -X POST $E/workspaces/$ID/profiles -H 'Content-Type: application/json' -d '{"add":["recon"]}'

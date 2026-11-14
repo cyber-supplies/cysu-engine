@@ -5,3 +5,5 @@ USER root
 ENV CYSU_WORKER_TEST_BOOTSTRAP=0
 RUN mv /usr/local/bin/codex /usr/local/bin/codex-real
 COPY --chmod=755 fake-codex.sh /usr/local/bin/codex
+RUN mv /usr/local/bin/claude /usr/local/bin/claude-real
+COPY --chmod=755 fake-claude.sh /usr/local/bin/claude

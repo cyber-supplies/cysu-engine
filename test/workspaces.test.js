@@ -11,6 +11,17 @@ function memoryStore(initial = {}) {
 }
 const req = (model = 'gpt-5') => ({ model, fromTags: {} }); // a workspace has no objective
 
+test('provider survives workspace edits and profile changes; removing it restores automatic selection', async () => {
+  const ws = new Workspaces({ store: memoryStore() });
+  const created = await ws.create({ name: 'Claude', request: { provider: 'claude', stages: [] } });
+  await ws.changeStages(created.id, { add: ['recon'] });
+  assert.equal((await ws.get(created.id)).request.provider, 'claude');
+  const updated = await ws.update(created.id, { request: { ...(await ws.get(created.id)).request, provider: 'openrouter' } });
+  assert.equal(updated.request.provider, 'openrouter');
+  const { provider, ...automatic } = updated.request;
+  assert.equal((await ws.update(created.id, { request: automatic })).request.provider, undefined);
+});
+
 test('create, list (newest first), find ONLY by exact id', async () => {
   const ws = new Workspaces({ store: memoryStore() });
   const a = await ws.create({ name: '  Weekly   recon ', request: req('a') });

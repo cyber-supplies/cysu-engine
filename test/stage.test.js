@@ -27,6 +27,52 @@ const run = (stage) => startStage({
 });
 const report = (r) => JSON.parse(r.result);
 
+const routerKey = 'sk-or-stage-test-credential';
+const routerModel = 'anthropic/test-model';
+const subscription = { auth_mode: 'chatgpt', tokens: { access_token: 'test-subscription', refresh_token: 'test-refresh' } };
+const routedRun = (stage, codexAuth = subscription) => startStage({ stage,
+  settings: { ...settings, llm: { mode: 'codex', openrouter: { apiKey: routerKey, model: routerModel } } },
+  codexAuth, image: TEST_IMAGE, extraEnv: { CYSU_API_URL: api.url, CYSU_EGRESS_GUARD: '0' },
+});
+
+test('saved subscription is preferred; even quota failures never switch to OpenRouter', async () => {
+  const ok = await routedRun({ profile: 'attack', prompt: 'go' }).done;
+  assert.equal(ok.status, 'succeeded', ok.log);
+  assert.deepEqual(ok.attempts.map((a) => a.provider), ['codex']);
+  assert.doesNotMatch(report(ok).files, /openrouter.key/);
+  const failed = await routedRun({ profile: 'attack', prompt: 'SUBSCRIPTION-QUOTA' }).done;
+  assert.equal(failed.status, 'failed');
+  assert.deepEqual(failed.attempts.map((a) => a.provider), ['codex']);
+  assert.deepEqual(failed.refreshedCodexAuth, subscription);
+});
+
+test('without subscription auth OpenRouter handles initial and resumed turns with the configured model', async () => {
+  const r = await routedRun({ profile: 'attack', globalProfile: 'global', prompt: 'go', reprompts: ['finish'] }, null).done;
+  assert.equal(r.status, 'succeeded', r.log);
+  assert.deepEqual(r.attempts.map((a) => [a.provider, a.model]), [['openrouter', routerModel], ['openrouter', routerModel]]);
+  assert.equal(report(r).resumed, true);
+  assert.equal(report(r).thread, 'fake-thread-0001');
+  assert.match(report(r).args, /model_provider="openrouter"/);
+  assert.ok(!JSON.stringify(r).includes(routerKey));
+  assert.equal(r.refreshedCodexAuth, undefined);
+});
+
+test('explicit OpenRouter overrides a saved Codex login without exposing its credentials', async () => {
+  const r = await routedRun({ provider: 'openrouter', profile: 'attack', prompt: 'go' }).done;
+  assert.equal(r.status, 'succeeded', r.log);
+  assert.deepEqual(r.attempts.map((a) => a.provider), ['openrouter']);
+  assert.equal(r.refreshedCodexAuth, undefined);
+  assert.doesNotMatch(JSON.stringify(r), /test-subscription|test-refresh/);
+});
+
+test('OpenRouter model fallback stays on OpenRouter and follow-ups use the successful model', async () => {
+  const r = await routedRun({ profile: 'attack', prompt: 'go', model: 'test/bad-model', fallbackModel: 'google/test-model', reprompts: ['finish'] }, null).done;
+  assert.equal(r.status, 'succeeded', r.log);
+  assert.deepEqual(r.attempts.map((a) => [a.provider, a.model, a.status]), [
+    ['openrouter', 'test/bad-model', 'failed'], ['openrouter', 'google/test-model', 'succeeded'], ['openrouter', 'google/test-model', 'succeeded'],
+  ]);
+});
+
 test('stage definitions are validated before anything starts', () => {
   for (const [input, message] of [
     [{ prompt: 'x' }, /stage profile/],

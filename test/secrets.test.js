@@ -77,7 +77,7 @@ test('docker inspect shows neither the token nor the passphrase', async () => {
 });
 
 test('secrets passed as env vars are refused', async () => {
-  for (const name of ['CYSU_TOKEN', 'CYSU_PASSPHRASE', 'OPENAI_API_KEY']) {
+  for (const name of ['CYSU_TOKEN', 'CYSU_PASSPHRASE', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY']) {
     const r = await worker(['true'], { env: { CYSU_SECRETS: 'stdin', [name]: 'x' } });
     assert.equal(r.code, 4, `${name}: ${r.stderr}`);
     assert.match(r.stderr, new RegExp(`${name} was passed as an env var`));

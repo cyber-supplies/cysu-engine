@@ -22,7 +22,8 @@ let dir, server, base, out = '';
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), 'cysu-migrate-'));
   const put = (name, value) => writeFile(join(dir, `${name}.json`), JSON.stringify(value));
-  await put('settings', { token: TOKEN, passkey: 'pk' });
+  await put('auth', { token: TOKEN });
+  await put('settings', { passkey: 'pk' });
   await put('workspaces', [
     { id: 'ws-old', name: 'Old', request: { prompt: 'recon example.com', stages: [{ profile: 'recon', prompt: 'own' }] }, createdAt: T, updatedAt: T },
     { id: 'ws-new', name: 'New', request: { stages: [{ profile: 'recon' }] }, createdAt: T, updatedAt: T },

@@ -6,7 +6,7 @@
 //   npm run stage -- --profile <id> --prompt "..." [--global <id>] [--model <m>] [--effort <e>]
 
 import { parseArgs } from 'node:util';
-import { load } from '../server/store.js';
+import { loadSettings } from '../server/settings.js';
 import { loadCodexAuth } from '../server/llm.js';
 import { startStage, cancelStage } from '../server/stage.js';
 
@@ -21,12 +21,12 @@ const { values } = parseArgs({
   },
 });
 
-const settings = await load('settings', null);
+const settings = await loadSettings();
 if (!settings?.token || !settings?.passkey) {
-  console.error('Save your token and passkey in the engine first (npm start → Setup).');
+  console.error('Provision your token with install.sh --token first, then save a passkey through the authenticated API.');
   process.exit(2);
 }
-const codexAuth = settings.llm?.mode === 'codex' ? await loadCodexAuth() : null;
+const codexAuth = await loadCodexAuth();
 
 const gray = (s) => `\x1b[90m${s}\x1b[0m`;
 const cyan = (s) => `\x1b[36m${s}\x1b[0m`;

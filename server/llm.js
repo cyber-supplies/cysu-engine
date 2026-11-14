@@ -7,6 +7,9 @@ import { spawn, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { hardeningArgs, IMAGE } from './docker.js';
 import { load, save, remove } from './store.js';
+import { loadSettings, saveSettings } from './settings.js';
+import { oneAtATime } from './auth.js';
+import { isOpenRouterModel } from './llm-policy.js';
 
 const MARK = '__CYSU_CODEX_AUTH__';
 const LOGIN_TIMEOUT_MS = 16 * 60_000; // Codex device codes expire after 15 minutes
@@ -104,9 +107,11 @@ export async function cancelCodexLogin() {
 // ---- stored login ----------------------------------------------------------
 
 export async function saveCodexAuth(auth) {
-  await save('codex-auth', { savedAt: new Date().toISOString(), auth });
-  const settings = await load('settings', {});
-  await save('settings', { ...settings, llm: { ...(settings.llm || {}), mode: 'codex' } });
+  return oneAtATime(async () => {
+    await save('codex-auth', { savedAt: new Date().toISOString(), auth });
+    const settings = await loadSettings();
+    await saveSettings({ ...settings, llm: { ...settings.llm, mode: 'codex' } });
+  });
 }
 
 export async function loadCodexAuth() {
@@ -119,9 +124,38 @@ export async function codexAuthInfo() {
 }
 
 export async function forgetCodexAuth() {
-  await remove('codex-auth');
-  const settings = await load('settings', {});
-  if (settings.llm?.mode === 'codex') await save('settings', { ...settings, llm: { ...settings.llm, mode: 'none' } });
+  return oneAtATime(async () => {
+    await remove('codex-auth');
+    const settings = await loadSettings();
+    if (settings.llm?.mode === 'codex' && !settings.llm.openrouter?.apiKey && !(await load('claude-auth', null))?.volume) {
+      await saveSettings({ ...settings, llm: { ...settings.llm, mode: 'none' } });
+    }
+  });
+}
+
+export async function saveOpenRouterAuth(input) {
+  const bad = (message) => { throw Object.assign(new Error(message), { status: 400 }); };
+  if (!input || typeof input !== 'object' || Array.isArray(input)) bad('OpenRouter auth must be a JSON object');
+  if (Object.keys(input).some((key) => !['apiKey', 'model'].includes(key))) bad('OpenRouter auth accepts only apiKey and model; the engine token must be set by the installer');
+  return oneAtATime(async () => {
+    const settings = await loadSettings();
+    const previous = settings.llm?.openrouter || {};
+    const apiKey = input.apiKey === undefined ? previous.apiKey : typeof input.apiKey === 'string' ? input.apiKey.trim() : '';
+    const model = input.model === undefined ? previous.model : typeof input.model === 'string' ? input.model.trim() : '';
+    if (!apiKey || apiKey.length > 4096 || !/^sk-or-[A-Za-z0-9_-]+$/.test(apiKey)) bad('A valid OpenRouter API key (sk-or-...) is required');
+    if (!isOpenRouterModel(model)) bad('An OpenRouter model ID including its provider is required (provider/model)');
+    // This endpoint opts into subscription-first routing, even if the user
+    // has not signed in yet. The direct OpenAI API-key mode remains available.
+    await saveSettings({ ...settings, llm: { ...settings.llm, mode: 'codex', openrouter: { apiKey, model } } });
+  });
+}
+
+export async function forgetOpenRouterAuth() {
+  return oneAtATime(async () => {
+    const settings = await loadSettings();
+    const { openrouter, ...llm } = settings.llm || {};
+    await saveSettings({ ...settings, llm });
+  });
 }
 
 // keepRefreshedCodexAuth saves the auth.json a stage ended with, when Codex
@@ -132,8 +166,10 @@ export async function keepRefreshedCodexAuth(sent, refreshed) {
   if (!sent || !refreshed || typeof refreshed !== 'object' || Array.isArray(refreshed)) return false;
   if (JSON.stringify(refreshed) === JSON.stringify(sent)) return false;
   if (!refreshed.tokens && !refreshed.OPENAI_API_KEY) return false; // not a usable login
-  const current = await loadCodexAuth();
-  if (JSON.stringify(current) !== JSON.stringify(sent)) return false;
-  await save('codex-auth', { savedAt: new Date().toISOString(), auth: refreshed });
-  return true;
+  return oneAtATime(async () => {
+    const current = await loadCodexAuth();
+    if (JSON.stringify(current) !== JSON.stringify(sent)) return false;
+    await save('codex-auth', { savedAt: new Date().toISOString(), auth: refreshed });
+    return true;
+  });
 }

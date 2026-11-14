@@ -1,16 +1,18 @@
 openapi: 3.1.0
 info:
   title: Cyber Supplies Engine API
-  version: 0.12.0
+  version: 0.16.0
   description: |
-    Local API of cysu-engine: the self-hosted server that runs Cyber Supplies
+    API of cysu-engine: the self-hosted server that runs Cyber Supplies
     profiles as agents in hardened Docker containers. There is no web UI: the
     `cysu` CLI is the client (setup and slash commands).
 
-    **Same machine only.** The engine listens on `http://127.0.0.1:8787`
-    (change with `PORT`). To keep web pages in your browser from using it,
-    every request must:
-    - use a loopback `Host` (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`);
+    **Access.** The engine itself listens on `http://127.0.0.1:8787`
+    (change with `PORT`). The v3 VPS installer exposes it at `https://<public-ip>`
+    through Caddy, which rewrites the upstream Host to loopback. To keep web
+    pages in your browser from using it, engine requests must:
+    - reach the engine with a loopback `Host` (`127.0.0.1:<port>`,
+      `localhost:<port>`, `[::1]:<port>`);
     - send no `Origin` header at all (the CLI sends none);
     - send `Content-Type: application/json` whenever it has a body.
     Anything else gets `403`.
@@ -19,26 +21,26 @@ info:
     **user token** (`usr_…`). Every request must send it as
     `Authorization: Bearer usr_…` (only this header counts: never a query
     string, cookie or body field). The only exception is `GET /api/health`.
-    - **Before setup** (no token stored yet) every request gets `401` with
-      `setupRequired: true`, except the setup itself: `PUT /api/settings`
-      with a `token` (no header needed). The engine checks the token with
-      Cyber Supplies first (refused → `400`, not reachable → `503`); then it
-      becomes the engine token. If two setups race, one wins and the other
-      gets `401`.
-    - **After setup** a missing or wrong token gets `401` with
-      `setupRequired: false`. Changing the token (`PUT /api/settings` with a
-      new `token`) needs the current one in the header; the old one stops
-      working at once (`tokenChanged: true` in the answer).
-    - A `401` from the engine ALWAYS means "wrong engine token". If Cyber
-      Supplies refuses the stored token (e.g. revoked), routes that ask it
-      answer `502` with a message saying so: set a new token.
-    - **10 wrong tokens within a minute** (a wrong token in the header, a
-      setup Cyber Supplies refuses, a lost setup race; a missing header does
-      not count) lock the engine for a minute: every request but
-      `GET /api/health` gets `429` with `Retry-After`, the right token
-      included (otherwise a hit would still tell itself apart from a miss).
-    - Lost the token? `sh scripts/engine.sh reset-auth` (needs Docker on the
-      machine) forgets it and keeps everything else; then set up again.
+    - **Provisioning and rotation** happen only on the engine host through
+      `install.sh --token usr_...` (add `--ip PUBLIC_IPV4` for HTTPS).
+      The installer checks the token with Cyber Supplies and writes it to
+      a private local auth file. `CYSU_TOKEN` is not an installer fallback.
+    - **Before provisioning** every protected request, including
+      `PUT /api/settings`, gets `401` with `setupRequired: true`.
+      There is no HTTP enrollment or token rotation endpoint.
+    - **After provisioning** a missing or wrong token gets `401` with
+      `setupRequired: false`. A `token` field in an authenticated settings
+      update gets `400`, even if empty or unchanged.
+    - If Cyber Supplies refuses the stored token (e.g. revoked), routes
+      that ask it answer `502`: rerun the installer with a new token.
+    - **10 wrong tokens within a minute** (a wrong token in the header;
+      a missing header does not count) lock the engine for a minute:
+      every request but `GET /api/health` gets `429` with `Retry-After`,
+      including requests carrying the right token.
+    - Lost the token? Rerun the installer with `--token` on the engine host.
+      `reset-auth` removes authentication and locks every protected route
+      until the installer provisions a token again; other data is kept.
+      Legacy tokens in `settings.json` are ignored by v3.
 
     Checks run in this order: same machine (`403`), lockout (`429`), token
     (`401`), then the route. A refused request's body is not read; the
@@ -46,7 +48,7 @@ info:
 
     **Runs.** A run is a list of stages executed one after another, each in a
     fresh container: the global profile is installed as the user, the stage
-    profile in `/workspace`, then Codex works on the run's **objective**. One
+    profile in `/workspace`, then the selected agent works on the run's **objective**. One
     run is active at a time.
 
     **Workspaces are blank templates; the objective comes with the run.** A
@@ -61,18 +63,36 @@ info:
     number); tags in `skip` are left out; stages run by tag, then profile ID.
     `POST /api/runs/plan` shows the resulting stages without starting.
 
-    Inside a stage, Codex runs one or more **attempts**: `initial`; if it
+    Inside a stage, the selected harness runs one or more **attempts**: `initial`; if it
     fails and `fallbackModel` is set, one `fallback` with that model (same
     objective, same workspace); after success, one `reprompt` per follow-up
-    prompt, each resuming the same Codex thread, in order. A stage fails if
+    prompt, each resuming the same agent session, in order. A stage fails if
     its initial (and fallback) attempt or any follow-up fails.
 
     By default a failed stage is recorded and the next stages still run
     (`continueOnFailure`); the run then ends `failed`.
 
-    Every run needs the user's own LLM login: a ChatGPT sign-in (Codex) or
-    an OpenAI API key. Check `GET /api/status` (`llm.ready`) and ask the user
-    to log in first.
+    **LLM credentials.** Set workflow `provider` to `codex`, `claude`, or
+    `openrouter` to choose explicitly. Omit it to select saved credentials in
+    order Codex → Claude → OpenRouter. An explicit choice without credentials
+    returns 400. The selection is fixed throughout the run; errors never switch
+    providers. Reruns using automatic selection resolve the order again.
+    Claude runs the official Claude Code CLI with its saved native login volume;
+    Codex and OpenRouter use the Codex harness. The legacy OpenAI API-key mode
+    remains supported by Codex (Auto selects it after the three providers).
+    `llm.mode: none` disables all LLM use, including explicit choices.
+    `GET /api/status` reports the default `llm.provider` and `llm.ready`.
+    Plans and runs report their actual resolved `provider`.
+
+    Save OpenRouter credentials with `PUT /api/llm/openrouter-auth`.
+    OpenRouter model IDs include a provider prefix (`provider/model`).
+    Omitted run/stage models use the configured OpenRouter model. Explicit
+    `model`, per-tag overrides and `fallbackModel` must use OpenRouter IDs
+    when that provider is selected. Model retries stay on the same provider.
+    Daybreak blue/red is unavailable through OpenRouter or Claude. Claude effort
+    accepts low, medium, high, xhigh, max, or omission; supported levels depend
+    on the selected model. Claude models use native IDs/aliases such as sonnet.
+
 
     Secrets (token, passkey, LLM keys/logins) are only ever written, never
     returned: reads show them masked.
@@ -85,6 +105,11 @@ info:
     Errors are JSON `{"error": "<message>"}` with a 4xx/5xx status.
 servers:
   - url: http://127.0.0.1:8787
+  - url: https://{ip}
+    variables:
+      ip:
+        default: 203.0.113.10
+        description: Public IPv4 address configured by the v3 installer
 
 # Every route needs the engine token unless it says otherwise.
 security:
@@ -168,7 +193,8 @@ paths:
                     required: [mode, ready]
                     properties:
                       mode: { $ref: '#/components/schemas/LlmMode' }
-                      ready: { type: boolean, description: 'The LLM login is complete (API key saved, or ChatGPT signed in)' }
+                      ready: { type: boolean, description: 'Credentials for the selected provider are saved; this does not verify remote account access' }
+                      provider: { type: [string, 'null'], enum: [codex, claude, openrouter, openai, null], description: 'Default credential selection; an explicit workflow provider overrides this' }
                   configured: { type: boolean, description: Everything a run needs is set up (cysu and llm.ready) }
 
   /api/settings:
@@ -181,31 +207,26 @@ paths:
         '200': { $ref: '#/components/responses/Settings' }
     put:
       tags: [Settings]
-      summary: Update settings (also the first setup)
+      summary: Update settings (token changes require the installer)
       description: |
         Only the fields you send change. Empty strings mean "keep what is
         stored", so sending back masked values never overwrites a secret.
         `llm.mode: codex` is only accepted after a ChatGPT sign-in
-        (see `/api/llm/codex-login`).
+        (see `/api/llm/codex-login` or `/api/llm/claude-login`) or after OpenRouter credentials are saved.
+        Manage OpenRouter credentials through `/api/llm/openrouter-auth`.
 
-        **First setup:** while no token is stored, this is the one request
-        accepted without the header, and it must contain `token`. A new or
-        changed `token` must be a user token (`usr_…`) that Cyber Supplies
-        accepts (checked now: refused → 400, not reachable → 503; nothing is
-        saved then). After setup, changing it needs the current token in
-        the header, and the answer has `tokenChanged: true`: send the new
-        one from then on.
-      security:
-        - {}
-        - bearerAuth: []
+        Authentication must already be provisioned by `install.sh --token`.
+        A `token` field is rejected with 400 (including empty, masked or
+        unchanged values); nothing in the request is saved. Token enrollment
+        and rotation are never available over HTTP.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              not: { required: [token] }
               properties:
-                token: { type: string, description: Cyber Supplies user token }
                 passkey: { type: string, description: Encryption passkey (CYSU passphrase); stays on this machine }
                 llm:
                   type: object
@@ -217,8 +238,53 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/Settings' }
-        '400': { description: 'Bad input: not a user token (usr_…), Cyber Supplies refused the token, unknown LLM mode, …', $ref: '#/components/responses/Error' }
-        '503': { description: Could not check the token with Cyber Supplies (nothing saved), $ref: '#/components/responses/Error' }
+        '400': { description: 'Bad input: token field present, unknown LLM mode, …', $ref: '#/components/responses/Error' }
+
+  /api/llm/openrouter-auth:
+    get:
+      tags: [LLM login]
+      summary: Read OpenRouter credential status (key masked)
+      responses:
+        '200': { $ref: '#/components/responses/OpenRouterAuth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [LLM login]
+      summary: Save or update an OpenRouter API key and default model
+      description: |
+        Requires the engine bearer token provisioned by the installer.
+        First configuration requires both apiKey and model. Later updates
+        may omit either field to retain it; empty or masked keys are rejected.
+        The key is checked for format, not sent to a remote API here.
+        The response always masks the key. Invalid requests save nothing.
+        This selects mode codex (automatic routing): Codex, then Claude, then
+        OpenRouter. A workflow may explicitly select any configured provider.
+        It never switches providers on failure.
+        The existing subscription login and OpenAI API key are retained.
+        Engine user tokens cannot be set or changed here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                apiKey: { type: string, writeOnly: true, maxLength: 4096, description: 'OpenRouter API key (sk-or-...)' }
+                model: { type: string, description: 'Default OpenRouter model ID, including provider, e.g. anthropic/claude-sonnet-4.6' }
+      responses:
+        '200': { $ref: '#/components/responses/OpenRouterAuth' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [LLM login]
+      summary: Remove the OpenRouter key and default model
+      description: Keeps the subscription login and direct OpenAI API key.
+      responses:
+        '200': { $ref: '#/components/responses/OpenRouterAuth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/llm/codex-login:
     get:
@@ -254,11 +320,96 @@ paths:
     delete:
       tags: [LLM login]
       summary: Forget the saved ChatGPT login
-      description: Removes it; if `llm.mode` was `codex` it becomes `none`.
+      description: Removes the Codex subscription login; automatic selection uses Claude, then OpenRouter if configured, otherwise disables mode codex.
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '200': { $ref: '#/components/responses/Settings' }
+
+  /api/llm/claude-login:
+    get:
+      tags: [LLM login]
+      summary: Poll the native Claude Code login
+      responses:
+        '200': { $ref: '#/components/responses/ClaudeLogin' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [LLM login]
+      summary: Start Claude Code subscription login in a container
+      description: |
+        Send an empty body. Starts the official `claude auth login --claudeai`
+        in an isolated container with a new private Docker volume. Poll GET
+        until `waiting`, open its native `url`, and submit the browser's one-time
+        code to `/api/llm/claude-login/code`. No callback port is published.
+        A repeated POST while login is active returns the same session.
+        After native auth verification, the volume is saved for future use.
+        Credentials never enter engine settings, responses or Docker logs.
+        Saving login enables automatic routing (Codex, then Claude, then OpenRouter).
+        Set workflow provider to claude to select it explicitly. Existing runs
+        keep their selected provider and volume until completion.
+        An unsuccessful replacement preserves the previous saved volume.
+      responses:
+        '202': { $ref: '#/components/responses/ClaudeLogin' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [LLM login]
+      summary: Cancel Claude login and remove its pending volume
+      description: Keeps any previously saved Claude login.
+      responses:
+        '200': { $ref: '#/components/responses/ClaudeLogin' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/llm/claude-login/code:
+    post:
+      tags: [LLM login]
+      summary: Pass the browser's one-time code to the waiting Claude Code CLI
+      description: |
+        The code is sent only to the matching active CLI process through stdin.
+        It is not stored, logged, or used by the engine to call Anthropic.
+        Poll `/api/llm/claude-login` for completion. If login fails or expires,
+        start a new session. Only one code submission is accepted per session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id, code]
+              properties:
+                id: { type: string, format: uuid, description: Id from the current login state }
+                code: { type: string, minLength: 1, maxLength: 4096, writeOnly: true, description: 'One-time code shown by Anthropic, including the #state suffix if present' }
+      responses:
+        '202': { $ref: '#/components/responses/ClaudeLogin' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/llm/claude-auth:
+    get:
+      tags: [LLM login]
+      summary: Check whether a Claude login volume has been saved
+      responses:
+        '200': { $ref: '#/components/responses/ClaudeAuth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [LLM login]
+      summary: Forget Claude login and remove its persistent volume
+      description: Cancels an active login and deletes the saved Claude configuration, credentials and history locally. Returns 409 while a Claude run owns a volume; finish or cancel that run first. Does not revoke the account session at Anthropic.
+      responses:
+        '200': { $ref: '#/components/responses/ClaudeAuth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/Error' }
 
   /api/profiles:
     get:
@@ -775,7 +926,7 @@ paths:
       - { $ref: '#/components/parameters/StageIndex' }
     get:
       tags: [Runs]
-      summary: A stage's Codex events (cursor paging, for live views)
+      summary: A stage's agent events (cursor paging, for live views)
       description: |
         Returns events with `seq > after`, oldest first. Poll with
         `after=<next>` to follow a live stage; stop when `done` is true and
@@ -806,7 +957,7 @@ paths:
     get:
       tags: [Runs]
       summary: A stage's container log
-      description: "`[engine]` lines, cysu install output and Codex stderr. Never contains secrets."
+      description: "`[engine]` lines, cysu install output and agent stderr. Never contains secrets."
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -822,7 +973,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: 'The user''s Cyber Supplies user token (usr_…), the one given at setup.'
+      description: 'The user''s Cyber Supplies user token (usr_…), the one passed to install.sh --token.'
   parameters:
     RunId:
       name: runId
@@ -851,7 +1002,7 @@ components:
 
   responses:
     Unauthorized:
-      description: 'No engine token, or the wrong one (`setupRequired: false`); or the engine is not set up yet (`setupRequired: true`: run setup)'
+      description: 'No engine token, or the wrong one (`setupRequired: false`); or the engine is not set up yet (`setupRequired: true`: run install.sh --token on the engine host)'
       headers:
         WWW-Authenticate: { schema: { type: string, example: 'Bearer realm="cysu-engine"' } }
       content:
@@ -899,6 +1050,8 @@ components:
                 properties:
                   mode: { $ref: '#/components/schemas/LlmMode' }
                   apiKey: { type: string, description: Masked OpenAI API key }
+                  openrouter: { $ref: '#/components/schemas/OpenRouterAuth' }
+                  claude: { $ref: '#/components/schemas/ClaudeAuth' }
                   codex:
                     type: object
                     required: [saved]
@@ -907,7 +1060,11 @@ components:
                       savedAt: { type: string, format: date-time }
               globalProfile: { type: string }
               configured: { type: boolean }
-              tokenChanged: { type: boolean, description: 'Only after PUT changed the token: use the new one from now on' }
+    OpenRouterAuth:
+      description: OpenRouter configuration with the key masked
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/OpenRouterAuth' }
     CodexLogin:
       description: ChatGPT sign-in state
       content:
@@ -923,11 +1080,52 @@ components:
               startedAt: { type: string, format: date-time }
               finishedAt: { type: string, format: date-time }
 
+    ClaudeLogin:
+      description: Native Claude Code sign-in state; no access or refresh tokens
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status]
+            properties:
+              id: { type: string, format: uuid }
+              status: { type: string, enum: [idle, starting, waiting, exchanging, succeeded, failed, cancelled, expired] }
+              url: { type: string, description: Native authorization URL; cleared when login finishes }
+              error: { type: string, description: Safe error message without native CLI output }
+              startedAt: { type: string, format: date-time }
+              expiresAt: { type: string, format: date-time, description: Engine deadline for this login attempt (15 minutes) }
+              finishedAt: { type: string, format: date-time }
+    ClaudeAuth:
+      description: Saved Claude volume status without credentials or volume identifiers
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ClaudeAuth' }
+
   schemas:
+    ClaudeAuth:
+      type: object
+      required: [saved]
+      properties:
+        saved: { type: boolean, description: 'A verified login volume was saved; does not recheck expiry, quota or external Docker volume deletion' }
+        savedAt: { type: string, format: date-time }
+
+    OpenRouterAuth:
+      type: object
+      required: [apiKey, model, configured]
+      properties:
+        apiKey: { type: string, description: 'Masked key; empty when unset' }
+        model: { type: string, description: Default OpenRouter model ID }
+        configured: { type: boolean, description: A key and model are saved (not remote verification) }
+
     LlmMode:
       type: string
       enum: [none, openai-api-key, codex]
-      description: How Codex logs in. Claude, Kimi and GLM come later.
+      description: "none disables LLM use; codex enables automatic selection in order Codex, Claude, OpenRouter. Workflows can select an explicit provider. openai-api-key also permits a legacy direct OpenAI key for the Codex harness."
+
+    Provider:
+      type: string
+      enum: [codex, claude, openrouter]
+      description: 'Workflow provider. Omit for automatic selection: Codex, Claude, OpenRouter. An explicit choice requires saved credentials; errors never change providers.'
 
     ReasoningEffort:
       type: string
@@ -949,16 +1147,17 @@ components:
       anyOf: [{ required: [objective] }, { required: [prompt] }]
       properties:
         name: { type: string, maxLength: 120 }
+        provider: { $ref: '#/components/schemas/Provider' }
         objective: { type: string, minLength: 1, maxLength: 100000, description: What the run should do (given to every stage) }
         prompt: { type: string, minLength: 1, maxLength: 100000, description: 'Older name of `objective` (used when `objective` is absent)' }
         globalProfile: { type: string, description: 'Profile installed as the user in every stage; "" for none. Defaults to the saved setting.' }
-        model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: Default model for every stage }
+        model: { type: string, pattern: '^~?[A-Za-z0-9._:/-]{1,120}$', description: Default model for every stage }
         reasoningEffort: { $ref: '#/components/schemas/ReasoningEffort' }
         continueOnFailure: { type: boolean, default: true, description: 'false: stop after the first failed stage (the rest become skipped)' }
-        fallbackModel: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$', description: 'If a stage''s first attempt fails, retry it once with this model (same objective, same workspace)' }
+        fallbackModel: { type: string, pattern: '^~?[A-Za-z0-9._:/-]{1,120}$', description: 'If a stage''s first attempt fails, retry it once with this model (same objective, same workspace)' }
         reprompts:
           type: array
-          description: Follow-up prompts per stage tag. After a stage's first attempt succeeds, each matching prompt is sent to the same Codex thread, in this order.
+          description: Follow-up prompts per stage tag. After a stage's first attempt succeeds, each matching prompt is sent to the same agent session, in this order.
           items:
             type: object
             required: [stage, prompt]
@@ -998,7 +1197,7 @@ components:
             required: [stage, model]
             properties:
               stage: { type: integer, enum: [1, 2, 3, 4] }
-              model: { type: string, pattern: '^[A-Za-z0-9._:/-]{1,120}$' }
+              model: { type: string, pattern: '^~?[A-Za-z0-9._:/-]{1,120}$' }
 
     WorkspaceRequest:
       description: |
@@ -1016,6 +1215,7 @@ components:
       description: A planned run (from `POST /api/runs/plan`); a created run has these fields plus id, status and times.
       properties:
         name: { type: string }
+        provider: { $ref: '#/components/schemas/Provider' }
         objective: { type: string }
         prompt: { type: string, description: Same as `objective` (older name) }
         globalProfile: { type: string }
@@ -1034,6 +1234,7 @@ components:
       required: [index, profile, status]
       properties:
         index: { type: integer }
+        provider: { $ref: '#/components/schemas/Provider' }
         profile: { type: string }
         tag: { type: string, description: 'Stage number "1"-"4", or "" for explicit stages without one' }
         globalProfile: { type: string }
@@ -1046,11 +1247,11 @@ components:
         startedAt: { type: [string, 'null'], format: date-time }
         finishedAt: { type: [string, 'null'], format: date-time }
         exitCode: { type: [integer, 'null'], description: 'Container exit code; 5 = a profile could not be installed' }
-        threadId: { type: [string, 'null'], description: Codex thread (session) ID }
+        threadId: { type: [string, 'null'], description: Codex thread or Claude session ID }
         turns: { type: integer }
         usage:
           type: [object, 'null']
-          description: Token usage of the last Codex turn
+          description: Token usage of the last completed turn
           properties:
             input_tokens: { type: integer }
             cached_input_tokens: { type: integer }
@@ -1059,11 +1260,12 @@ components:
         errors: { type: array, items: { type: string }, description: Errors from all attempts (a failure rescued by the fallback model is kept here) }
         attempts:
           type: array
-          description: The Codex runs inside this stage, in order
+          description: The agent attempts inside this stage, in order
           items:
             type: object
             properties:
               kind: { type: string, enum: [initial, fallback, reprompt] }
+              provider: { type: string, enum: [codex, claude, openrouter, openai], description: Credential used for this attempt }
               model: { type: string, description: '"" = default model' }
               status: { type: string, enum: [running, succeeded, failed, cancelled] }
               exitCode: { type: [integer, 'null'] }
@@ -1241,13 +1443,17 @@ components:
       type: object
       required: [seq, time, type]
       description: |
-        One line of Codex's `exec --json` stream, plus `seq` and `time`.
+        One line of Codex's `exec --json` or Claude's `--output-format stream-json`
+        stream, plus `seq` and `time`.
         The engine adds `engine.attempt` (kind, model) before and
         `engine.attempt.finished` (kind, exitCode) after each attempt.
         Common Codex types: `thread.started` (thread_id), `turn.started`,
         `item.started` / `item.completed` (item.type: agent_message,
         reasoning, command_execution, file_change, mcp_tool_call, …),
         `turn.completed` (usage), `turn.failed` (error), `error`.
+        Claude types include `system` (init with session_id), `assistant`
+        (text and tool-use content), `user` (tool results), and `result`
+        (subtype, is_error, result, session_id, usage).
       properties:
         seq: { type: integer, minimum: 1 }
         time: { type: string, format: date-time }

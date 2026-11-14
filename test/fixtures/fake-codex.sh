@@ -30,6 +30,10 @@ emit "{\"type\":\"thread.started\",\"thread_id\":\"$thread\"}"
 emit '{"type":"turn.started"}'
 case "$prompt" in *SLEEP*) sleep 300 ;; esac
 case "$prompt" in *PAUSE*) sleep 4 ;; esac
+case "$prompt" in *SUBSCRIPTION-QUOTA*)
+  emit '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'
+  exit 1 ;;
+esac
 # Simulates Codex refreshing a ChatGPT login during the stage.
 case "$prompt" in *REFRESH-LOGIN*)
   jq -c '.tokens.refresh_token = "refreshed-by-stage" | .last_refresh = "now"' ~/.codex/auth.json > ~/.codex/auth.json.new &&
@@ -37,7 +41,7 @@ case "$prompt" in *REFRESH-LOGIN*)
 esac
 if [ "$mode" = new ] && grep -q FAIL-THIS-STAGE /workspace/AGENTS.md 2>/dev/null; then prompt="$prompt FAIL-TURN"; fi
 if [ "$mode" = new ] && grep -q HANG-THIS-STAGE /workspace/AGENTS.md 2>/dev/null; then sleep 300; fi
-if [ "$model" = "bad-model" ]; then
+if [ "$model" = "bad-model" ] || [ "$model" = "test/bad-model" ]; then
   echo "bad-model" >> /workspace/.attempts
   emit '{"type":"turn.failed","error":{"message":"model bad-model is not available"}}'
   exit 1

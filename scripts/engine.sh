@@ -7,7 +7,7 @@
 #   sh scripts/engine.sh status    is it running? (with CYSU_TOKEN set: also its setup status)
 #   sh scripts/engine.sh logs      follow its log
 #   sh scripts/engine.sh update    replace the container with the current image (data is kept)
-#   sh scripts/engine.sh reset-auth  forget the engine token (lost it?), then run setup again
+#   sh scripts/engine.sh reset-auth  disable API access until the installer provisions a token again
 #
 # Settings (environment):
 #   CYSU_ENGINE_IMAGE_REF   engine image          (default ghcr.io/cyber-supplies/cysu-engine:latest;
@@ -17,7 +17,7 @@
 #                           (default: the engine's own default)
 #
 # The engine API needs your Cyber Supplies user token on every request (it is
-# set at the first setup); only "is it up?" (/api/health) answers without it.
+# provisioned locally by install.sh --token); only "is it up?" (/api/health) answers without it.
 #
 # Your settings, logins and runs live in the Docker volume cysu-engine-data;
 # they survive stop/start/update. The engine needs the Docker socket to start
@@ -90,7 +90,7 @@ case "${1:-}" in
     # Only for a lost token. Keeps the passkey, LLM login, workspaces and runs.
     if ! running; then echo "The engine is not running; start it first: sh scripts/engine.sh start"; exit 1; fi
     if [ "${2:-}" != "--yes" ]; then
-      printf 'This removes the engine token. Until you run setup again, the next setup on this machine sets it.\nType yes to continue: '
+      printf 'This removes the engine token and locks protected routes. Restore access with install.sh --token on this host.\nType yes to continue: '
       read -r answer
       [ "$answer" = "yes" ] || { echo "Cancelled."; exit 1; }
     fi

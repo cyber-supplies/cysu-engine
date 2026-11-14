@@ -3,14 +3,17 @@
 // Same machine only: it listens on 127.0.0.1 and rejects requests that come
 // from web pages on other sites or through other host names (DNS rebinding).
 // Every request needs the engine token (the user's Cyber Supplies user
-// token, set at setup): see auth.js and the request handler at the bottom.
+// token, provisioned by the installer): see auth.js and the request handler at the bottom.
 
 import { createServer } from 'node:http';
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { DATA_DIR, load, save } from './store.js';
+import { DATA_DIR } from './store.js';
+import { loadSettings, saveSettings } from './settings.js';
 import { dockerAvailable, IMAGE } from './docker.js';
-import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth } from './llm.js';
+import { startCodexLogin, cancelCodexLogin, codexLoginState, codexAuthInfo, loadCodexAuth, forgetCodexAuth, saveOpenRouterAuth, forgetOpenRouterAuth } from './llm.js';
+import { ClaudeLogin } from './claude-login.js';
+import { llmProvider, openRouterReady } from './llm-policy.js';
 import { Runs } from './runs.js';
 import { API_URL, STAGE_TAGS, fetchProfiles } from './profiles.js';
 import { Workspaces, WorkspaceError } from './workspaces.js';
@@ -21,15 +24,15 @@ import { bearerToken, sameToken, UNAUTHORIZED, oneAtATime, AuthLimiter, tooManyM
 const ENGINE_VERSION = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
-
-const defaultSettings = { token: '', passkey: '', llm: { mode: 'none', apiKey: '' }, globalProfile: '' };
+const claudeLogin = new ClaudeLogin();
 
 const runs = new Runs({
   dir: join(DATA_DIR, 'runs'),
   getSecrets: async () => {
-    const settings = await load('settings', defaultSettings);
-    return { settings, codexAuth: settings.llm?.mode === 'codex' ? await loadCodexAuth() : null };
+    const settings = await loadSettings();
+    return { settings, codexAuth: await loadCodexAuth(), claudeAuth: (await claudeLogin.authInfo()).saved };
   },
+  acquireClaude: () => claudeLogin.acquireVolume(),
   listProfiles: (settings) => fetchProfiles(settings.token),
   onIdle: () => scheduler.tick(),
 });
@@ -71,7 +74,7 @@ async function workspaceView(ws) {
   try {
     // Workspaces have no objective: plan with a stand-in to check the rest.
     const p = await runs.plan({ ...ws.request, objective: 'objective given at run time' });
-    plan = { stages: p.stages.map((st) => ({ order: st.index + 1, tag: st.tag, profile: st.profile, model: st.model || 'default', daybreak: st.daybreak })), globalProfile: p.globalProfile || '' };
+    plan = { provider: p.provider, stages: p.stages.map((st) => ({ order: st.index + 1, tag: st.tag, profile: st.profile, model: st.model || 'default', daybreak: st.daybreak })), globalProfile: p.globalProfile || '' };
   } catch (error) { planError = error.message; }
   return { ...ws, plan, planError };
 }
@@ -99,13 +102,14 @@ async function scheduleView(s) {
 }
 
 async function engineStatus() {
-  const settings = await load('settings', defaultSettings);
+  const settings = await loadSettings();
   const llmMode = settings.llm?.mode || 'none';
-  const llmReady = Boolean((llmMode === 'openai-api-key' && settings.llm?.apiKey) || (llmMode === 'codex' && (await codexAuthInfo()).saved));
+  const provider = llmProvider(settings.llm, (await codexAuthInfo()).saved, (await claudeLogin.authInfo()).saved);
+  const llmReady = Boolean(provider);
   const cysuReady = Boolean(settings.token && settings.passkey);
   return {
     version: ENGINE_VERSION, docker: await dockerAvailable(), image: IMAGE, apiUrl: API_URL,
-    cysu: cysuReady, llm: { mode: llmMode, ready: llmReady },
+    cysu: cysuReady, llm: { mode: llmMode, ready: llmReady, provider },
     configured: cysuReady && llmReady, // everything a run needs is set up
   };
 }
@@ -113,12 +117,13 @@ async function engineStatus() {
 const mask = (v) => (v ? '••••' + String(v).slice(-4) : '');
 
 const LLM_MODES = ['none', 'openai-api-key', 'codex'];
+const publicOpenRouter = (llm) => ({ apiKey: mask(llm?.openrouter?.apiKey), model: llm?.openrouter?.model || '', configured: openRouterReady(llm) });
 
 async function publicSettings(s) {
   return {
     token: mask(s.token),
     passkey: s.passkey ? 'set' : '',
-    llm: { mode: s.llm?.mode || 'none', apiKey: mask(s.llm?.apiKey), codex: await codexAuthInfo() },
+    llm: { mode: s.llm?.mode || 'none', apiKey: mask(s.llm?.apiKey), codex: await codexAuthInfo(), openrouter: publicOpenRouter(s.llm), claude: await claudeLogin.authInfo() },
     globalProfile: s.globalProfile || '',
     configured: Boolean(s.token && s.passkey),
   };
@@ -191,57 +196,31 @@ function unauthorized(res, kind) {
   return send(res, 401, UNAUTHORIZED[kind]);
 }
 
-// verifyToken asks Cyber Supplies whether a user token is real before the
-// engine accepts it (a typo would otherwise lock the user out of the engine).
-async function verifyToken(token) {
-  try {
-    await fetchProfiles(token);
-  } catch (error) {
-    if (error.upstreamStatus === 401 || error.upstreamStatus === 403) {
-      throw Object.assign(new Error('Cyber Supplies did not accept this token: check it (or make a new user token) and try again'), { status: 400 });
-    }
-    throw Object.assign(new Error('Could not check the token with Cyber Supplies right now (is the network up?); try again'), { status: 503 });
-  }
-}
-
-// putSettings: PUT /api/settings. With `setup` it is the first setup (no
-// engine token stored yet, so the request carried none): it must set a token,
-// and loses to a setup that finished first. One change at a time.
-async function putSettings(req, res, { setup }) {
+// The token is never accepted here, even from an authenticated request.
+async function putSettings(req, res) {
   const input = await body(req);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return send(res, 400, { error: 'Settings must be a JSON object' });
+  if (Object.hasOwn(input, 'token')) return send(res, 400, { error: 'Set or change the user token on the engine host with install.sh --token; token setup through the API is disabled' });
   return oneAtATime(async () => {
-    const settings = await load('settings', defaultSettings);
-    if (setup && settings.token) { authFailed(); return unauthorized(res, 'token'); } // someone else set it up first
-    // Empty fields mean "keep what is stored", so masked values never overwrite secrets.
+    const settings = await loadSettings();
     const next = { ...settings, llm: { ...settings.llm } };
-    const token = input.token ? String(input.token).trim() : '';
-    if (setup && !token) return unauthorized(res, 'setup');
-    if (token) {
-      // The engine works with a USER token (usr_…); LLM tokens cannot manage
-      // profiles and workspaces.
-      if (!token.startsWith('usr_')) return send(res, 400, { error: 'The engine needs your Cyber Supplies user token (it starts with usr_), not an LLM token' });
-      if (token !== settings.token) {
-        try { await verifyToken(token); } catch (error) { if (error.status === 400) authFailed(); throw error; }
-      }
-      next.token = token;
-    }
     if (input.passkey) next.passkey = String(input.passkey);
     if (input.llm?.mode) {
       if (!LLM_MODES.includes(input.llm.mode)) return send(res, 400, { error: 'Unknown LLM login mode' });
-      if (input.llm.mode === 'codex' && !(await codexAuthInfo()).saved) {
-        return send(res, 400, { error: 'Sign in with ChatGPT first' });
+      if (input.llm.mode === 'codex' && !(await codexAuthInfo()).saved && !(await claudeLogin.authInfo()).saved && !openRouterReady(settings.llm)) {
+        return send(res, 400, { error: 'Sign in with ChatGPT or Claude, or add OpenRouter credentials first' });
       }
       next.llm.mode = input.llm.mode;
     }
     if (input.llm?.apiKey) next.llm.apiKey = String(input.llm.apiKey).trim();
     if (input.globalProfile !== undefined) next.globalProfile = String(input.globalProfile);
-    await save('settings', next);
-    return send(res, 200, { ...(await publicSettings(next)), ...(token && settings.token && token !== settings.token ? { tokenChanged: true } : {}) });
+    await saveSettings(next);
+    return send(res, 200, await publicSettings(next));
   });
 }
 
 async function api(req, res, path) {
-  const settings = await load('settings', defaultSettings);
+  const settings = await loadSettings();
 
   if (path === '/api/status' && req.method === 'GET') {
     return send(res, 200, await engineStatus());
@@ -249,7 +228,19 @@ async function api(req, res, path) {
 
   if (path === '/api/settings') {
     if (req.method === 'GET') return send(res, 200, await publicSettings(settings));
-    if (req.method === 'PUT') return putSettings(req, res, { setup: false });
+    if (req.method === 'PUT') return putSettings(req, res);
+  }
+
+  if (path === '/api/llm/openrouter-auth') {
+    if (req.method === 'GET') return send(res, 200, publicOpenRouter(settings.llm));
+    if (req.method === 'PUT') {
+      await saveOpenRouterAuth(await body(req));
+      return send(res, 200, publicOpenRouter((await loadSettings()).llm));
+    }
+    if (req.method === 'DELETE') {
+      await forgetOpenRouterAuth();
+      return send(res, 200, publicOpenRouter((await loadSettings()).llm));
+    }
   }
 
   // Codex "Sign in with ChatGPT" (device code login in a worker container).
@@ -263,7 +254,31 @@ async function api(req, res, path) {
   }
   if (path === '/api/llm/codex-auth' && req.method === 'DELETE') {
     await forgetCodexAuth();
-    return send(res, 200, await publicSettings(await load('settings', defaultSettings)));
+    return send(res, 200, await publicSettings(await loadSettings()));
+  }
+
+  // Claude Code performs its native login in a container. Only the one-time
+  // browser code is relayed over stdin; credentials stay in its named volume.
+  if (path === '/api/llm/claude-login') {
+    if (req.method === 'GET') return send(res, 200, claudeLogin.state());
+    if (req.method === 'POST') {
+      if (hasBody(req)) {
+        const input = await body(req);
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length) {
+          return send(res, 400, { error: 'Start Claude login with an empty body; credentials are managed by Claude Code' });
+        }
+      }
+      if (!(await dockerAvailable())) return send(res, 503, { error: 'Docker is not available on this machine' });
+      return send(res, 202, await claudeLogin.start());
+    }
+    if (req.method === 'DELETE') return send(res, 200, await claudeLogin.cancel());
+  }
+  if (path === '/api/llm/claude-login/code' && req.method === 'POST') {
+    return send(res, 202, await claudeLogin.submitCode(await body(req)));
+  }
+  if (path === '/api/llm/claude-auth') {
+    if (req.method === 'GET') return send(res, 200, await claudeLogin.authInfo());
+    if (req.method === 'DELETE') return send(res, 200, await claudeLogin.forget());
   }
 
   // Profiles come from the user's Cyber Supplies account via the gateway.
@@ -424,6 +439,7 @@ if (process.env.CYSU_ENGINE_TEST_NO_FIREWALL === '1') {
 await runs.recover().then(({ removedContainers }) => {
   if (removedContainers.length) console.log(`removed ${removedContainers.length} leftover container(s): ${removedContainers.join(', ')}`);
 });
+await claudeLogin.recover();
 
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
@@ -440,13 +456,10 @@ const server = createServer(async (req, res) => {
     if (locked) return tooMany(res, locked);
 
     // The engine token check, for every other request, before anything else
-    // (the body is not even read). Before setup there is no token: only the
-    // setup call itself (PUT /api/settings with a token) is let through.
-    const stored = (await load('settings', defaultSettings)).token;
-    if (!stored) {
-      if (path === '/api/settings' && req.method === 'PUT') return await putSettings(req, res, { setup: true });
-      return unauthorized(res, 'setup');
-    }
+    // (the body is not even read). Unprovisioned/reset engines stay locked
+    // until the installer writes the private auth file locally.
+    const stored = (await loadSettings()).token;
+    if (!stored) return unauthorized(res, 'setup');
     if (!sameToken(bearerToken(req.headers.authorization), stored)) {
       if (req.headers.authorization !== undefined) authFailed(); // a wrong token is a guess; no header is not
       return unauthorized(res, 'token');
@@ -480,6 +493,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, async () => {
     server.close();
     scheduler.stop();
+    await claudeLogin.cancel().catch(() => console.error('Could not clean up Claude login; it will be retried at startup'));
     await runs.close();
     process.exit(0);
   });

@@ -1,3 +1,4 @@
+import { provisionToken } from './fixtures/provision-auth.js';
 // The API behind the CLI's slash commands: /workspace, /load, /run, /runs,
 // /watch (feed), /cancel, /download — workspaces by exact id, short run ids. Real engine + stand-in Cyber Supplies API + stand-in Codex stages.
 // Needs Docker + both images (npm run image:build && npm run image:build:test).
@@ -28,7 +29,8 @@ before(async () => {
     if (await fetch(`${base}/api/health`).then((r) => r.ok, () => false)) break;
     await sleep(200);
   }
-  await http('/api/settings', 'PUT', { token: TOKEN, passkey: 'pk', llm: { mode: 'openai-api-key', apiKey: 'sk-wsapi' } });
+  assert.equal((await provisionToken({ dir, apiUrl: api.url }, TOKEN)).code, 0);
+  await http('/api/settings', 'PUT', { passkey: 'pk', llm: { mode: 'openai-api-key', apiKey: 'sk-wsapi' } });
 });
 after(async () => {
   server?.kill('SIGINT');
@@ -184,11 +186,11 @@ test('deleting a workspace by id', async () => {
   assert.match(r.body.error, /No workspace with id/);
 });
 
-test('settings: only a USER token (usr_…) is accepted; an LLM token is refused', async () => {
+test('settings: HTTP token changes are refused', async () => {
   const r = await http('/api/settings', 'PUT', { token: 'llm_0123456789abcdef' });
   assert.equal(r.status, 400);
-  assert.match(r.body.error, /needs your Cyber Supplies user token \(it starts with usr_\)/);
-  assert.equal((await http('/api/settings', 'PUT', { token: TOKEN })).status, 200);
+  assert.match(r.body.error, /install.sh --token/);
+  assert.equal((await http('/api/settings', 'PUT', { token: TOKEN })).status, 400);
 });
 
 test('unknown ids on log/feed/events endpoints get a clean 404, and the engine stays up', async () => {

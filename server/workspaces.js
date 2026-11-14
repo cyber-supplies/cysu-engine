@@ -12,6 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { load, save } from './store.js';
+import { validateProvider } from './llm-policy.js';
 
 export class WorkspaceError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -108,6 +109,8 @@ export class Workspaces {
     if (!name) throw new WorkspaceError(400, 'A workspace needs a name');
     if (name.length > 80) throw new WorkspaceError(400, 'Workspace names are limited to 80 characters');
     if (!request || typeof request !== 'object' || Array.isArray(request)) throw new WorkspaceError(400, 'A workspace needs a run request');
+    validateProvider(request.provider);
+    if (Array.isArray(request.stages) && request.stages.some((s) => s?.provider !== undefined)) throw new WorkspaceError(400, 'Set provider on the workflow request, not on individual stages');
     // An empty prompt is allowed (older clients send one) and dropped.
     if (objectiveOf(request)) throw new WorkspaceError(400, NO_OBJECTIVE);
   }

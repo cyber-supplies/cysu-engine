@@ -16,6 +16,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startFakeApi } from './fixtures/fake-api.js';
+import { provisionToken } from './fixtures/provision-auth.js';
 
 const TOKEN = 'usr_journey-test-token-8b';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -77,11 +78,12 @@ test('1. start: the engine is up but not set up yet (401 setupRequired)', async 
   assert.equal(r.body.setupRequired, true);
 });
 
-test('2. setup: user token (an LLM token is refused) + passkey, then the LLM login', async () => {
-  let r = await call('PUT', '/api/settings', { token: 'llm_0011223344556677', passkey: 'my passkey' });
-  assert.equal(r.status, 400);
-  assert.match(r.body.error, /user token \(it starts with usr_\)/);
-  r = await call('PUT', '/api/settings', { token: TOKEN, passkey: 'my passkey' });
+test('2. installer provisions the token locally, then authenticated passkey and LLM login', async () => {
+  let r = await call('PUT', '/api/settings', { token: TOKEN });
+  assert.equal(r.status, 401, 'HTTP cannot enroll a token');
+  const provisioned = await provisionToken({ dir, apiUrl: api.url, container: IN_CONTAINER ? names.container : undefined }, TOKEN);
+  assert.equal(provisioned.code, 0, provisioned.output);
+  r = await call('PUT', '/api/settings', { passkey: 'my passkey' });
   assert.equal(r.status, 200);
   assert.deepEqual([r.body.passkey, r.body.token.startsWith('••••')], ['set', true], 'secrets come back masked');
   const s = (await call('GET', '/api/status')).body;
@@ -153,7 +155,7 @@ test('7. /runs and /download', async () => {
   assert.ok((await res.arrayBuffer()).byteLength > 100);
 });
 
-test('8. lost token: reset-auth (as engine.sh does it) → setup again; workspaces and runs are kept', async () => {
+test('8. reset-auth locks the API until local provisioning; workspaces and runs are kept', async () => {
   const out = IN_CONTAINER
     ? execFileSync('docker', ['exec', names.container, 'node', 'server/reset-auth.js']).toString()
     : execFileSync(process.execPath, ['server/reset-auth.js'], { env: { ...process.env, CYSU_ENGINE_DATA: dir } }).toString();
@@ -161,7 +163,9 @@ test('8. lost token: reset-auth (as engine.sh does it) → setup again; workspac
   let r = await call('GET', '/api/status');
   assert.deepEqual([r.status, r.body.setupRequired], [401, true]);
   r = await call('PUT', '/api/settings', { token: TOKEN });
-  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.status, 401, 'reset never reopens HTTP enrollment');
+  const provisioned = await provisionToken({ dir, apiUrl: api.url, container: IN_CONTAINER ? names.container : undefined }, TOKEN);
+  assert.equal(provisioned.code, 0, provisioned.output);
   assert.equal((await call('GET', '/api/status')).body.configured, true, 'passkey + LLM login kept');
   assert.equal((await call('GET', ws(picked))).body.name, 'Picked by hand');
   assert.equal((await call('GET', '/api/runs')).body[0].id.slice(0, 8), shortId);

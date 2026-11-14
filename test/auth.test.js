@@ -6,11 +6,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { startFakeApi } from './fixtures/fake-api.js';
+import { provisionToken } from './fixtures/provision-auth.js';
 import { bearerToken, sameToken, AuthLimiter } from '../server/auth.js';
 
 const TOKEN = 'usr_auth-test-token-5f1e9a';
@@ -59,7 +60,7 @@ async function startEngine(apiUrl = api.url, extraEnv = {}) {
   child.stdout.on('data', (d) => { output += d; });
   child.stderr.on('data', (d) => { output += d; });
   const base = `http://127.0.0.1:${port}`;
-  const engine = { child, dir, base, output: () => output };
+  const engine = { child, dir, base, apiUrl, output: () => output };
   servers.push(engine);
   for (let i = 0; i < 50; i++) {
     if (await fetch(`${base}/api/health`).then((r) => r.ok, () => false)) return engine;
@@ -80,7 +81,11 @@ async function req(e, method, path, { token, headers = {}, body } = {}) {
   return { status: r.status, headers: r.headers, body: json, text };
 }
 
-const setup = (e, token, extra = {}) => req(e, 'PUT', '/api/settings', { body: { token, passkey: 'pk', ...extra } });
+const setup = async (e, token, extra = {}) => {
+  const provisioned = await provisionToken(e, token);
+  assert.equal(provisioned.code, 0, provisioned.output);
+  return req(e, 'PUT', '/api/settings', { token, body: { passkey: 'pk', ...extra } });
+};
 
 // ---- the pieces ---------------------------------------------------------------------
 
@@ -119,26 +124,31 @@ test('before setup: only /api/health answers; every route is 401 setupRequired',
   }
 });
 
-test('before setup: a setup without a token, with an LLM token, or with a token Cyber Supplies refuses saves nothing', async () => {
-  let r = await req(fresh, 'PUT', '/api/settings', { body: { passkey: 'pk', llm: { mode: 'openai-api-key', apiKey: 'sk-x' } } });
-  assert.equal(r.status, 401);
-  assert.equal(r.body.setupRequired, true);
-  r = await setup(fresh, 'llm_0011223344556677');
-  assert.equal(r.status, 400);
-  assert.match(r.body.error, /user token \(it starts with usr_\)/);
-  r = await setup(fresh, 'usr_made-up-token');
-  assert.equal(r.status, 400);
-  assert.match(r.body.error, /Cyber Supplies did not accept this token/);
-  assert.equal((await req(fresh, 'GET', '/api/status')).body.setupRequired, true, 'still not set up');
-  await assert.rejects(readFile(join(fresh.dir, 'settings.json')), { code: 'ENOENT' }, 'nothing was saved');
+test('HTTP enrollment is always refused, including real tokens, without upstream calls', async () => {
+  const before = api.requests.length;
+  for (const token of [TOKEN, OTHER, 'llm_bad', 'usr_invalid']) {
+    const r = await req(fresh, 'PUT', '/api/settings', { token, body: { token, passkey: 'pk' } });
+    assert.equal(r.status, 401);
+    assert.match(r.body.error, /install.sh --token/);
+  }
+  assert.equal(api.requests.length, before);
+  await assert.rejects(readFile(join(fresh.dir, 'auth.json')), { code: 'ENOENT' });
 });
 
-test('before setup: Cyber Supplies unreachable â†’ 503, nothing saved', async () => {
+test('local provisioning rejects missing, malformed and refused tokens without saving', async () => {
+  for (const token of ['', 'llm_bad', 'usr_bad\ninjected', 'usr_made-up-token']) {
+    const r = await provisionToken(fresh, token);
+    assert.equal(r.code, 1, r.output);
+  }
+  await assert.rejects(readFile(join(fresh.dir, 'auth.json')), { code: 'ENOENT' });
+});
+
+test('local provisioning fails closed if Cyber Supplies is unreachable', async () => {
   const down = await startEngine(`http://127.0.0.1:${await freePort()}`);
-  const r = await setup(down, TOKEN);
-  assert.equal(r.status, 503);
-  assert.match(r.body.error, /Could not check the token/);
-  assert.equal((await req(down, 'GET', '/api/status')).body.setupRequired, true);
+  const r = await provisionToken(down, TOKEN);
+  assert.equal(r.code, 1);
+  assert.match(r.output, /Could not check/);
+  await assert.rejects(readFile(join(down.dir, 'auth.json')), { code: 'ENOENT' });
 });
 
 test('before setup: same-machine checks still come first (403 beats 401)', async () => {
@@ -146,13 +156,13 @@ test('before setup: same-machine checks still come first (403 beats 401)', async
   assert.equal((await req(fresh, 'PUT', '/api/settings', { body: `token=${TOKEN}`, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })).status, 403);
 });
 
-test('two setups at the same time: exactly one wins; the loser\'s token does not work', async () => {
-  const race = await startEngine();
-  const [a, b] = await Promise.all([setup(race, TOKEN), setup(race, OTHER)]);
-  assert.deepEqual([a.status, b.status].sort(), [200, 401], `${a.status} ${b.status}`);
-  const [winner, loser] = a.status === 200 ? [TOKEN, OTHER] : [OTHER, TOKEN];
-  assert.equal((await req(race, 'GET', '/api/status', { token: winner })).status, 200);
-  assert.equal((await req(race, 'GET', '/api/status', { token: loser })).status, 401);
+test('legacy settings tokens do not reopen enrollment or authenticate requests', async () => {
+  const e = await startEngine();
+  await writeFile(join(e.dir, 'settings.json'), JSON.stringify({ token: TOKEN, passkey: 'legacy' }));
+  assert.equal((await req(e, 'GET', '/api/status', { token: TOKEN })).status, 401);
+  assert.equal((await req(e, 'PUT', '/api/settings', { token: TOKEN, body: { token: OTHER } })).status, 401);
+  assert.equal((await provisionToken(e, OTHER)).code, 0);
+  assert.equal((await req(e, 'GET', '/api/settings', { token: OTHER })).body.passkey, 'set');
 });
 
 // ---- after setup ----------------------------------------------------------------------
@@ -194,7 +204,7 @@ test('after setup: every route is 401 without the right token, in any form but t
 });
 
 test('after setup: a second "setup" without the token cannot take the engine over', async () => {
-  const r = await setup(eng, OTHER); // a real token, but not this engine's
+  const r = await req(eng, 'PUT', '/api/settings', { body: { token: OTHER } });
   assert.equal(r.status, 401);
   assert.equal((await req(eng, 'GET', '/api/status', { token: OTHER })).status, 401);
   assert.equal((await req(eng, 'GET', '/api/status', { token: TOKEN })).status, 200);
@@ -207,23 +217,23 @@ test('an unauthenticated request is refused before its body is read (huge body â
   assert.equal((await req(eng, 'POST', '/api/runs', { body: huge, token: TOKEN })).status, 413, 'with the token the size limit applies');
 });
 
-test('changing the token: needs the current one; checked with Cyber Supplies; the old one stops working at once', async () => {
-  let r = await req(eng, 'PUT', '/api/settings', { body: { token: NEWER } });
-  assert.equal(r.status, 401, 'no header');
-  r = await req(eng, 'PUT', '/api/settings', { token: TOKEN, body: { token: 'usr_not-real' } });
-  assert.equal(r.status, 400);
-  assert.match(r.body.error, /did not accept this token/);
-  assert.equal((await req(eng, 'GET', '/api/status', { token: TOKEN })).status, 200, 'a refused change keeps the old token');
-
-  r = await req(eng, 'PUT', '/api/settings', { token: TOKEN, body: { token: NEWER } });
-  assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.equal(r.body.tokenChanged, true);
-  assert.equal((await req(eng, 'GET', '/api/status', { token: TOKEN })).status, 401, 'old token');
-  assert.equal((await req(eng, 'GET', '/api/status', { token: NEWER })).status, 200, 'new token');
-
-  r = await req(eng, 'PUT', '/api/settings', { token: NEWER, body: { token: NEWER, passkey: 'pk2' } });
-  assert.equal(r.status, 200);
-  assert.equal(r.body.tokenChanged, undefined, 'same token: not a change');
+test('API token writes are rejected atomically; only local provisioning rotates it', async () => {
+  const before = api.requests.length;
+  for (const token of [NEWER, TOKEN, '', null, false, {}, []]) {
+    const r = await req(eng, 'PUT', '/api/settings', { token: TOKEN, body: { token, passkey: 'must-not-save' } });
+    assert.equal(r.status, 400);
+    assert.match(r.body.error, /install.sh --token/);
+  }
+  assert.equal(api.requests.length, before);
+  assert.equal(JSON.parse(await readFile(join(eng.dir, 'settings.json'))).passkey, 'pk');
+  assert.equal((await provisionToken(eng, 'usr_rejected')).code, 1);
+  assert.equal((await req(eng, 'GET', '/api/status', { token: TOKEN })).status, 200);
+  assert.equal((await provisionToken(eng, NEWER)).code, 0);
+  assert.equal((await req(eng, 'GET', '/api/status', { token: TOKEN })).status, 401);
+  assert.equal((await req(eng, 'GET', '/api/status', { token: NEWER })).status, 200);
+  assert.equal((await stat(join(eng.dir, 'auth.json'))).mode & 0o777, 0o600);
+  const settings = JSON.parse(await readFile(join(eng.dir, 'settings.json')));
+  assert.equal(settings.token, undefined);
 });
 
 test('Cyber Supplies refusing the stored token is a 502 that says so, never a 401', async () => {
@@ -231,7 +241,7 @@ test('Cyber Supplies refusing the stored token is a 502 that says so, never a 40
   try {
     const r = await req(eng, 'GET', '/api/profiles', { token: NEWER });
     assert.equal(r.status, 502);
-    assert.match(r.body.error, /did not accept your user token .*set a new one with \/setup/);
+    assert.match(r.body.error, /did not accept your user token .*install.sh --token/);
     const plan = await req(eng, 'POST', '/api/runs/plan', { token: NEWER, body: { prompt: 'p', fromTags: {} } });
     assert.equal(plan.status, 502);
     assert.equal((await req(eng, 'GET', '/api/status', { token: NEWER })).status, 200, 'the engine still lets the user in');
@@ -277,13 +287,11 @@ test('lockout over HTTP: wrong tokens lock everyone out (right token too) for th
   assert.equal((await req(e, 'GET', '/api/status', { token: TOKEN })).status, 200, 'over after the lock time');
 });
 
-test('lockout: refused setups count too (no hammering Cyber Supplies with guesses)', async () => {
-  const e = await startEngine(api.url, { CYSU_ENGINE_TEST_AUTH_LOCK_MS: '60000' });
-  for (let i = 0; i < 10; i++) assert.equal((await setup(e, `usr_made-up-${i}`)).status, 400);
+test('repeated HTTP setup attempts never reach Cyber Supplies', async () => {
+  const e = await startEngine();
   const before = api.requests.length;
-  const r = await setup(e, TOKEN);
-  assert.equal(r.status, 429, 'locked: even a real token cannot set it up now');
-  assert.equal(api.requests.length, before, 'and Cyber Supplies was not asked');
+  for (let i = 0; i < 20; i++) assert.equal((await req(e, 'PUT', '/api/settings', { body: { token: OTHER } })).status, 401);
+  assert.equal(api.requests.length, before);
 });
 
 // ---- reset-auth ---------------------------------------------------------------------------
@@ -307,7 +315,8 @@ test('reset-auth: forgets ONLY the token; the engine needs setup again; everythi
   const saved = JSON.parse(await readFile(join(e.dir, 'settings.json'), 'utf8'));
   assert.deepEqual([saved.token, saved.passkey, saved.llm.mode, saved.llm.apiKey], [undefined, 'pk', 'openai-api-key', 'sk-reset'], 'only the token is gone');
 
-  assert.equal((await req(e, 'PUT', '/api/settings', { body: { token: NEWER } })).status, 200, 'set up again with a new token');
+  assert.equal((await req(e, 'PUT', '/api/settings', { body: { token: NEWER } })).status, 401, 'reset never reopens HTTP enrollment');
+  assert.equal((await provisionToken(e, NEWER)).code, 0);
   assert.equal((await req(e, 'GET', `/api/workspaces/${w.id}`, { token: NEWER })).body.name, 'Kept', 'workspaces kept');
   assert.equal((await req(e, 'GET', '/api/status', { token: NEWER })).body.configured, true, 'passkey and LLM login kept');
 

@@ -28,7 +28,7 @@ export async function fetchProfiles(token, { apiUrl = API_URL, fetchImpl = fetch
   // Never answered as 401: to the engine's client a 401 means "wrong ENGINE
   // token". Cyber Supplies refusing the stored token is a 502 that says so.
   if (response.status === 401 || response.status === 403) {
-    throw Object.assign(new ProfileError(502, `Cyber Supplies did not accept your user token (${response.status}); it may have been revoked: set a new one with /setup`), { upstreamStatus: response.status });
+    throw Object.assign(new ProfileError(502, `Cyber Supplies did not accept your user token (${response.status}); it may have been revoked: set a new one on the engine host with install.sh --token`), { upstreamStatus: response.status });
   }
   if (!response.ok) throw Object.assign(new ProfileError(502, `Cyber Supplies profile lookup failed (${response.status})`), { upstreamStatus: response.status });
   if (!Array.isArray(data)) throw new ProfileError(502, 'Cyber Supplies profiles response must be an array');

@@ -1,8 +1,8 @@
 // auth.js: the engine API's login. The engine token IS the user's Cyber
-// Supplies user token (usr_…), set once with PUT /api/settings (the setup).
+// Supplies user token (usr_…), provisioned locally by the installer.
 // After that every request must carry it as `Authorization: Bearer <token>`;
 // anything else gets 401. Before setup, every request gets 401 with
-// `setupRequired: true`, except the setup call itself (see index.js).
+// `setupRequired: true`; HTTP cannot enroll or replace a token.
 //
 // Rules:
 //  - only the Authorization header counts (never a query string or body);
@@ -31,7 +31,7 @@ export function sameToken(sent, stored) {
 }
 
 export const UNAUTHORIZED = {
-  setup: { error: 'The engine is not set up yet: set your Cyber Supplies user token first (PUT /api/settings {"token": "usr_…"})', setupRequired: true },
+  setup: { error: 'Engine authentication is not provisioned. On the engine host, run install.sh --token <your user token>; setup through the API is disabled', setupRequired: true },
   token: { error: 'Missing or wrong engine token: send Authorization: Bearer <your Cyber Supplies user token>', setupRequired: false },
 };
 
@@ -42,7 +42,7 @@ export const tooManyMessage = (seconds) => `Too many wrong engine tokens: the en
 // the right token still worked during a lockout, an attacker could keep
 // guessing and tell a hit (200) from a miss (429), which would make the
 // lockout useless. Only requests that PRESENT a token count (a wrong Bearer
-// header, a refused setup); a missing header is not a guess. In memory: a
+// header); a missing header is not a guess. In memory: a
 // restart clears it.
 export class AuthLimiter {
   constructor({ max = 10, windowMs = 60_000, lockMs = 60_000, now = Date.now } = {}) {
@@ -68,8 +68,7 @@ export class AuthLimiter {
   }
 }
 
-// A queue so settings changes (and the first setup) happen one at a time:
-// two setups racing each other cannot both win.
+// Serialize authenticated settings changes within the server.
 let queue = Promise.resolve();
 export function oneAtATime(fn) {
   const next = queue.then(fn);

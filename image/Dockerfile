@@ -1,5 +1,5 @@
 # cysu-engine workspace image: what every workflow run executes in.
-# Node + Go + Python + ProjectDiscovery tools + curl/utilities + cysu CLI + Codex.
+# Node + Go + Python + ProjectDiscovery tools + cysu CLI + Codex + Claude Code.
 #
 #   docker build -t cysu-engine-workspace:dev image
 #   (release target: docker buildx build --platform linux/amd64 image)
@@ -26,7 +26,7 @@ FROM golang:1.26-bookworm AS gotoolchain
 # ---- runtime ----------------------------------------------------------------
 FROM node:22-bookworm
 LABEL org.opencontainers.image.source="https://github.com/cyber-supplies/cysu-engine" \
-      org.opencontainers.image.description="Cyber Supplies Engine worker: Node, Go, Python, ProjectDiscovery, cysu CLI, Codex"
+      org.opencontainers.image.description="Cyber Supplies Engine worker: Node, Go, Python, ProjectDiscovery, cysu CLI, Codex, Claude Code"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl wget ca-certificates git jq unzip less vim-tiny \
@@ -41,15 +41,19 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 
 # The entrypoint refreshes the CLI on every start. Keep a baseline copy in the
 # image for test tooling and to make the image useful before a stage starts.
-# Codex is pinned only when reproducing an older image.
-ARG CODEX_VERSION=latest
-RUN npm install -g @cyber-supplies/cysu@latest @openai/codex@${CODEX_VERSION} \
+# Command-backed provider auth and catalog discovery are tested with this release.
+ARG CODEX_VERSION=0.167.0
+ARG CLAUDE_CODE_VERSION=2.1.325
+RUN npm install -g @cyber-supplies/cysu@latest @openai/codex@${CODEX_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
  && npm cache clean --force \
  && cysu help >/dev/null
 
 # Unprivileged user (fixed uid so engine-side files line up); the global
 # profile is installed as this user, workspace profiles go in /workspace.
-RUN useradd -m -u 10001 -s /bin/bash runner && mkdir -p /workspace && chown runner:runner /workspace
+RUN useradd -m -u 10001 -s /bin/bash runner \
+ && mkdir -p /workspace /home/runner/.claude \
+ && chown runner:runner /workspace /home/runner/.claude \
+ && chmod 0700 /home/runner/.claude
 COPY --chmod=755 entrypoint.sh /usr/local/bin/cysu-entrypoint
 COPY --chmod=755 egress-guard.sh /usr/local/bin/cysu-egress-guard
 

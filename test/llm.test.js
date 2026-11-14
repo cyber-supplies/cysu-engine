@@ -1,3 +1,4 @@
+import { provisionToken } from './fixtures/provision-auth.js';
 // LLM login: OpenAI API key and Codex (ChatGPT) device login.
 // Needs Docker and the image (npm run image:build). Run: npm run test:image
 // The device login is exercised with a stand-in for OpenAI (no real account):
@@ -6,7 +7,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { mkdtemp, rm, stat, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, stat, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -19,6 +20,7 @@ const llm = await import('../server/llm.js');
 const { load, save } = await import('../server/store.js');
 
 const API_KEY = `sk-test-${randomBytes(8).toString('hex')}`;
+const ROUTER_KEY = `sk-or-test-${randomBytes(8).toString('hex')}`;
 const FAKE_AUTH = { auth_mode: 'chatgpt', tokens: { access_token: 'fake-at', refresh_token: `fake-rt-${randomBytes(4).toString('hex')}` } };
 const base = { token: 'test-token', passkey: 'test-passkey' };
 
@@ -63,6 +65,17 @@ test('Codex login mode: the saved auth.json is installed exactly, owner-only', a
   assert.match(r.stderr, /^\[engine\] LLM login: Codex \(ChatGPT\)$/m);
   assert.deepEqual(JSON.parse(r.stdout.split('\n').find((l) => l.startsWith('{'))), FAKE_AUTH);
   assert.match(r.stdout, /^auth=runner 600$/m);
+});
+
+test('OpenRouter key lives in a private file, not the agent environment or Codex config', async () => {
+  const line = secretsLine({ ...base, llm: { mode: 'codex', openrouter: { apiKey: ROUTER_KEY, model: 'anthropic/test-model' } } });
+  const r = await worker('stat -c "key=%U %a" ~/.config/cysu/openrouter.key; cat ~/.codex/config.toml; env | grep -c OPENROUTER_API_KEY || true; test ! -f ~/.codex/auth.json', line);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /^key=runner 600$/m);
+  assert.match(r.stdout, /base_url = "https:\/\/openrouter.ai\/api\/v1"/);
+  assert.match(r.stdout, /command = "\/bin\/cat"/);
+  assert.match(r.stdout, /^0$/m);
+  assert.ok(!(r.stdout + r.stderr).includes(ROUTER_KEY));
 });
 
 test('no LLM login: worker still starts, and says so', async () => {
@@ -115,6 +128,21 @@ test('forget login: removes it and switches back to no LLM login', async () => {
   assert.equal((await load('settings')).llm.mode, 'none');
 });
 
+test('removing subscription preserves OpenRouter; an in-flight refresh cannot restore the deleted login', async () => {
+  await Promise.all([
+    llm.saveOpenRouterAuth({ apiKey: ROUTER_KEY, model: 'anthropic/test-model' }),
+    llm.saveCodexAuth(FAKE_AUTH),
+  ]);
+  const refreshed = { ...FAKE_AUTH, tokens: { ...FAKE_AUTH.tokens, access_token: 'refreshed' } };
+  const [, accepted] = await Promise.all([llm.forgetCodexAuth(), llm.keepRefreshedCodexAuth(FAKE_AUTH, refreshed)]);
+  assert.equal(accepted, false);
+  assert.equal(await llm.loadCodexAuth(), null);
+  const saved = await load('settings');
+  assert.equal(saved.llm.mode, 'codex');
+  assert.equal(saved.llm.openrouter.apiKey, ROUTER_KEY);
+  await llm.forgetOpenRouterAuth();
+});
+
 // ---- HTTP API ---------------------------------------------------------------------
 
 test('HTTP API: login endpoints and the "sign in first" guard', async () => {
@@ -128,7 +156,8 @@ test('HTTP API: login endpoints and the "sign in first" guard', async () => {
     await waitFor(() => fetch(url('/api/health')).then((r) => r.ok, () => false), 10_000);
     const JSON_AUTH = { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` };
     assert.equal((await fetch(url('/api/llm/codex-login'))).status, 401, 'not set up yet');
-    let r = await fetch(url('/api/settings'), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN, passkey: 'pk' }) });
+    assert.equal((await provisionToken({ dir, apiUrl: api.url }, TOKEN)).code, 0);
+    let r = await fetch(url('/api/settings'), { method: 'PUT', headers: JSON_AUTH, body: JSON.stringify({ passkey: 'pk' }) });
     assert.equal(r.status, 200, 'setup');
 
     r = await fetch(url('/api/llm/codex-login'), { headers: JSON_AUTH });
@@ -136,13 +165,44 @@ test('HTTP API: login endpoints and the "sign in first" guard', async () => {
 
     r = await fetch(url('/api/settings'), { method: 'PUT', headers: JSON_AUTH, body: JSON.stringify({ llm: { mode: 'codex' } }) });
     assert.equal(r.status, 400);
-    assert.match((await r.json()).error, /Sign in with ChatGPT first/);
+    assert.match((await r.json()).error, /Sign in with ChatGPT or Claude, or add OpenRouter credentials first/);
 
     r = await fetch(url('/api/settings'), { method: 'PUT', headers: JSON_AUTH, body: JSON.stringify({ llm: { mode: 'openai-api-key', apiKey: API_KEY } }) });
     const s = await r.json();
     assert.equal(s.llm.mode, 'openai-api-key');
     assert.ok(!JSON.stringify(s).includes(API_KEY), 'API key returned unmasked');
     assert.deepEqual(s.llm.codex, { saved: false });
+
+    const putRouter = (body) => fetch(url('/api/llm/openrouter-auth'), { method: 'PUT', headers: JSON_AUTH, body: JSON.stringify(body) });
+    assert.equal((await fetch(url('/api/llm/openrouter-auth'), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
+    for (const bad of [null, [], { apiKey: ROUTER_KEY }, { apiKey: API_KEY, model: 'a/b' }, { apiKey: ROUTER_KEY, model: 'gpt-test' }, { token: TOKEN, apiKey: ROUTER_KEY, model: 'a/b' }]) {
+      assert.equal((await putRouter(bad)).status, 400);
+    }
+    r = await putRouter({ apiKey: ROUTER_KEY, model: 'anthropic/test-model' });
+    assert.equal(r.status, 200);
+    const router = await r.json();
+    assert.equal(router.configured, true);
+    assert.equal(router.apiKey, '••••' + ROUTER_KEY.slice(-4));
+    const status = () => fetch(url('/api/status'), { headers: JSON_AUTH }).then((r) => r.json());
+    assert.deepEqual((await status()).llm, { mode: 'codex', ready: true, provider: 'openrouter' });
+    const plan = await fetch(url('/api/runs/plan'), { method: 'POST', headers: JSON_AUTH, body: JSON.stringify({ objective: 'hello', stages: [{ profile: 'attack' }] }) }).then((r) => r.json());
+    assert.equal(plan.stages[0].model, 'anthropic/test-model');
+
+    await writeFile(join(dir, 'codex-auth.json'), JSON.stringify({ auth: FAKE_AUTH, savedAt: new Date().toISOString() }), { mode: 0o600 });
+    assert.deepEqual((await status()).llm, { mode: 'codex', ready: true, provider: 'codex' });
+    assert.equal((await putRouter({ model: 'google/test-model' })).status, 200, 'model update preserves the key and subscription');
+    assert.equal((await status()).llm.provider, 'codex');
+    const saved = JSON.parse(await readFile(join(dir, 'settings.json'), 'utf8'));
+    assert.equal(saved.llm.openrouter.apiKey, ROUTER_KEY);
+    assert.equal(saved.llm.apiKey, API_KEY, 'OpenAI API key stays separate');
+    assert.equal((await stat(join(dir, 'settings.json'))).mode & 0o777, 0o600);
+
+    await fetch(url('/api/llm/codex-auth'), { method: 'DELETE', headers: JSON_AUTH });
+    assert.equal((await status()).llm.provider, 'openrouter');
+    assert.equal((await fetch(url('/api/llm/openrouter-auth'), { headers: JSON_AUTH }).then((r) => r.json())).model, 'google/test-model');
+    const removed = await fetch(url('/api/llm/openrouter-auth'), { method: 'DELETE', headers: JSON_AUTH }).then((r) => r.json());
+    assert.deepEqual(removed, { apiKey: '', model: '', configured: false });
+    assert.equal((await status()).llm.ready, false);
   } finally {
     server.kill();
     api.server.close();

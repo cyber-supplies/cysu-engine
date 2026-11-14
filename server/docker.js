@@ -3,6 +3,7 @@
 // out of a stopped container).
 
 import { execFile } from 'node:child_process';
+import { llmProvider } from './llm-policy.js';
 
 export const IMAGE = process.env.CYSU_ENGINE_IMAGE || 'cysu-engine-workspace:dev';
 
@@ -46,12 +47,14 @@ export function dockerAvailable() {
 }
 
 // secretsLine is the one JSON line the entrypoint reads from stdin
-// (CYSU_SECRETS=stdin). Secrets never go in env vars, args or files.
-// The LLM login is either an OpenAI API key or a saved Codex (ChatGPT) login.
-export function secretsLine(settings, codexAuth = null) {
+// (CYSU_SECRETS=stdin). Secrets never go in Docker env vars or arguments.
+// Only the selected provider credential enters the worker; the entrypoint
+// installs it in a private file inside that ephemeral container.
+export function secretsLine(settings, codexAuth = null, provider = llmProvider(settings.llm, codexAuth)) {
   const secrets = { token: settings.token, passphrase: settings.passkey };
-  if (settings.llm?.mode === 'openai-api-key' && settings.llm.apiKey) secrets.openaiApiKey = settings.llm.apiKey;
-  if (settings.llm?.mode === 'codex' && codexAuth) secrets.codexAuth = codexAuth;
+  if (provider === 'openai') secrets.openaiApiKey = settings.llm.apiKey;
+  if (provider === 'codex') secrets.codexAuth = codexAuth;
+  if (provider === 'openrouter') secrets.openrouterApiKey = settings.llm.openrouter.apiKey;
   return `${JSON.stringify(secrets)}\n`;
 }
 
