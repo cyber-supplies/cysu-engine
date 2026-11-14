@@ -42,7 +42,7 @@ CYSU_ENGINE_IMAGE_REF=cysu-engine:dev sh scripts/engine.sh start   # → Engine 
 | `sh scripts/engine.sh stop` | stop it (a run in progress is cancelled) |
 | `sh scripts/engine.sh start` | start it again — your settings, logins and runs are kept |
 | `sh scripts/engine.sh logs` | follow its log |
-| `sh scripts/engine.sh update` | use a newer engine image (data is kept) |
+| `sh scripts/engine.sh update` | download the newest engine image and switch to it (data is kept; if the download fails, the running engine is left as it is) |
 | `sh scripts/engine.sh reset-auth` | lost the token the engine was set up with? forget it, then run setup again (everything else is kept) |
 
 It also restarts by itself after a reboot (`--restart unless-stopped`).
