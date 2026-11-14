@@ -273,3 +273,24 @@ test('Daybreak access check: the real worker asks Codex once per program and rep
   const cyber = await checkDaybreak({ settings, image: TEST_IMAGE, model: 'gpt-5.6-cyber' });
   assert.ok(cyber.results.every((x) => x.ok), JSON.stringify(cyber.results));
 });
+
+test('user secrets reach the agent, and are masked in everything the engine saves', async () => {
+  const value = 'bb_live_stage_test_9f8e7d';
+  const lines = [];
+  const updates = [];
+  const live = startStage({
+    stage: { profile: 'attack', prompt: 'ECHO-SECRET' }, settings, image: TEST_IMAGE,
+    userSecrets: { BROWSERBASE_API_KEY: value },
+    extraEnv: { CYSU_API_URL: api.url, CYSU_EGRESS_GUARD: '0' },
+    onLog: (line) => lines.push(line),
+    onUpdate: (_run, event) => { if (event) updates.push(JSON.stringify(event)); },
+  });
+  const r = await live.done;
+  assert.equal(r.status, 'succeeded', r.log);
+  const everything = [...lines, ...updates, r.log, r.result, JSON.stringify(r.events)].join('\n');
+  assert.ok(!everything.includes(value), 'the value appears nowhere the engine keeps');
+  // The agent did have it: each place it printed it now shows the mask.
+  assert.ok(updates.some((e) => e.includes('key: [secret:BROWSERBASE_API_KEY]')), 'command output masked');
+  assert.match(r.result, /using \[secret:BROWSERBASE_API_KEY\]/, 'agent message masked');
+  assert.ok(lines.some((l) => l.includes('debug: BROWSERBASE_API_KEY=[secret:BROWSERBASE_API_KEY]')), 'stderr masked');
+});

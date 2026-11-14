@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cyber Supplies Engine API
-  version: 0.12.0
+  version: 0.13.0
   description: |
     Local API of cysu-engine: the self-hosted server that runs Cyber Supplies
     profiles as agents in hardened Docker containers. There is no web UI: the
@@ -94,6 +94,19 @@ tags:
   - name: Engine
   - name: Settings
   - name: LLM login
+  - name: Secrets
+    description: |
+      The user's own secrets for their profiles' skills, e.g. an API key a
+      skill needs (`BROWSERBASE_API_KEY`). Each one reaches every stage's
+      agent as an environment variable of that name, so a skill says
+      `$BROWSERBASE_API_KEY` instead of carrying the key in its text. Values
+      are kept on this machine (DATA_DIR/secrets.json, 0600), are never
+      returned by the API, and are masked as `[secret:NAME]` in saved run
+      events and logs. Names are environment variable names (A-Z, 0-9, _;
+      starting with a letter; at most 64). Names the worker uses are
+      reserved: PATH, HOME, proxy variables, and anything starting with
+      CYSU_, OPENAI_, CODEX_, NODE_, NPM_, LD_, GIT_, PYTHON, PERL, RUBY,
+      BASH_ or LC_. At most 50 secrets, 16 KiB each.
   - name: Profiles
   - name: Runs
   - name: Workspaces
@@ -295,6 +308,54 @@ paths:
         '409': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '503': { $ref: '#/components/responses/Error' }
+  /api/secrets:
+    get:
+      tags: [Secrets]
+      summary: The secrets' names and when each was set (never their values)
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '200':
+          description: OK, sorted by name
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SecretInfo' } }
+  /api/secrets/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$' }, example: BROWSERBASE_API_KEY }
+    put:
+      tags: [Secrets]
+      summary: Set a secret (creates it or replaces its value); used from the next stage on
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value: { type: string, minLength: 1, description: 'At most 16 KiB; no NUL' }
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '400': { description: 'Bad name (not an env var name, or reserved), bad value, or 50 secrets already', $ref: '#/components/responses/Error' }
+        '200':
+          description: Saved (the value is not echoed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SecretInfo' }
+    delete:
+      tags: [Secrets]
+      summary: Remove a secret; stages started afterwards no longer get it
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '404': { description: No secret by that name, $ref: '#/components/responses/Error' }
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema: { type: object, properties: { deleted: { type: string } } }
   /api/profiles:
     get:
       tags: [Profiles]
@@ -963,6 +1024,12 @@ components:
               finishedAt: { type: string, format: date-time }
 
   schemas:
+    SecretInfo:
+      type: object
+      required: [name, updatedAt]
+      properties:
+        name: { type: string, example: BROWSERBASE_API_KEY }
+        updatedAt: { type: string, format: date-time }
     LlmMode:
       type: string
       enum: [none, openai-api-key, codex]

@@ -114,7 +114,30 @@ function applyEvent(run, event) {
 // `link` ({ network, ip, port, key }, engine linked): the worker joins that
 // network and gets CYSU_ENGINE_URL; its firewall lets through that one
 // address:port; the read-only key goes in with the other secrets (stdin).
-export function startStage({ stage: input, settings, codexAuth = null, image = IMAGE, extraEnv = {}, link = null, onUpdate = () => {}, onLog = () => {} }) {
+// Shortest secret value that is masked: masking a very short value would
+// garble ordinary text wherever those few characters happen to appear.
+export const MIN_MASKED_SECRET = 6;
+
+// secretMasker returns a function that replaces every user secret value in a
+// line with [secret:NAME], before the engine saves or shows it (events, log,
+// result, downloads, engine linked reads). The JSON-escaped form is masked
+// too, since events arrive as JSON. The replacement has no quotes or
+// backslashes, so a JSON line stays valid JSON.
+export function secretMasker(userSecrets = {}) {
+  const forms = [];
+  for (const [name, value] of Object.entries(userSecrets || {})) {
+    if (typeof value !== 'string' || value.length < MIN_MASKED_SECRET) continue;
+    for (const form of new Set([value, JSON.stringify(value).slice(1, -1)])) forms.push([form, `[secret:${name}]`]);
+  }
+  forms.sort((a, b) => b[0].length - a[0].length); // a longer value first, if one contains another
+  if (forms.length === 0) return (text) => text;
+  return (text) => {
+    for (const [form, mask] of forms) if (text.includes(form)) text = text.split(form).join(mask);
+    return text;
+  };
+}
+
+export function startStage({ stage: input, settings, codexAuth = null, userSecrets = {}, image = IMAGE, extraEnv = {}, link = null, onUpdate = () => {}, onLog = () => {} }) {
   const stage = validateStage(input);
   const id = randomUUID();
   const container = `cysu-stage-${id.slice(0, 8)}`;
@@ -141,17 +164,20 @@ export function startStage({ stage: input, settings, codexAuth = null, image = I
 
   const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdin.on('error', () => {});
-  child.stdin.end(secretsLine(settings, codexAuth, link?.key || ''));
+  child.stdin.end(secretsLine(settings, codexAuth, link?.key || '', userSecrets));
 
-  const appendLog = (line) => {
+  const mask = secretMasker(userSecrets);
+  const appendLog = (raw) => {
+    const line = mask(raw);
     onLog(line);
     run.log += `${line}\n`;
     if (run.log.length > MAX_LOG) run.log = run.log.slice(-MAX_LOG);
   };
 
   const stdout = (async () => {
-    for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
-      if (!line.trim()) continue;
+    for await (const raw of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
+      if (!raw.trim()) continue;
+      const line = mask(raw);
       let event;
       try { event = JSON.parse(line); } catch { event = null; }
       if (!event || typeof event !== 'object' || Array.isArray(event)) { appendLog(line); continue; }

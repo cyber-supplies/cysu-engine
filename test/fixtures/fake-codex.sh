@@ -35,6 +35,15 @@ emit() { printf '%s\n' "$1"; }
 emit "{\"type\":\"thread.started\",\"thread_id\":\"$thread\"}"
 emit '{"type":"turn.started"}'
 case "$prompt" in *SLEEP*) sleep 300 ;; esac
+# Prints the user secret BROWSERBASE_API_KEY the way an agent might (command
+# output, its own message, stderr), so the engine's masking can be checked.
+case "$prompt" in *ECHO-SECRET*)
+  emit "$(jq -cn --arg v "$BROWSERBASE_API_KEY" '{type: "item.completed", item: {type: "command_execution", command: "cat SKILL.md", aggregated_output: ("key: " + $v + "\n"), exit_code: 0}}')"
+  emit "$(jq -cn --arg v "$BROWSERBASE_API_KEY" '{type: "item.completed", item: {type: "agent_message", text: ("using " + $v)}}')"
+  echo "debug: BROWSERBASE_API_KEY=$BROWSERBASE_API_KEY" >&2
+  emit '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+  exit 0 ;;
+esac
 case "$prompt" in *PAUSE*) sleep 4 ;; esac
 # Simulates Codex refreshing a ChatGPT login during the stage.
 case "$prompt" in *REFRESH-LOGIN*)

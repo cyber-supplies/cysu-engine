@@ -393,7 +393,7 @@ export class Runs {
     let writes = Promise.resolve();
     const write = (handle, text) => { writes = writes.then(() => handle.appendFile(text)).catch(() => {}); };
 
-    const { settings, codexAuth } = await this.getSecrets();
+    const { settings, codexAuth, userSecrets = {} } = await this.getSecrets();
     let link = null; // engine linked: released (its key revoked) when the stage ends
     stage.status = 'running';
     stage.startedAt = new Date().toISOString();
@@ -417,7 +417,7 @@ export class Runs {
       const live = startStage({
         stage: { profile: stage.profile, globalProfile: stage.globalProfile, prompt: stage.prompt, model: stage.model,
           reasoningEffort: stage.reasoningEffort, fallbackModel: stage.fallbackModel, reprompts: stage.reprompts, daybreak: stage.daybreak },
-        settings: { ...settings, token: agent.token }, codexAuth, link, ...this.stageOptions,
+        settings: { ...settings, token: agent.token }, codexAuth, userSecrets, link, ...this.stageOptions,
         onLog: (line) => write(log, `${line}\n`),
         onUpdate: (live, event) => {
           if (event) {

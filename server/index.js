@@ -20,6 +20,7 @@ import { Schedules } from './schedules.js';
 import { Scheduler } from './scheduler.js';
 import { bearerToken, sameToken, UNAUTHORIZED, oneAtATime, AuthLimiter, tooManyMessage } from './auth.js';
 import { runListItem, runDetail } from './run-view.js';
+import { listSecrets, setSecret, deleteSecret, secretValues } from './secrets.js';
 
 const ENGINE_VERSION = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 const PORT = Number(process.env.PORT || 8787);
@@ -40,7 +41,7 @@ const runs = new Runs({
   dir: join(DATA_DIR, 'runs'),
   getSecrets: async () => {
     const settings = await load('settings', defaultSettings);
-    return { settings, codexAuth: settings.llm?.mode === 'codex' ? await loadCodexAuth() : null };
+    return { settings, codexAuth: settings.llm?.mode === 'codex' ? await loadCodexAuth() : null, userSecrets: await secretValues() };
   },
   agentToken,
   listProfiles: (settings) => fetchProfiles(settings.token),
@@ -336,6 +337,22 @@ async function api(req, res, path) {
   if (path === '/api/daybreak/check') {
     if (req.method === 'GET') return send(res, 200, await daybreakStatus());
     if (req.method === 'POST') return send(res, 200, await runDaybreakCheck(hasBody(req) ? await body(req) : {}));
+  }
+
+  // The user's own secrets for their skills (names only out; see secrets.js).
+  if (path === '/api/secrets' && req.method === 'GET') return send(res, 200, await listSecrets());
+  const secretPath = path.match(/^\/api\/secrets\/([^/]+)$/);
+  if (secretPath) {
+    let name;
+    try { name = decodeURIComponent(secretPath[1]); } catch { return send(res, 400, { error: "Invalid secret name encoding" }); }
+    if (req.method === 'PUT') {
+      const input = hasBody(req) ? await body(req) : {};
+      return send(res, 200, await setSecret(name, input?.value));
+    }
+    if (req.method === 'DELETE') {
+      if (!(await deleteSecret(name))) return send(res, 404, { error: `No secret named ${name}` });
+      return send(res, 200, { deleted: name });
+    }
   }
 
   // Profiles come from the user's Cyber Supplies account via the gateway.

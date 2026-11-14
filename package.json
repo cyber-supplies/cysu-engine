@@ -10,10 +10,10 @@
   "scripts": {
     "start": "node server/index.js",
     "image:build": "docker build -t cysu-engine-workspace:dev image",
-    "test:image": "node --test --test-concurrency=1 test/hardening.test.js test/secrets.test.js test/llm.test.js test/stage.test.js test/daybreak-api.test.js test/runs.test.js test/scheduler-runs.test.js test/schedules-api.test.js test/workspaces-api.test.js test/cli-journey.test.js test/engine-linked.test.js && CYSU_TEST_ENGINE=container node --test --test-concurrency=1 test/cli-journey.test.js",
+    "test:image": "node --test --test-concurrency=1 test/hardening.test.js test/secrets.test.js test/llm.test.js test/stage.test.js test/daybreak-api.test.js test/runs.test.js test/scheduler-runs.test.js test/schedules-api.test.js test/workspaces-api.test.js test/cli-journey.test.js test/engine-linked.test.js test/engine-secrets-run.test.js && CYSU_TEST_ENGINE=container node --test --test-concurrency=1 test/cli-journey.test.js",
     "image:build:test": "docker build -t cysu-engine-workspace:test -f test/fixtures/Dockerfile.test test/fixtures",
     "stage": "node scripts/run-stage.js",
-    "test": "node --test test/run-view.test.js test/daybreak.test.js test/profiles.test.js test/workspaces.test.js test/schedules.test.js test/scheduler.test.js test/objective-migration.test.js test/text.test.js test/auth.test.js",
+    "test": "node --test test/engine-secrets-api.test.js test/run-view.test.js test/daybreak.test.js test/profiles.test.js test/workspaces.test.js test/schedules.test.js test/scheduler.test.js test/objective-migration.test.js test/text.test.js test/auth.test.js",
     "dev": "node --watch server/index.js",
     "engine:build": "docker build -t cysu-engine:dev ."
   }

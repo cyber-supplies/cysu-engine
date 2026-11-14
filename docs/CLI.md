@@ -478,6 +478,36 @@ Gone from the API (still kept by the engine): `request`, `prompt` (use
 run-level `daybreak`, and per stage `tag`, `prompt`, `errors` (now one
 `error`), `turns`, `container`. The full plan is still `POST /api/runs/plan`.
 
+### Secrets (for skills)
+
+New after engine 0.3.2 (not released yet). The user's own secrets, e.g. an
+API key a profile's skill needs. Each one reaches **every stage's agent as an
+environment variable** of that name, so the skill says `$BROWSERBASE_API_KEY`
+instead of carrying the key in its text (where the agent reads it and it ends
+up in run events, downloads and engine-linked reads). The engine keeps the
+values on the user's machine and **never returns them**; anywhere a value
+shows up in a stage's events, log or result, the engine saves
+`[secret:NAME]` instead (values under 6 characters are not masked).
+
+| Command | Request | Show |
+|---|---|---|
+| `/secrets` | `GET /api/secrets` | one line each: `name`, `updatedAt` (there are no values to show) |
+| `/secret set <NAME>` | `PUT /api/secrets/<NAME> {"value": "..."}` | "saved" + `updatedAt`. **Read the value without echo** (like a password prompt), or from `--file <path>` / stdin; never take it as a command-line argument (shell history, `ps`) |
+| `/secret delete <NAME>` | `DELETE /api/secrets/<NAME>` → 200 / 404 | "deleted" |
+
+Names are environment variable names: `A-Z`, `0-9`, `_`, starting with a
+letter, at most 64. Reserved (400): `PATH`, `HOME`, proxy variables and
+anything starting with `CYSU_`, `OPENAI_`, `CODEX_`, `NODE_`, `NPM_`, `LD_`,
+`GIT_`, `PYTHON`, `PERL`, `RUBY`, `BASH_`, `LC_`. At most 50 secrets, 16 KiB
+each. A change applies from the next stage that starts. With the
+non-interactive style: `get-secrets`, `set-secret`, `delete-secret`.
+
+**Moving a key out of a skill** (e.g. the Browserbase skill): set it with
+`/secret set BROWSERBASE_API_KEY`, then change the skill's text from the key
+itself to the variable, e.g. `X-BB-API-Key: $BROWSERBASE_API_KEY` or
+`"apiKey": process.env.BROWSERBASE_API_KEY`, and add a line such as "the key
+is in the environment variable BROWSERBASE_API_KEY; never print it".
+
 ### `/watch` feed
 
 ```

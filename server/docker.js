@@ -51,9 +51,11 @@ export function dockerAvailable() {
 // (CYSU_SECRETS=stdin). Secrets never go in env vars, args or files.
 // The LLM login is either an OpenAI API key or a saved Codex (ChatGPT) login.
 // engineKey (engine linked): the stage's read-only engine key.
-export function secretsLine(settings, codexAuth = null, engineKey = '') {
+export function secretsLine(settings, codexAuth = null, engineKey = '', userSecrets = {}) {
   const secrets = { token: settings.token, passphrase: settings.passkey };
   if (engineKey) secrets.engineKey = engineKey;
+  // The user's own secrets (secrets.js): environment variables for the agent.
+  if (userSecrets && Object.keys(userSecrets).length) secrets.env = { ...userSecrets };
   if (settings.llm?.mode === 'openai-api-key' && settings.llm.apiKey) secrets.openaiApiKey = settings.llm.apiKey;
   if (settings.llm?.mode === 'codex' && codexAuth) secrets.codexAuth = codexAuth;
   return `${JSON.stringify(secrets)}\n`;

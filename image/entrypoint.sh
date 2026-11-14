@@ -79,6 +79,24 @@ if [ "$(id -u)" = "0" ]; then
     openai_key=$(field openaiApiKey)
     engine_key=$(field engineKey)
     codex_auth=$(printf '%s' "$secrets" | jq -c '.codexAuth // empty | objects' 2>/dev/null || true)
+    # The user's own secrets (engine /api/secrets) -> environment variables
+    # for the agent. jq keeps only env-var names the worker does not use
+    # itself (checked again here, as in server/secrets.js) and quotes each
+    # value for the shell (@sh), so any value is exported exactly as given.
+    user_secret_filter='.env // {} | objects | to_entries[]
+      | select(.value | type == "string")
+      | select(.key | test("^[A-Z][A-Z0-9_]{0,63}$"))
+      | select(.key | IN("PATH","HOME","USER","LOGNAME","SHELL","PWD","OLDPWD","TERM","LANG","TZ","TMPDIR","IFS","ENV","BASH_ENV","PS4","HTTP_PROXY","HTTPS_PROXY","NO_PROXY","ALL_PROXY","SSL_CERT_FILE","SSL_CERT_DIR") | not)
+      | select(.key | test("^(CYSU_|OPENAI_|CODEX_|NODE_|NPM_|LD_|GIT_|PYTHON|PERL|RUBY|BASH_|LC_)") | not)'
+    user_secret_exports=$(printf '%s' "$secrets" | jq -r "$user_secret_filter | \"export \\(.key)=\\(.value | @sh)\"" 2>/dev/null || true)
+    user_secret_names=$(printf '%s' "$secrets" | jq -r "[$user_secret_filter | .key] | join(\" \")" 2>/dev/null || true)
+    user_secret_given=$(printf '%s' "$secrets" | jq -r '.env // {} | objects | keys | length' 2>/dev/null || echo 0)
+    user_secret_kept=$(printf '%s' "$secrets" | jq -r "[$user_secret_filter] | length" 2>/dev/null || echo 0)
+    eval "$user_secret_exports"
+    if [ "${user_secret_given:-0}" -gt "${user_secret_kept:-0}" ]; then
+      log "ignored $((user_secret_given - user_secret_kept)) secret(s) with a reserved or invalid name" >&2
+    fi
+    unset user_secret_filter user_secret_exports user_secret_given user_secret_kept
     unset secrets
     if [ -z "$token" ] || [ -z "$passphrase" ]; then
       log "refusing to run: secrets on stdin must be a JSON line with token and passphrase" >&2
@@ -118,6 +136,8 @@ if [ "$(id -u)" = "0" ]; then
       log "engine linked: read-only access to earlier runs at $CYSU_ENGINE_URL"
     fi
     unset engine_key
+    if [ -n "$user_secret_names" ]; then log "secrets for the agent: $user_secret_names"; fi
+    unset user_secret_names
 
     if [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
       # cysu installs the proxy CA and the managed /etc/environment block.
