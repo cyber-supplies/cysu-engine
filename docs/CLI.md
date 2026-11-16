@@ -30,7 +30,7 @@ are not all implemented in the current CLI.
   pass `--engine` for every CLI command.
 - **Not running?** On the engine host, start an existing installation with
   `docker start cysu-engine`. For a new installation run
-  `sudo sh install.sh --token usr_...` (add `--ip PUBLIC_IPV4` for HTTPS).
+  `sh install.sh --token usr_...` as root (add `--ip PUBLIC_IPV4` for HTTPS).
   See [INSTALL.md](INSTALL.md). Wait for `GET /api/health` to answer
   `{"ok": true}`; that route needs no token. Starting a bare container
   without provisioning leaves all protected routes locked.
@@ -66,7 +66,7 @@ Authorization: Bearer usr_…
 - **`401`** always means the engine token is the problem. Look at
   `setupRequired` in the body:
   - `true`: authentication is not provisioned → run
-    `sudo sh install.sh --token usr_...` on the engine host;
+    `sh install.sh --token usr_...` as root on the engine host;
   - `false`: the header is missing or the token differs from the installed
     one → use the installed token, or rerun the installer with a new one.
 - **`429`** (`Retry-After`, `retryAfter` seconds): 10 wrong tokens within a
@@ -98,8 +98,8 @@ GET /api/status   → 401 {"setupRequired": true, …}      → run the installe
 
 ## 2. Setup (first run, and `/setup`)
 
-Provision the user token first with `sudo sh install.sh --token usr_...`
-on the engine host. `--token` is mandatory; there is no environment fallback
+Provision the user token first with `sh install.sh --token usr_...`
+as root on the engine host. `--token` is mandatory; there is no environment fallback
 or API enrollment. Adding `--ip PUBLIC_IPV4` enables HTTPS. For rotation,
 rerun the same installer with a new `--token`; HTTP clients then use that token.
 
@@ -454,8 +454,14 @@ leaves out empty and default values, so check for a field before using it:
 { "id", "name", "status", "trigger": {"type": "user"}, "workspace": {"id", "name"},
   "model"?, "reasoningEffort"?, "startedAt", "finishedAt", "objective",
   "stages": [{ "index", "profile", "status", "error"?, "daybreak"?, "durationSec",
-               "exitCode", "result", "threadId"?, "usage"?, "eventCount" }] }
+               "exitCode", "result", "threadId"?, "usage"?, "diagnostics"?, "eventCount" }] }
 ```
+
+On a failed Codex attempt, `diagnostics` contains a bounded extract from the
+worker's Codex log: HTTP status, request ID, CF-Ray, error code/parameter, and
+timestamp when available. Free-form log messages and response bodies are never
+copied out of the worker. `logFound: false` means Codex did not create the log
+database; an empty `records` list means it held no matching request metadata.
 
 `GET /api/runs` has the same top fields without `objective`, and each stage
 only as `{index, profile, status, error?}`. A stage's `model` /
@@ -527,7 +533,7 @@ Print items as they come (`kind`: `attempt` (first try / fallback / follow-up),
 ## 5. Trying it without the CLI
 
 ```sh
-sudo sh install.sh --token usr_YOUR_TOKEN  # engine on 127.0.0.1:8787
+sh install.sh --token usr_YOUR_TOKEN  # run as root; engine on 127.0.0.1:8787
 E=127.0.0.1:8787/api
 read -rs T                     # paste your usr_ token (not echoed, not in history)
 H="Authorization: Bearer $T"   # send it on every request; -H @- keeps it out of ps:

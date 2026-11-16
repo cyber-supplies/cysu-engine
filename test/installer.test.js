@@ -11,7 +11,7 @@ const TOKEN = 'usr_installer-test-token';
 const IMAGE = 'engine:installer-test';
 const installer = fileURLToPath(new URL('../install.sh', import.meta.url));
 
-async function fixture(t, initial = {}) {
+async function fixture(t, initial = {}, imageRef = IMAGE) {
   const dir = await mkdtemp(join(tmpdir(), 'cysu-installer-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const state = join(dir, 'state.json');
@@ -37,8 +37,11 @@ else if (command === 'curl') {
   } else if (args[0] === 'inspect') {
     const format = args[2];
     if (format.includes('.Mounts')) console.log(state.mount);
-    else if (format === '{{.Config.Image}}') console.log('${IMAGE}');
+    else if (format === '{{.Config.Image}}') console.log(state.currentRef || '${IMAGE}');
+    else if (format === '{{.Image}}') console.log(state.currentId || 'sha256:same');
     else if (format.includes('Labels')) console.log('8.8.8.8');
+  } else if (args[0] === 'image' && args[1] === 'inspect') {
+    if (args.includes('-f')) console.log(state.imageId || 'sha256:same');
   } else if (args[0] === 'run' && args.at(-1) === 'server/provision-auth.js') {
     call.stdin = fs.readFileSync(0, 'utf8');
     if (state.failProvision) fail();
@@ -46,6 +49,8 @@ else if (command === 'curl') {
   } else if (args[0] === 'run' && args.includes('--name')) {
     state.exists = true;
     console.log('test-container');
+  } else if (args[0] === 'rm' && args[1] === 'cysu-engine') {
+    state.exists = false;
   }
 }
 save();
@@ -57,7 +62,8 @@ save();
     state: async () => JSON.parse(await readFile(state, 'utf8')),
     run: (args) => new Promise((resolve) => execFile('sh', [installer, ...args], {
       env: { PATH: `${dir}:${process.env.PATH}`, INSTALLER_TEST_STATE: state,
-        CYSU_ENGINE_IMAGE_REF: IMAGE, CYSU_TOKEN: TOKEN, TOKEN: 'inherited-value' }, timeout: 10000,
+        ...(imageRef ? { CYSU_ENGINE_IMAGE_REF: imageRef } : {}),
+        CYSU_TOKEN: TOKEN, TOKEN: 'inherited-value' }, timeout: 10000,
     }, (error, stdout, stderr) => resolve({ code: error?.code || 0, output: stdout + stderr }))),
   };
 }
@@ -110,6 +116,18 @@ test('installer rekeys an existing engine and retains HTTPS when --ip is omitted
   const { calls, token } = await f.state();
   assert.equal(token, TOKEN);
   assert.ok(!calls.some((c) => c.args.includes('--name')));
+});
+
+test('installer refreshes the default latest image and replaces a stale engine', async (t) => {
+  const latest = 'ghcr.io/cyber-supplies/cysu-engine:latest';
+  const f = await fixture(t, { exists: true, currentRef: latest,
+    currentId: 'sha256:old', imageId: 'sha256:new' }, null);
+  const r = await f.run(['--token', TOKEN]);
+  assert.equal(r.code, 0, r.output);
+  const { calls } = await f.state();
+  assert.equal(calls.filter((c) => c.command === 'docker' && c.args[0] === 'pull' && c.args[1] === latest).length, 1);
+  assert.ok(calls.some((c) => c.command === 'docker' && c.args[0] === 'stop'));
+  assert.ok(calls.some((c) => c.command === 'docker' && c.args.includes('--name')));
 });
 
 test('installer refuses a custom data mount before writing credentials', async (t) => {

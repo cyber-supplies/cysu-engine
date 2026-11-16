@@ -109,6 +109,20 @@ function applyEvent(run, event) {
         current.status = current.exitCode === 0 ? 'succeeded' : 'failed';
       }
       break;
+    case 'engine.codex.diagnostic':
+      {
+        const diagnostic = safeCodexDiagnostic(event);
+        run.diagnostics.push(diagnostic);
+        const record = diagnostic.records.find((r) => r.status || r.requestId);
+        if (record) run.errors.push(`Codex request diagnostic: ${[
+          record.status && `HTTP ${record.status}`,
+          record.requestId && `request ID ${record.requestId}`,
+          record.cfRay && `CF-Ray ${record.cfRay}`,
+          record.errorCode && `code ${record.errorCode}`,
+          record.errorParam && `param ${record.errorParam}`,
+        ].filter(Boolean).join(', ')}`);
+      }
+      break;
     case 'thread.started':
       if (typeof event.thread_id === 'string') run.threadId = event.thread_id;
       break;
@@ -182,6 +196,24 @@ export function secretMasker(userSecrets = {}) {
   };
 }
 
+// Diagnostics come from a worker event, so validate again at the engine
+// boundary. Never persist a free-form Codex log message or response body.
+export function safeCodexDiagnostic(event = {}) {
+  const safeToken = (value, pattern) => typeof value === 'string' && pattern.test(value) ? value : undefined;
+  const records = (Array.isArray(event.records) ? event.records : []).slice(0, 10).map((raw) => {
+    const record = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    return {
+      ...(Number.isSafeInteger(record.timestamp) && record.timestamp >= 0 ? { timestamp: record.timestamp } : {}),
+      ...(Number.isInteger(record.status) && record.status >= 100 && record.status <= 599 ? { status: record.status } : {}),
+      ...(safeToken(record.requestId, /^(?:req_[A-Za-z0-9_-]{8,124}|[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,119})$/) ? { requestId: record.requestId } : {}),
+      ...(safeToken(record.cfRay, /^[A-Za-z0-9_-]{8,128}$/) ? { cfRay: record.cfRay } : {}),
+      ...(safeToken(record.errorCode, /^[A-Za-z0-9_.-]{1,100}$/) ? { errorCode: record.errorCode } : {}),
+      ...(safeToken(record.errorParam, /^[A-Za-z0-9_.-]{1,100}$/) ? { errorParam: record.errorParam } : {}),
+    };
+  }).filter((record) => record.status || record.requestId || record.cfRay);
+  return { kind: safeToken(event.kind, /^(initial|fallback|reprompt)$/) || '', logFound: event.logFound === true, records };
+}
+
 export function startStage({ stage: input, settings, codexAuth = null, claudeVolume = null, userSecrets = {}, cli = null, link = null, image = IMAGE, extraEnv = {}, onUpdate = () => {}, onLog = () => {} }) {
   const stage = validateProviderStage(validateStage(input), settings.llm, codexAuth, Boolean(claudeVolume));
   const provider = llmProvider(settings.llm, codexAuth, Boolean(claudeVolume), stage.provider);
@@ -191,7 +223,7 @@ export function startStage({ stage: input, settings, codexAuth = null, claudeVol
   const run = {
     id, container, stage: { ...stage }, status: 'running',
     startedAt: new Date().toISOString(), finishedAt: null, exitCode: null,
-    threadId: null, turns: 0, usage: null, result: '', agentError: false, errors: [], hints: [], attempts: [],
+    threadId: null, turns: 0, usage: null, result: '', agentError: false, errors: [], hints: [], attempts: [], diagnostics: [],
     events: [], log: '', cancelled: false,
   };
 

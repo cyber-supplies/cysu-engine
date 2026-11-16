@@ -69,6 +69,16 @@ test('a failed stage says why, in one line, in the list too', () => {
   assert.match(runDetail(interrupted).stages[0].error, /engine stopped/);
 });
 
+test('request diagnostics appear in run detail without expanding the run list', () => {
+  const run = stored({ status: 'failed' });
+  run.stages[0].status = 'failed';
+  run.stages[0].diagnostics = [{ kind: 'initial', logFound: true, records: [{
+    timestamp: 1794802984, status: 400, requestId: 'd835041f-009a-48d1-82df-34a8a4691909',
+  }] }];
+  assert.deepEqual(runDetail(run).stages[0].diagnostics, run.stages[0].diagnostics);
+  assert.equal(runListItem(run).stages[0].diagnostics, undefined);
+});
+
 test('a stage shows its model / settings only where they differ from the run', () => {
   const run = stored({ model: 'gpt-a', reasoningEffort: 'high', continueOnFailure: false, engineLinked: true, globalProfile: 'global' });
   run.stages.push({ ...structuredClone(run.stages[0]), index: 1, profile: 'attack', model: 'gpt-b', daybreak: 'default',

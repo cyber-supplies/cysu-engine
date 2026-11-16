@@ -161,6 +161,19 @@ test('a failed Codex turn marks the stage failed and keeps the error', async () 
   assert.equal(r.threadId, 'fake-thread-0001');
 });
 
+test('failed Codex attempt preserves safe request diagnostics before the worker is removed', async () => {
+  const r = await routedRun({ profile: 'attack', prompt: 'FAIL-DIAGNOSTIC' }).done;
+  assert.equal(r.status, 'failed');
+  assert.equal(r.diagnostics.length, 1);
+  assert.equal(r.diagnostics[0].logFound, true);
+  assert.deepEqual(r.diagnostics[0].records[0], {
+    timestamp: r.diagnostics[0].records[0].timestamp,
+    status: 400, requestId: 'd835041f-009a-48d1-82df-34a8a4691909', cfRay: 'a5a578aa19478c21-DUB',
+  });
+  assert.ok(r.errors.some((e) => e.includes('request ID d835041f-009a-48d1-82df-34a8a4691909')));
+  assert.doesNotMatch(JSON.stringify(r), /private diagnostic body/);
+});
+
 test('cancel stops a running stage and removes its container', async () => {
   const live = run({ profile: 'attack', prompt: 'SLEEP please' });
   for (let i = 0; i < 100 && !live.threadId; i++) await new Promise((r) => setTimeout(r, 200));

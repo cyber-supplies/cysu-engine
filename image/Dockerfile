@@ -64,6 +64,7 @@ RUN useradd -m -u 10001 -s /bin/bash runner \
  && chown runner:runner /workspace /home/runner/.claude \
  && chmod 0700 /home/runner/.claude
 COPY --chmod=755 entrypoint.sh /usr/local/bin/cysu-entrypoint
+COPY --chmod=755 codex-diagnostics.py /opt/cysu/codex-diagnostics.py
 COPY --chmod=755 egress-guard.sh /usr/local/bin/cysu-egress-guard
 # Engine linked: a skill added to linked workers only (see entrypoint.sh).
 COPY engine-history /opt/cysu/engine-history-skill

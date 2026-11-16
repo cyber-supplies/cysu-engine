@@ -45,6 +45,22 @@ case "$prompt" in *ECHO-SECRET*)
   exit 0 ;;
 esac
 case "$prompt" in *PAUSE*) sleep 4 ;; esac
+case "$prompt" in *FAIL-DIAGNOSTIC*)
+  python3 - <<'PY'
+import os, sqlite3, time
+path = os.path.join(os.environ['HOME'], '.codex', 'logs_2.sqlite')
+con = sqlite3.connect(path)
+con.execute('create table logs (ts integer, level text, feedback_log_body text)')
+con.execute('insert into logs values (?, ?, ?)', (int(time.time()), 'WARN',
+  'unexpected status 400 Bad Request: {"detail":"private diagnostic body"}, '
+  'url: https://chatgpt.com/backend-api/codex/responses, '
+  'cf-ray: a5a578aa19478c21-DUB, request id: d835041f-009a-48d1-82df-34a8a4691909'))
+con.commit()
+con.close()
+PY
+  emit '{"type":"turn.failed","error":{"message":"{\"detail\":\"Bad Request\"}"}}'
+  exit 1 ;;
+esac
 case "$prompt" in *SUBSCRIPTION-QUOTA*)
   emit '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'
   exit 1 ;;

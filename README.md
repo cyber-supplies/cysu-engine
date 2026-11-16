@@ -6,14 +6,15 @@ your profiles, start runs, and see the results.
 Every stage runs in a hardened Docker container that comes with everything
 set up. There is no web UI.
 
-Version 3 adds a single-command VPS installer with a publicly trusted HTTPS
-endpoint at the server's IP address.
+The VPS installer provides a publicly trusted HTTPS endpoint at the server's
+IP address. Version 4 adds safe request diagnostics for failed Codex attempts.
 
 ## Install and run
 
 For a VPS, see **[docs/INSTALL.md](docs/INSTALL.md)**. The standalone
 [`install.sh`](install.sh) script requires `--token`, accepts `--ip` for HTTPS, installs Docker,
-and deploys the engine and its HTTPS reverse proxy. For a local checkout:
+and deploys the latest published engine with its HTTPS reverse proxy. Rerun it
+to update the engine. For a local checkout:
 
 ```sh
 npm run image:build          # worker image

@@ -3,7 +3,7 @@
 set -eu
 umask 077
 
-ENGINE_IMAGE=${CYSU_ENGINE_IMAGE_REF:-ghcr.io/cyber-supplies/cysu-engine:3.0.0}
+ENGINE_IMAGE=${CYSU_ENGINE_IMAGE_REF:-ghcr.io/cyber-supplies/cysu-engine:latest}
 PROXY_IMAGE=${CYSU_ENGINE_PROXY_IMAGE:-caddy:2.11.8}
 ENGINE_NAME=cysu-engine
 PROXY_NAME=cysu-engine-proxy
@@ -14,7 +14,7 @@ unset TOKEN
 TOKEN=
 
 usage() {
-  echo 'Usage: sudo sh install.sh [--ip PUBLIC_IPV4] --token usr_...' >&2
+  echo 'Usage (as root): sh install.sh [--ip PUBLIC_IPV4] --token usr_...' >&2
   exit "${1:-2}"
 }
 die() { echo "Installer: $*" >&2; exit 1; }
@@ -30,7 +30,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ "$(id -u)" -eq 0 ] || die 'Run as root (sudo sh install.sh --ip ... --token ...).'
+[ "$(id -u)" -eq 0 ] || die 'Run from a root shell (sh install.sh --ip ... --token ...).'
 [ -n "$TOKEN" ] || usage
 [ "$(uname -m)" = x86_64 ] || die 'The published engine images require an x86_64 (amd64) VPS.'
 
@@ -69,9 +69,12 @@ docker info >/dev/null 2>&1 || die 'Docker is not running.'
 exists() { [ -n "$(docker ps -aq --filter "name=^$1$")" ]; }
 running() { [ -n "$(docker ps -q --filter "name=^$1$")" ]; }
 ensure_engine_image() {
-  if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
+  if [ "${ENGINE_IMAGE##*:}" = latest ]; then
     echo "Downloading $ENGINE_IMAGE..."
-    docker pull "$ENGINE_IMAGE" >/dev/null || die 'Engine image unavailable. Check that the v3 release is public.'
+    docker pull "$ENGINE_IMAGE" >/dev/null || die 'Engine image unavailable. Check that the release is public.'
+  elif ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
+    echo "Downloading $ENGINE_IMAGE..."
+    docker pull "$ENGINE_IMAGE" >/dev/null || die 'Engine image unavailable. Check that the release is public.'
   fi
 }
 
@@ -88,9 +91,10 @@ printf '%s' "$TOKEN" | docker "$@" "$ENGINE_IMAGE" node server/provision-auth.js
 
 if exists "$ENGINE_NAME"; then
   current=$(docker inspect -f '{{.Config.Image}}' "$ENGINE_NAME")
-  if [ "$current" != "$ENGINE_IMAGE" ]; then
+  current_id=$(docker inspect -f '{{.Image}}' "$ENGINE_NAME")
+  target_id=$(docker image inspect -f '{{.Id}}' "$ENGINE_IMAGE")
+  if [ "$current" != "$ENGINE_IMAGE" ] || [ "$current_id" != "$target_id" ]; then
     echo "Updating engine from $current to $ENGINE_IMAGE..."
-    ensure_engine_image
     docker stop -t 20 "$ENGINE_NAME" >/dev/null
     docker rm "$ENGINE_NAME" >/dev/null
   else
@@ -98,7 +102,6 @@ if exists "$ENGINE_NAME"; then
   fi
 fi
 if ! exists "$ENGINE_NAME"; then
-  ensure_engine_image
   set -- run -d --name "$ENGINE_NAME" --restart unless-stopped --init \
     -p 127.0.0.1:8787:8787 \
     -v /var/run/docker.sock:/var/run/docker.sock \

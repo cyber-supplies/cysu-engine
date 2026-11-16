@@ -304,7 +304,7 @@ export class Runs {
         const daybreak = own.daybreak ?? daybreakForTag.get(tag) ?? defaults.daybreak;
         const stage = validateProviderStage(validateStage({ ...defaults, ...own, model, reprompts, daybreak }), llm, codexAuth, claudeAuth);
         return { index, tag, ...stage, status: 'pending', startedAt: null, finishedAt: null, exitCode: null,
-          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], eventCount: 0, agentToken: null, engineLinked: false };
+          threadId: null, turns: 0, usage: null, result: '', errors: [], hints: [], attempts: [], diagnostics: [], eventCount: 0, agentToken: null, engineLinked: false };
       });
     } catch (error) {
       if (error instanceof StageError) throw new HttpError(400, error.message);
@@ -453,7 +453,7 @@ export class Runs {
             stage.eventCount += 1;
             write(events, `${JSON.stringify({ seq: stage.eventCount, ...event })}\n`);
           }
-          Object.assign(stage, { threadId: live.threadId, turns: live.turns, usage: live.usage, result: live.result, errors: [...live.errors], hints: [...live.hints], attempts: structuredClone(live.attempts) });
+          Object.assign(stage, { threadId: live.threadId, turns: live.turns, usage: live.usage, result: live.result, errors: [...live.errors], hints: [...live.hints], attempts: structuredClone(live.attempts), diagnostics: structuredClone(live.diagnostics) });
           this.saveSoon(run);
         },
       });
@@ -466,7 +466,7 @@ export class Runs {
       Object.assign(stage, {
         status: done.status, exitCode: done.exitCode, finishedAt: done.finishedAt,
         threadId: done.threadId, turns: done.turns, usage: done.usage, result: done.result, errors: [...done.errors], hints: [...done.hints],
-        attempts: structuredClone(done.attempts),
+        attempts: structuredClone(done.attempts), diagnostics: structuredClone(done.diagnostics),
       });
       if (await keepRefreshedCodexAuth(codexAuth, done.refreshedCodexAuth)) {
         write(log, '[engine] saved the refreshed ChatGPT login\n');

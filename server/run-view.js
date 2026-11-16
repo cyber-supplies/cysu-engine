@@ -65,6 +65,7 @@ function detailStage(stage, run) {
     attempts: attempts.length > 1
       ? attempts.map((a) => keep({ kind: a.kind, provider: a.provider, model: a.model, status: a.status, durationSec: seconds(a.startedAt, a.finishedAt) }))
       : undefined,
+    diagnostics: stage.diagnostics,
     eventCount: stage.eventCount, // the CLI reads it to bound transcript downloads
   });
 }

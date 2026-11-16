@@ -1,6 +1,6 @@
 # Installing and running the Cyber Supplies Engine
 
-## VPS with public HTTPS (v3)
+## VPS with public HTTPS
 
 Use a Debian 12 or Ubuntu VPS with a **stable public IPv4 address**. Allow
 inbound TCP ports **80** and **443** in both the VPS firewall and the cloud
@@ -8,17 +8,18 @@ provider firewall. Port 80 is required for Let's Encrypt's certificate
 challenge. Keep port 8787 closed to the internet; the installer binds the
 engine to `127.0.0.1` and puts Caddy in front of it.
 
-Once the 3.0.0 images have been published, run this one command on the VPS as
-root, replacing the IP and token:
+From a root shell on the VPS, replace the IP and token and run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/cyber-supplies/cysu-engine/main/install.sh | sudo sh -s -- --ip 203.0.113.10 --token usr_YOUR_TOKEN
+apt-get update && apt-get install -y curl
+curl -fsSL https://raw.githubusercontent.com/cyber-supplies/cysu-engine/main/install.sh | sh -s -- --ip 203.0.113.10 --token usr_YOUR_TOKEN
 ```
 
-The installer installs Docker if needed, downloads the v3 engine and worker
-images, checks the token with Cyber Supplies, writes it directly to the private
-Docker data volume, starts Caddy, obtains a publicly trusted certificate for
-the IP, and verifies `https://IP/api/health` from the host. It makes no engine
+The installer installs Docker if needed, downloads the latest published engine
+and its matching worker image, checks the token with Cyber Supplies, and writes
+it directly to the private Docker data volume. It starts Caddy, obtains a
+publicly trusted certificate for the IP, and verifies `https://IP/api/health`
+from the host. It makes no engine
 API calls to set or change the token. Caddy
 renews the short lived certificate automatically. The engine and Caddy restart
 after reboot; their data and certificates are kept in Docker volumes.
@@ -35,14 +36,17 @@ if needed. The installer never writes the token into Caddy's configuration or
 prints it. It is stored in `auth.json` with mode `0600` in the private Docker volume.
 `--token` is mandatory on every installer run; `CYSU_TOKEN` is not a fallback.
 
-The first setup only sets the user token. Set a passkey and complete the LLM
-login with `cysu engine auth --engine https://IP --token usr_... --passphrase ...`
-before starting runs. This login may ask you to finish a browser step.
+The first setup only sets the user token. With CLI v0.6.4 or newer, set a
+passkey and authenticate Codex, Claude, or OpenRouter using `cysu engine auth
+--provider PROVIDER --engine https://IP --token usr_... --passphrase ...`.
+Codex and Claude sign-ins include a browser step; Claude also needs
+`cysu engine auth-code --id LOGIN_ID`.
 
-To inspect the deployment on the VPS: `sudo docker logs cysu-engine`,
-`sudo docker logs cysu-engine-proxy`, and `sudo docker ps`. Re-running the
-same installer with the same IP and token is safe. To rotate or recover a
-token, rerun it with `--token usr_NEW_TOKEN`; the old token is not needed.
+To inspect the deployment on the VPS: `docker logs cysu-engine`,
+`docker logs cysu-engine-proxy`, and `docker ps`. Re-running the
+same installer with the same IP and token updates the engine if a newer image
+has been published. To rotate or recover a token, rerun it with
+`--token usr_NEW_TOKEN`; the old token is not needed.
 An omitted `--ip` preserves an existing HTTPS installation. If the VPS IP changes,
 reserve a new static address and remove the old `cysu-engine-proxy` container
 before running the installer with the new IP; the engine data volume remains.
@@ -278,9 +282,9 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
 | Port 8787 is taken | `CYSU_ENGINE_PORT=8788 sh scripts/engine.sh start` (and set `CYSU_ENGINE_URL=http://127.0.0.1:8788` for the CLI) |
 | Setup says the token is wrong | The engine needs your **user** token (`usr_…`), not an LLM token (`llm_…`), and Cyber Supplies must accept it (check it, or make a new one) |
 | Setup says it could not check the token | Cyber Supplies could not be reached: check your network and try again |
-| `Missing or wrong engine token` | The CLI is not using the token the engine was set up with. Use that one, or rerun `sudo sh install.sh --token usr_NEW_TOKEN` on the engine host |
+| `Missing or wrong engine token` | The CLI is not using the token the engine was set up with. Use that one, or rerun `sh install.sh --token usr_NEW_TOKEN` as root on the engine host |
 | `Too many wrong engine tokens` | Wait a minute (something sent wrong tokens); then use the right one |
-| `Cyber Supplies did not accept your user token` | Your token was revoked or replaced: rerun `sudo sh install.sh --token usr_NEW_TOKEN` on the engine host |
+| `Cyber Supplies did not accept your user token` | Your token was revoked or replaced: rerun `sh install.sh --token usr_NEW_TOKEN` as root on the engine host |
 | ProjectDiscovery tools (subfinder, dnsx, httpx…) find nothing or time out on a university/company network | See *Restrictive networks* below |
 
 ### Restrictive networks (DNS)

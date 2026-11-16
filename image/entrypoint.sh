@@ -392,6 +392,7 @@ rc=0
 # limit, not visible in ps). With THREAD it resumes that conversation.
 attempt() {
   a_kind=$1 a_model=$2 a_prompt=$3 a_thread=${4:-}
+  attempt_started=$(date +%s)
   jq -cn --arg kind "$a_kind" --arg model "$a_model" --arg provider "$provider" --arg daybreak "${daybreak:-default}" '{type: "engine.attempt", kind: $kind, model: $model, provider: $provider, daybreak: $daybreak}'
   if [ "$provider" = claude ]; then
     set -- claude -p --output-format stream-json --verbose --dangerously-skip-permissions --permission-prompts none
@@ -426,6 +427,9 @@ attempt() {
   rc=$(cat /tmp/cysu-rc)
   if [ "$rc" = 0 ] && [ "$(jq -Rn '[inputs | fromjson? | select(.type? == "turn.failed")] | length' "$ATTEMPT_EVENTS")" != 0 ]; then
     rc=1
+  fi
+  if [ "$rc" != 0 ] && [ "$provider" = codex ]; then
+    python3 /opt/cysu/codex-diagnostics.py "$attempt_started" "$a_kind" || true
   fi
   jq -cn --arg kind "$a_kind" --argjson exitCode "$rc" '{type: "engine.attempt.finished", kind: $kind, exitCode: $exitCode}'
   [ "$rc" = 0 ]

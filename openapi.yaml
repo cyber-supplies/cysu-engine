@@ -1,14 +1,14 @@
 openapi: 3.1.0
 info:
   title: Cyber Supplies Engine API
-  version: 0.16.0
+  version: 0.17.0
   description: |
     API of cysu-engine: the self-hosted server that runs Cyber Supplies
     profiles as agents in hardened Docker containers. There is no web UI: the
     `cysu` CLI is the client (setup and slash commands).
 
     **Access.** The engine itself listens on `http://127.0.0.1:8787`
-    (change with `PORT`). The v3 VPS installer exposes it at `https://<public-ip>`
+    (change with `PORT`). The VPS installer exposes it at `https://<public-ip>`
     through Caddy, which rewrites the upstream Host to loopback. To keep web
     pages in your browser from using it, engine requests must:
     - reach the engine with a loopback `Host` (`127.0.0.1:<port>`,
@@ -1445,6 +1445,7 @@ components:
         agentToken: { type: [string, 'null'], enum: [llm, user, null], description: 'Which token the stage''s agent got (null until the stage starts)' }
         engineLinked: { type: boolean, description: 'The stage''s agent could read earlier runs (false when the run did not ask, or the link was unavailable; the stage log says why)' }
         hints: { type: array, items: { type: string }, description: 'Plain advice for Daybreak access errors in `errors` (OpenAI''s own messages are misleading), once each' }
+        diagnostics: { type: array, items: { $ref: '#/components/schemas/CodexDiagnostic' }, description: Safe request metadata from failed Codex attempts }
         attempts:
           type: array
           description: The agent attempts inside this stage, in order
@@ -1462,6 +1463,26 @@ components:
               finishedAt: { type: [string, 'null'], format: date-time }
         eventCount: { type: integer }
         container: { type: string, description: Docker container name while it exists }
+
+    CodexDiagnostic:
+      type: object
+      description: Bounded request metadata extracted from a failed Codex attempt; no free-form log messages or response bodies.
+      required: [kind, logFound, records]
+      properties:
+        kind: { type: string, description: Attempt kind (initial, fallback, or reprompt) }
+        logFound: { type: boolean, description: Whether the worker found a Codex log database }
+        records:
+          type: array
+          maxItems: 10
+          items:
+            type: object
+            properties:
+              timestamp: { type: integer }
+              status: { type: integer, minimum: 100, maximum: 599 }
+              requestId: { type: string }
+              cfRay: { type: string }
+              errorCode: { type: string }
+              errorParam: { type: string }
 
     Trigger:
       type: object
@@ -1518,6 +1539,7 @@ components:
               model: { type: string }
               status: { type: string, enum: [running, succeeded, failed, cancelled] }
               durationSec: { type: integer }
+        diagnostics: { type: array, items: { $ref: '#/components/schemas/CodexDiagnostic' }, description: Safe request metadata from failed Codex attempts, omitted from run lists }
         eventCount: { type: integer, description: Events recorded so far (the CLI uses it to bound transcript downloads) }
 
     Run:
