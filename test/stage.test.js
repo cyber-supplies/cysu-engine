@@ -161,9 +161,12 @@ test('a failed Codex turn marks the stage failed and keeps the error', async () 
   assert.equal(r.threadId, 'fake-thread-0001');
 });
 
-test('failed Codex attempt preserves safe request diagnostics before the worker is removed', async () => {
+test('generic Bad Request resumes the same Codex thread and preserves diagnostics', async () => {
   const r = await routedRun({ profile: 'attack', prompt: 'FAIL-DIAGNOSTIC' }).done;
-  assert.equal(r.status, 'failed');
+  assert.equal(r.status, 'succeeded', r.log);
+  assert.deepEqual(r.attempts.map((a) => [a.kind, a.status]), [['initial', 'failed'], ['reprompt', 'succeeded']]);
+  assert.equal(report(r).resumed, true);
+  assert.equal(report(r).thread, 'fake-thread-0001');
   assert.equal(r.diagnostics.length, 1);
   assert.equal(r.diagnostics[0].logFound, true);
   assert.deepEqual(r.diagnostics[0].records[0], {
@@ -172,6 +175,16 @@ test('failed Codex attempt preserves safe request diagnostics before the worker 
   });
   assert.ok(r.errors.some((e) => e.includes('request ID d835041f-009a-48d1-82df-34a8a4691909')));
   assert.doesNotMatch(JSON.stringify(r), /private diagnostic body/);
+});
+
+test('repeated generic Bad Requests keep resuming until the stage is cancelled', async () => {
+  const live = routedRun({ profile: 'attack', prompt: 'FAIL-BAD-REQUEST-FOREVER' });
+  for (let i = 0; i < 100 && live.attempts.length < 2; i++) await new Promise((r) => setTimeout(r, 200));
+  assert.equal(live.attempts.length, 2, 'the first resume never started');
+  await cancelStage(live);
+  const r = await live.done;
+  assert.equal(r.status, 'cancelled');
+  assert.deepEqual(r.attempts.map((a) => a.kind), ['initial', 'reprompt']);
 });
 
 test('cancel stops a running stage and removes its container', async () => {

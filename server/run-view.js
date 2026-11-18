@@ -104,6 +104,7 @@ export function runDetail(run) {
       engineLinked: run.engineLinked === true ? true : undefined,
       cancelRequested: run.cancelRequested && ACTIVE.includes(run.status) ? true : undefined,
       rerunOf: run.rerunOf,
+      workerImage: run.workerImage,
     }),
     stages: (run.stages || []).map((s) => detailStage(s, run)),
   };

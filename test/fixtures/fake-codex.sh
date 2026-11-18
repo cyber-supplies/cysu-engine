@@ -34,6 +34,11 @@ prompt=$(cat)   # the engine passes the prompt on stdin ("-")
 emit() { printf '%s\n' "$1"; }
 emit "{\"type\":\"thread.started\",\"thread_id\":\"$thread\"}"
 emit '{"type":"turn.started"}'
+case "$prompt" in *FAIL-BAD-REQUEST-FOREVER*) touch /workspace/.fail-bad-request-forever ;; esac
+if [ -f /workspace/.fail-bad-request-forever ]; then
+  emit '{"type":"turn.failed","error":{"message":"{\"detail\":\"Bad Request\"}"}}'
+  exit 1
+fi
 case "$prompt" in *SLEEP*) sleep 300 ;; esac
 # Prints the user secret BROWSERBASE_API_KEY the way an agent might (command
 # output, its own message, stderr), so the engine's masking can be checked.

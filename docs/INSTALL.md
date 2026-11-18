@@ -16,13 +16,16 @@ curl -fsSL https://raw.githubusercontent.com/cyber-supplies/cysu-engine/main/ins
 ```
 
 The installer installs Docker if needed, downloads the latest published engine
-and its matching worker image, checks the token with Cyber Supplies, and writes
+and its worker image, checks the token with Cyber Supplies, and writes
 it directly to the private Docker data volume. It starts Caddy, obtains a
 publicly trusted certificate for the IP, and verifies `https://IP/api/health`
 from the host. It makes no engine
 API calls to set or change the token. Caddy
 renews the short lived certificate automatically. The engine and Caddy restart
 after reboot; their data and certificates are kept in Docker volumes.
+From engine v4.1, each new run refreshes the worker `:latest` tag and uses one
+resolved image ID across all its stages. A registry outage uses the cached
+worker image if one is available and records a warning in the run detail.
 
 On your own computer, use the CLI with the address and your token:
 

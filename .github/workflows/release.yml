@@ -80,7 +80,7 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            WORKER_IMAGE=${{ steps.v.outputs.worker }}:${{ steps.v.outputs.version }}
+            WORKER_IMAGE=${{ steps.v.outputs.worker }}:latest
           tags: |
             ${{ steps.v.outputs.engine }}:${{ steps.v.outputs.version }}
             ${{ steps.v.outputs.engine }}:latest

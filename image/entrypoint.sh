@@ -435,6 +435,41 @@ attempt() {
   [ "$rc" = 0 ]
 }
 
+# A generic Bad Request can arrive after Codex has already completed tool
+# calls. Resume its saved thread instead of restarting the objective and
+# repeating those calls. Keep trying until the worker is cancelled; other
+# failures (including policy, auth and model errors) retain their normal path.
+attempt_with_bad_request_recovery() {
+  recovery_model=$2
+  recovery_thread=${4:-}
+  if attempt "$@"; then return 0; fi
+  [ "$provider" = codex ] && [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] || return "$rc"
+
+  recovery_count=0
+  recovery_delay=5
+  while jq -Rne '[inputs | fromjson? | select(.type? == "turn.failed" and .error.message? == "{\"detail\":\"Bad Request\"}")] | length > 0' "$ATTEMPT_EVENTS"; do
+    if [ -z "$recovery_thread" ]; then
+      recovery_thread=$(jq -Rrn '[inputs | fromjson? | select(.type? == "thread.started") | .thread_id? | strings] | last // empty' "$ATTEMPT_EVENTS")
+    fi
+    if [ -z "$recovery_thread" ]; then
+      log "generic Bad Request, but Codex reported no thread ID; cannot resume" >&2
+      return "$rc"
+    fi
+    recovery_count=$((recovery_count + 1))
+    log "generic Bad Request; resuming Codex thread after ${recovery_delay}s (retry $recovery_count, until cancelled)" >&2
+    sleep "$recovery_delay"
+    if attempt reprompt "$recovery_model" 'Continue the interrupted objective from the last confirmed state. Check completed tool effects before repeating any mutation.' "$recovery_thread"; then
+      return 0
+    fi
+    [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] || return "$rc"
+    if [ "$recovery_delay" -lt 60 ]; then
+      recovery_delay=$((recovery_delay * 2))
+      [ "$recovery_delay" -le 60 ] || recovery_delay=60
+    fi
+  done
+  return "$rc"
+}
+
 
 cd /workspace
 if [ "$provider" = claude ]; then
@@ -442,12 +477,12 @@ if [ "$provider" = claude ]; then
 else
   log "running Codex${model:+ (model $model)}${effort:+ (effort $effort)}${cyber_program:+ (Daybreak: $cyber_program)}" >&2
 fi
-if attempt initial "$model" "$prompt"; then
+if attempt_with_bad_request_recovery initial "$model" "$prompt"; then
   :
 elif [ -n "$fallback_model" ] && [ "$rc" -lt 128 ]; then
   # rc >= 128 means Codex was killed (e.g. the run was cancelled): no retry.
   log "first attempt failed (exit $rc); retrying once with fallback model $fallback_model" >&2
-  if attempt fallback "$fallback_model" "$prompt"; then
+  if attempt_with_bad_request_recovery fallback "$fallback_model" "$prompt"; then
     model=$fallback_model # follow-ups continue with the model that worked
   else
     log "fallback attempt failed (exit $rc)" >&2
@@ -467,7 +502,7 @@ if [ "$reprompt_count" -gt 0 ]; then
   while [ "$i" -lt "$reprompt_count" ]; do
     follow_up=$(printf '%s' "$CYSU_STAGE_JSON" | jq -r --argjson i "$i" '[.reprompts[] | strings][$i]')
     log "follow-up prompt $((i + 1))/$reprompt_count (resuming thread $thread)" >&2
-    if ! attempt reprompt "$model" "$follow_up" "$thread"; then
+    if ! attempt_with_bad_request_recovery reprompt "$model" "$follow_up" "$thread"; then
       log "stage failed: follow-up prompt $((i + 1)) failed (exit $rc)" >&2
       exit "$rc"
     fi

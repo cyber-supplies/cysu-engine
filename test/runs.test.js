@@ -381,6 +381,7 @@ test('ordered run: every stage in order, each in a FRESH container with global +
   const created = await runs.create({ prompt: 'Objective X', globalProfile: 'global', fromTags: {} });
   const run = await finished(created.id, 180_000);
   assert.equal(run.status, 'succeeded', JSON.stringify(stagesOf(run)));
+  assert.match(run.workerImage.id, /^sha256:[a-f0-9]{64}$/);
   assert.deepEqual(stagesOf(run), ['1:recon:succeeded', '2:attack:succeeded', '2:attack-b:succeeded', '3:escalate:succeeded', '4:triage:succeeded']);
 
   const containers = new Set(run.stages.map((s) => s.container));
@@ -399,6 +400,7 @@ test('ordered run: every stage in order, each in a FRESH container with global +
   }
   for (const stage of run.stages) {
     assert.match(await runs.log(run.id, stage.index), new RegExp(`installing stage profile: ${stage.profile}`));
+    assert.match(await runs.log(run.id, stage.index), new RegExp(`worker image: ${run.workerImage.id}`));
   }
 });
 

@@ -452,7 +452,7 @@ leaves out empty and default values, so check for a field before using it:
 
 ```json
 { "id", "name", "status", "trigger": {"type": "user"}, "workspace": {"id", "name"},
-  "model"?, "reasoningEffort"?, "startedAt", "finishedAt", "objective",
+  "model"?, "reasoningEffort"?, "startedAt", "finishedAt", "objective", "workerImage"?,
   "stages": [{ "index", "profile", "status", "error"?, "daybreak"?, "durationSec",
                "exitCode", "result", "threadId"?, "usage"?, "diagnostics"?, "eventCount" }] }
 ```
@@ -462,6 +462,8 @@ worker's Codex log: HTTP status, request ID, CF-Ray, error code/parameter, and
 timestamp when available. Free-form log messages and response bodies are never
 copied out of the worker. `logFound: false` means Codex did not create the log
 database; an empty `records` list means it held no matching request metadata.
+`workerImage` shows the tag and immutable image ID used for all stages of that
+run, plus whether `:latest` was refreshed or a cached copy was used.
 
 `GET /api/runs` has the same top fields without `objective`, and each stage
 only as `{index, profile, status, error?}`. A stage's `model` /

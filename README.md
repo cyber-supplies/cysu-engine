@@ -8,6 +8,9 @@ set up. There is no web UI.
 
 The VPS installer provides a publicly trusted HTTPS endpoint at the server's
 IP address. Version 4 adds safe request diagnostics for failed Codex attempts.
+Version 4.1 refreshes the `:latest` worker image before each run and uses one
+fixed image ID for every stage in that run. If the registry is unavailable, it
+uses the locally cached image and records a warning in the run detail.
 
 ## Install and run
 
