@@ -81,7 +81,7 @@ test('native CLI login: concurrent starts share one container; credentials stay 
       '-e', `CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}`, image, 'sh', '-c', 'claude auth status; stat -c "%u %a" "$CLAUDE_CONFIG_DIR" "$CLAUDE_CONFIG_DIR/.credentials.json"']);
     assert.equal(reused.ok, true, reused.stderr);
     assert.match(reused.stdout, /"loggedIn":true/);
-    assert.match(reused.stdout, /10001 700\n10001 600/);
+    assert.match(reused.stdout, /0 700\n0 600/);
   }
   const restarted = new ClaudeLogin({ image });
   await restarted.recover();

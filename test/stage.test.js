@@ -104,7 +104,7 @@ test('full stage: installs global + stage profile, Codex sees both, run record f
 
   const seen = report(r);
   assert.equal(seen.prompt, 'Map the target');
-  assert.equal(seen.user, 'runner');
+  assert.equal(seen.user, 'root');
   assert.equal(seen.cwd, '/workspace');
   assert.match(seen.args, /--json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C \/workspace --model gpt-test -c model_reasoning_effort="high" -$/);
   assert.match(seen.globalAgents, /GLOBAL-PROMPT-MARKER/);

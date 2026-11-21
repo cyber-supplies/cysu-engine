@@ -15,7 +15,7 @@ function sh(file, args) {
   });
 }
 
-// worker runs `command` as the hardened runner user (entrypoint command mode).
+// worker runs `command` as the hardened root agent (entrypoint command mode).
 function worker(command, { env = {}, flags = hardeningArgs() } = {}) {
   const envArgs = Object.entries({ CYSU_WORKER_TEST_BOOTSTRAP: '0', ...env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   return sh('docker', ['run', '--rm', ...flags, ...envArgs, IMAGE, 'sh', '-c', command]);
@@ -32,19 +32,16 @@ before(async () => {
 });
 after(() => server?.close());
 
-test('agent runs as runner (uid 10001) with no capabilities and no-new-privileges', async () => {
+test('agent runs as root with no-new-privileges', async () => {
   const r = await worker('id -u; grep -E "^(CapEff|CapPrm|NoNewPrivs)" /proc/self/status');
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /^10001$/m);
-  assert.match(r.stdout, /CapEff:\s+0+$/m);
-  assert.match(r.stdout, /CapPrm:\s+0+$/m);
+  assert.match(r.stdout, /^0$/m);
   assert.match(r.stdout, /NoNewPrivs:\s+1$/m);
 });
 
-test('agent cannot change the firewall or become root', async () => {
-  const r = await worker('iptables -F OUTPUT 2>&1 && echo FLUSHED; su -c id root </dev/null 2>&1 || true; sudo id 2>&1 || true');
-  assert.doesNotMatch(r.stdout, /FLUSHED/);
-  assert.doesNotMatch(r.stdout, /uid=0/);
+test('root agent can modify the system', async () => {
+  const r = await worker('touch /usr/local/cysu-root-write && rm /usr/local/cysu-root-write && echo ROOT-WRITE');
+  assert.match(r.stdout, /ROOT-WRITE/);
 });
 
 test('public internet and DNS work', async () => {

@@ -55,7 +55,7 @@ test('API key mode: Codex is logged in from auth.json and the key is NOT in the 
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /API key configured/);
   assert.match(r.stdout, /^0$/m, 'an OpenAI/Codex key variable is still in the agent env');
-  assert.match(r.stdout, /^auth=runner 600$/m);
+  assert.match(r.stdout, /^auth=root 600$/m);
 });
 
 test('Codex login mode: the saved auth.json is installed exactly, owner-only', async () => {
@@ -64,14 +64,14 @@ test('Codex login mode: the saved auth.json is installed exactly, owner-only', a
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stderr, /^\[engine\] LLM login: Codex \(ChatGPT\)$/m);
   assert.deepEqual(JSON.parse(r.stdout.split('\n').find((l) => l.startsWith('{'))), FAKE_AUTH);
-  assert.match(r.stdout, /^auth=runner 600$/m);
+  assert.match(r.stdout, /^auth=root 600$/m);
 });
 
 test('OpenRouter key lives in a private file, not the agent environment or Codex config', async () => {
   const line = secretsLine({ ...base, llm: { mode: 'codex', openrouter: { apiKey: ROUTER_KEY, model: 'anthropic/test-model' } } });
   const r = await worker('stat -c "key=%U %a" ~/.config/cysu/openrouter.key; cat ~/.codex/config.toml; env | grep -c OPENROUTER_API_KEY || true; test ! -f ~/.codex/auth.json', line);
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /^key=runner 600$/m);
+  assert.match(r.stdout, /^key=root 600$/m);
   assert.match(r.stdout, /base_url = "https:\/\/openrouter.ai\/api\/v1"/);
   assert.match(r.stdout, /command = "\/bin\/cat"/);
   assert.match(r.stdout, /^0$/m);

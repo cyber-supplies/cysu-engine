@@ -67,7 +67,7 @@ test('explicit Claude overrides other saved credentials, runs stages serially an
   const seen = JSON.parse(run.stages[0].result);
   assert.equal(seen.resumed, true);
   assert.equal(seen.thread, run.stages[0].threadId);
-  assert.equal(seen.user, 'runner');
+  assert.equal(seen.user, 'root');
   assert.match(seen.args, /--model sonnet --effort high --resume/);
   assert.match(seen.globalAgents, /GLOBAL-PROMPT-MARKER/);
   assert.match(seen.workspaceAgents, /STAGE-PROMPT-MARKER/);

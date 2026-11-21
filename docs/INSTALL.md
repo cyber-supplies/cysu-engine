@@ -112,7 +112,7 @@ model slug, not a guaranteed entitlement. `GET /api/llm/openrouter-auth` returns
 masked key status; `DELETE` removes it. `GET /api/status` reports the selected
 `llm.provider`. The endpoint stores credentials locally; it does not verify
 credits or make a paid model request. Only the selected credential is sent to
-the worker, over stdin; the OpenRouter key is held in a runner-owned `0600` file.
+the worker, over stdin; the OpenRouter key is held in a root-owned `0600` file.
 
 To use OpenRouter with a subscription login saved, set `"provider":"openrouter"`
 in the workflow request. Without an explicit choice, saved credentials are
@@ -158,8 +158,9 @@ between containers. No additional callback port needs opening on the VPS.
 The private named Docker volume survives removal of the login container and
 engine restarts. The engine stores only its reference in `claude-auth.json`.
 Include both that volume and engine data in backups. Claude workers mount it
-at `/home/runner/.claude` with `CLAUDE_CONFIG_DIR` set to that path and run as
-uid 10001. Native Claude Code manages token refresh in the volume. Saving a
+at `/home/runner/.claude` with `CLAUDE_CONFIG_DIR` set to that path. The agent
+runs as root while retaining `/home/runner` as its compatibility home. Native
+Claude Code manages token refresh in the volume. Saving a
 login enables automatic selection; a saved Codex login still takes precedence.
 Set `"provider":"claude"` in the workflow request to choose Claude explicitly.
 The provider is fixed for the run, and stages execute serially with fresh
@@ -239,9 +240,12 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
   it through HTTPS via Caddy while the engine itself stays on loopback. Every request must
   carry the Cyber Supplies user token you set it up with; after 10 wrong
   tokens in a minute it refuses everything for a minute.
-- **Workers are locked down.** Each stage runs in a fresh container as an
-  unprivileged user, with a firewall that blocks your machine, your local
-  network and cloud metadata addresses (the internet stays reachable).
+- **Workers are ephemeral root containers.** Each stage starts with a firewall
+  that blocks your machine, local network and cloud metadata addresses while
+  leaving the internet reachable. The agent runs as root so it can install
+  tools. Existing engines grant root `NET_ADMIN` to create that firewall, so
+  the agent can also change it; do not treat the worker firewall as a security
+  boundary against the agent.
 - **Agents get a restricted token by default.** Each worker gives its agent
   your Cyber Supplies **LLM token** (`llm_…`), which the engine fetches with
   your user token when the worker starts (it is never saved). The agent can
@@ -268,7 +272,7 @@ docker volume rm cysu-engine-agent   # only if an older engine version created i
   latest published `cysu` CLI before running a stage, then installs the Cyber
   Supplies proxy and its CA using the run token. Worker startup needs access
   to npm and the proxy's CA endpoint. The proxy token is stored only in that
-  worker's ephemeral `/etc/environment`, readable by root and the worker user.
+  worker's ephemeral `/etc/environment`, readable by the root agent.
 - **Scheduled runs need the engine running.** A schedule starts its run by
   itself, but only while the engine is up (it restarts with Docker after a
   reboot). If the computer is off or asleep at the time, that run is skipped

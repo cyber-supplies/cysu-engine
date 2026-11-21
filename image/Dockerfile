@@ -34,6 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
 
+# The published engine intentionally grants only a small capability set. Run
+# apt downloads as root so package installation works without DAC_OVERRIDE or
+# FOWNER in worker-only updates.
+RUN printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99cysu-root \
+ && chown -R root:root /var/lib/apt/lists /var/cache/apt/archives
+
 # Go toolchain (for agents that build or `go install` tools themselves)
 COPY --from=gotoolchain /usr/local/go /usr/local/go
 COPY --from=pd /go/bin/ /usr/local/bin/
@@ -57,11 +63,11 @@ RUN v=$(codex --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) \
  && codex exec resume --help | grep -q -- '--cyber-access-program' \
  || { echo "This Codex has no --cyber-access-program flag (needed for Daybreak)" >&2; exit 1; }
 
-# Unprivileged user (fixed uid so engine-side files line up); the global
-# profile is installed as this user, workspace profiles go in /workspace.
+# Compatibility path for profile state, credentials and the persisted Claude
+# volume. The agent runs as root with HOME=/home/runner.
 RUN useradd -m -u 10001 -s /bin/bash runner \
  && mkdir -p /workspace /home/runner/.claude \
- && chown runner:runner /workspace /home/runner/.claude \
+ && chown -R root:root /workspace /home/runner \
  && chmod 0700 /home/runner/.claude
 COPY --chmod=755 entrypoint.sh /usr/local/bin/cysu-entrypoint
 COPY --chmod=755 codex-diagnostics.py /opt/cysu/codex-diagnostics.py
@@ -79,9 +85,9 @@ RUN git clone -q --depth 1 https://github.com/cyber-supplies/cysu-cli.git /tmp/c
  && chmod -R a+rX /opt/cysu \
  && rm -rf /tmp/cysu-cli
 
-# The entrypoint starts as root only to install the egress firewall, then
-# drops to runner for good. The engine starts containers with
-# --cap-drop ALL --cap-add NET_ADMIN,CHOWN,SETUID,SETGID,KILL and no-new-privileges.
+# The entrypoint installs the egress firewall, then keeps the agent as root.
+# The existing engine starts containers with --cap-drop ALL and only
+# NET_ADMIN,CHOWN,SETUID,SETGID,KILL plus no-new-privileges.
 USER root
 WORKDIR /workspace
 ENTRYPOINT ["cysu-entrypoint"]

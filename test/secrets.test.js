@@ -36,7 +36,7 @@ test('agent gets the token and the key file, but not the passphrase', async () =
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, new RegExp(`^token=${TOKEN}$`, 'm'));
   assert.match(r.stdout, /^passphrase=<unset>$/m);
-  assert.match(r.stdout, /^key=runner 600$/m);
+  assert.match(r.stdout, /^key=root 600$/m);
 });
 
 test('the key file is derived from the passkey (cysu key verify accepts it, rejects another)', async () => {
@@ -64,7 +64,7 @@ test('passphrase is in no process (environ or argv); token search proves the sca
     const passHits = await scan(user, PASSKEY);
     assert.equal(passHits.stdout, '', `passphrase found as uid ${user} in: ${passHits.stdout}`);
   }
-  const tokenHits = await scan('10001', TOKEN);
+  const tokenHits = await scan('0', TOKEN);
   assert.match(tokenHits.stdout, /environ/, 'control failed: token not found in the agent environment');
 });
 
@@ -103,7 +103,7 @@ test('user secrets reach the agent as env vars, values exactly as given', async 
   assert.match(r.stdout, /^bb=bb_live_test_123$/m);
   assert.ok(r.stdout.includes(Buffer.from(tricky).toString('base64')), 'the tricky value arrives byte for byte');
   assert.match(r.stdout, new RegExp(`^token=${TOKEN}$`, 'm'));
-  assert.match(r.stdout, /^runner$/m, 'still runs as the agent user');
+  assert.match(r.stdout, /^root$/m, 'runs as the root agent user');
   assert.match(r.stderr, /secrets for the agent: BROWSERBASE_API_KEY TRICKY/);
   assert.ok(!r.stderr.includes('bb_live_test_123'), 'the value is never logged');
 });

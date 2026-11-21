@@ -9,13 +9,13 @@
 #   {"token": "...", "passphrase": "...", "openaiApiKey": "..." | "openrouterApiKey": "..." | "codexAuth": {...}}
 # engineKey (engine linked only) becomes CYSU_ENGINE_TOKEN: a read-only key for
 # this stage's engine access, revoked by the engine when the stage ends.
-# The passphrase is used once, by `cysu key init` as runner, to create
+# The passphrase is used once, by `cysu key init` as root, to create
 # ~/.config/cysu/master.key; no long-lived process ever holds it. The LLM
 # login is installed in ~/.codex/auth.json, or ~/.config/cysu/openrouter.key
 # for OpenRouter, and is NOT left in the agent's environment. The agent
 # gets CYSU_TOKEN (the CLI only reads it from env), the key file and auth.json.
 # The proxy installer also writes the token to /etc/environment inside this
-# ephemeral container; the entrypoint limits that file to root and runner.
+# ephemeral container; the entrypoint limits that file to root.
 #
 # Other inputs (env, set by the engine, not secret):
 #   CYSU_STAGE_JSON     {profile, globalProfile, prompt, model, reasoningEffort, fallbackModel, reprompts}
@@ -24,20 +24,20 @@
 #   CYSU_EGRESS_GUARD   0 disables the outbound firewall (local debugging and tests only)
 #   CYSU_WORKER_TEST_BOOTSTRAP=0  skips CLI refresh and proxy install in tests
 #
-# Started as root with only NET_ADMIN/CHOWN/SETUID/SETGID/KILL: installs the egress
-# firewall, reads the secrets, then permanently drops to `runner` (uid 10001,
-# no capabilities) before any profile or agent code runs. With arguments, runs
-# that command as `runner` instead (tests, engine tooling).
+# Started as root with NET_ADMIN/CHOWN/SETUID/SETGID/KILL: installs the egress
+# firewall and reads the secrets. The agent stays root so it can install system
+# packages. HOME remains /home/runner to preserve profile, login and Claude
+# volume compatibility. Because the existing engine grants NET_ADMIN at startup,
+# a root agent can also change the container's firewall.
 set -eu
 
 log() { printf '[engine] %s\n' "$*" >&2; }
 
-# as_runner runs a command as runner with no capabilities. Secrets are passed
-# through the environment by the caller, never as arguments (argv is visible
-# in `ps`, including from the host).
-as_runner() {
-  HOME=/home/runner USER=runner LOGNAME=runner \
-    setpriv --reuid=10001 --regid=10001 --init-groups --inh-caps=-all "$@"
+# as_agent gives setup commands the same home and identity as the root agent.
+# Secrets are passed through the environment by the caller, never as arguments
+# (argv is visible in `ps`, including from the host).
+as_agent() {
+  HOME=/home/runner USER=root LOGNAME=root "$@"
 }
 
 if [ "$(id -u)" = "0" ]; then
@@ -75,9 +75,14 @@ if [ "$(id -u)" = "0" ]; then
   unset cli_dir CYSU_CLI_DIR
   export CYSU_SKILL_DIR
 
+  # Older Claude volumes were runner-owned. Change the mount point first so
+  # recursive ownership repair can traverse it without DAC_OVERRIDE.
+  chown root:root /workspace /home/runner /home/runner/.claude
+  chown -R root:root /home/runner/.claude
+
   # The cysu skill, copied into the home dir at start (see Dockerfile: folders
   # from the image layer cannot be swapped by `cysu profiles install`).
-  as_runner sh -c 'for d in "$HOME/.codex/skills" "$HOME/.agents/skills"; do mkdir -p "$d" && cp -R "$CYSU_SKILL_DIR" "$d/cysu"; done'
+  as_agent sh -c 'for d in "$HOME/.codex/skills" "$HOME/.agents/skills"; do mkdir -p "$d" && cp -R "$CYSU_SKILL_DIR" "$d/cysu"; done'
 
   if [ "${CYSU_SECRETS:-}" = "stdin" ]; then
     secrets=$(head -n 1)
@@ -111,16 +116,16 @@ if [ "$(id -u)" = "0" ]; then
       log "refusing to run: secrets on stdin must be a JSON line with token and passphrase" >&2
       exit 4
     fi
-    if ! CYSU_PASSPHRASE="$passphrase" as_runner cysu key init >/dev/null 2>&1; then
+    if ! CYSU_PASSPHRASE="$passphrase" as_agent cysu key init >/dev/null 2>&1; then
       log "refusing to run: could not create the encryption key from the passkey" >&2
       exit 4
     fi
     unset passphrase
 
-    # LLM login -> ~/.codex/auth.json (0600, owned by runner). Fed through
+    # LLM login -> ~/.codex/auth.json (0600, owned by root). Fed through
     # stdin so the key/tokens never appear in argv or env.
     if [ -n "$openrouter_key" ]; then
-      if ! printf '%s' "$openrouter_key" | as_runner sh -c 'umask 077; mkdir -p ~/.config/cysu && cat > ~/.config/cysu/openrouter.key'; then
+      if ! printf '%s' "$openrouter_key" | as_agent sh -c 'umask 077; mkdir -p ~/.config/cysu && cat > ~/.config/cysu/openrouter.key'; then
         log "refusing to run: could not install the OpenRouter API key" >&2
         exit 4
       fi
@@ -130,19 +135,19 @@ if [ "$(id -u)" = "0" ]; then
       router_url=${CYSU_ENGINE_TEST_OPENROUTER_URL:-https://openrouter.ai/api/v1}
       router_url_json=$(printf '%s' "$router_url" | jq -Rs .)
       printf '\n[model_providers.openrouter]\nname = "OpenRouter"\nbase_url = %s\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n[model_providers.openrouter.auth]\ncommand = "/bin/cat"\nargs = ["/home/runner/.config/cysu/openrouter.key"]\n' "$router_url_json" |
-        as_runner sh -c 'umask 077; mkdir -p ~/.codex; cat >> ~/.codex/config.toml'
+        as_agent sh -c 'umask 077; mkdir -p ~/.codex; cat >> ~/.codex/config.toml'
       unset router_url router_url_json
       log "LLM provider configured: OpenRouter"
     fi
     if [ -n "$codex_auth" ]; then
-      if ! printf '%s\n' "$codex_auth" | as_runner sh -c 'umask 077; mkdir -p ~/.codex && cat > ~/.codex/auth.json'; then
+      if ! printf '%s\n' "$codex_auth" | as_agent sh -c 'umask 077; mkdir -p ~/.codex && cat > ~/.codex/auth.json'; then
         log "refusing to run: could not install the Codex login" >&2
         exit 4
       fi
       log "LLM login: Codex (ChatGPT)"
       export CYSU_LLM_PROVIDER=codex
     elif [ -n "$openai_key" ]; then
-      if ! printf '%s' "$openai_key" | as_runner codex login --with-api-key >/dev/null 2>&1; then
+      if ! printf '%s' "$openai_key" | as_agent codex login --with-api-key >/dev/null 2>&1; then
         log "refusing to run: could not install the OpenAI API key" >&2
         exit 4
       fi
@@ -172,13 +177,13 @@ if [ "$(id -u)" = "0" ]; then
 
     if [ "${CYSU_WORKER_TEST_BOOTSTRAP:-1}" != "0" ]; then
       # cysu installs the proxy CA and the managed /etc/environment block.
-      # The CLI defaults to a world-readable file; limit it to the agent user.
+      # The CLI defaults to a world-readable file; limit it to the root agent.
       if ! cysu proxy install >/dev/null; then
         log "refusing to run: could not install the Cyber Supplies proxy"
         exit 4
       fi
-      chown root:runner /etc/environment
-      chmod 0640 /etc/environment
+      chown root:root /etc/environment
+      chmod 0600 /etc/environment
       proxy_url=$(sed -n 's/^https_proxy="\(.*\)"$/\1/p' /etc/environment)
       if [ -z "$proxy_url" ]; then
         log "refusing to run: the Cyber Supplies proxy has no URL"
@@ -189,7 +194,7 @@ if [ "$(id -u)" = "0" ]; then
       no_proxy=localhost,127.0.0.1,::1${CYSU_ENGINE_ALLOW:+,${CYSU_ENGINE_ALLOW%:*}}
       export no_proxy NO_PROXY="$no_proxy"
       unset proxy_url
-      if ! as_runner cysu proxy status | jq -e '.installed == true and .active == true' >/dev/null; then
+      if ! as_agent cysu proxy status | jq -e '.installed == true and .active == true' >/dev/null; then
         log "refusing to run: the Cyber Supplies proxy is not active"
         exit 4
       fi
@@ -198,8 +203,10 @@ if [ "$(id -u)" = "0" ]; then
   fi
   unset CYSU_SECRETS
 
-  exec env HOME=/home/runner USER=runner LOGNAME=runner \
-    setpriv --reuid=10001 --regid=10001 --init-groups --inh-caps=-all "$0" "$@"
+  HOME=/home/runner
+  USER=root
+  LOGNAME=root
+  export HOME USER LOGNAME
 fi
 
 if [ "$#" -gt 0 ]; then
@@ -381,8 +388,9 @@ if [ "$provider" != claude ]; then
   printf '\n[projects."/workspace"]\ntrust_level = "trusted"\n' >> "$HOME/.codex/config.toml"
 fi
 
-# The container is the sandbox (firewall, no capabilities), so Codex's own
-# sandbox and approval prompts are off, as in the dojo harness.
+# The ephemeral container is the execution boundary, so Codex's own sandbox
+# and approval prompts are off, as in the dojo harness. The root agent can
+# change the container firewall because the existing engine grants NET_ADMIN.
 ATTEMPT_EVENTS=/tmp/cysu-attempt.jsonl
 rc=0
 
