@@ -27,6 +27,12 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   '-p --output-format')
+    # Like the real CLI: no permission bypass as root outside a sandbox.
+    if [ "$(id -u)" = 0 ] && [ "${IS_SANDBOX:-}" != 1 ]; then
+      case " $* " in *' --dangerously-skip-permissions '*)
+        echo '--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons' >&2; exit 1 ;;
+      esac
+    fi
     [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ] || { echo 'Missing native Claude login' >&2; exit 1; }
     args="$*"
     model='' thread='fake-claude-session' resumed=false

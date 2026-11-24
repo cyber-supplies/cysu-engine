@@ -41,10 +41,10 @@ test('real Claude CLI streams results, executes tools and resumes its session', 
   t.after(() => server.close());
   const container = `cysu-claude-wire-${randomUUID()}`;
   t.after(() => execFileSync('docker', ['rm', '-f', container], { stdio: 'pipe' }));
-  execFileSync('docker', ['run', '-d', '--name', container, '--init', '--user', '10001:10001', '--entrypoint', 'sleep',
+  execFileSync('docker', ['run', '-d', '--name', container, '--init', '--entrypoint', 'sleep',
     '-e', 'HOME=/home/runner', '-e', 'ANTHROPIC_API_KEY=sk-ant-wire-fixture',
     '-e', `ANTHROPIC_BASE_URL=http://${host}:${server.address().port}`, '-e', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1',
-    '-e', 'DISABLE_AUTOUPDATER=1', 'cysu-engine-workspace:dev', '120'], { stdio: 'pipe' });
+    '-e', 'DISABLE_AUTOUPDATER=1', '-e', 'IS_SANDBOX=1', 'cysu-engine-workspace:dev', '120'], { stdio: 'pipe' });
   const invoke = (prompt, thread) => new Promise((resolve, reject) => {
     const child = spawn('docker', ['exec', '-i', container, 'claude', '-p', '--output-format', 'stream-json', '--verbose',
       '--dangerously-skip-permissions', '--permission-prompts', 'none', '--model', 'claude-sonnet-4-6', '--effort', 'low',

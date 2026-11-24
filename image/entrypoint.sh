@@ -403,7 +403,10 @@ attempt() {
   attempt_started=$(date +%s)
   jq -cn --arg kind "$a_kind" --arg model "$a_model" --arg provider "$provider" --arg daybreak "${daybreak:-default}" '{type: "engine.attempt", kind: $kind, model: $model, provider: $provider, daybreak: $daybreak}'
   if [ "$provider" = claude ]; then
-    set -- claude -p --output-format stream-json --verbose --dangerously-skip-permissions --permission-prompts none
+    # The agent runs as root, and the Claude CLI refuses
+    # --dangerously-skip-permissions as root unless told it is in a sandbox.
+    # The ephemeral container is that sandbox.
+    set -- env IS_SANDBOX=1 claude -p --output-format stream-json --verbose --dangerously-skip-permissions --permission-prompts none
     [ -z "$a_model" ] || set -- "$@" --model "$a_model"
     [ -z "$effort" ] || set -- "$@" --effort "$effort"
     [ -z "$a_thread" ] || set -- "$@" --resume "$a_thread"
